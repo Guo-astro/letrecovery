@@ -478,7 +478,15 @@ fn stage_desktop_log_contents(
     let directory = session_handoff_directory(data_directory, session_id)?;
     let sha256 = sha256_hex(&contents);
     let blob_file = format!("normal-{sha256}.log");
-    atomic_publish(&directory, &blob_file, &contents)?;
+    // The desktop log is a bounded, redacted diagnostic payload.  It is not an authorization
+    // artifact: the manifest/hash pair is the commit and integrity boundary, while the log must
+    // remain readable by the interactive user after a reboot.  Applying the SYSTEM/
+    // Administrators-only custody descriptor to a newly-created directory on a freshly-created
+    // staging volume can legitimately fail with ERROR_ACCESS_DENIED (for example while the
+    // volume's inherited ACL is still being materialized).  Do not turn that diagnostic ACL
+    // detail into a reboot blocker; publish with the compatibility diagnostic path and retain
+    // the reparse-point, atomic-write, and byte-for-byte readback checks.
+    atomic_publish_diagnostic(&directory, &blob_file, &contents)?;
     let manifest = DesktopLogManifest {
         schema: LOG_HANDOFF_SCHEMA,
         session_id: session_id.to_string(),
@@ -488,7 +496,7 @@ fn stage_desktop_log_contents(
         blob_file,
     };
     let encoded = serde_json::to_vec_pretty(&manifest).context("encode desktop log manifest")?;
-    atomic_publish(&directory, DESKTOP_MANIFEST_FILE, &encoded)?;
+    atomic_publish_diagnostic(&directory, DESKTOP_MANIFEST_FILE, &encoded)?;
     Ok(manifest)
 }
 
