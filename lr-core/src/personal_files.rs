@@ -1572,6 +1572,73 @@ fn enumerate_directory(directory: &Path) -> Result<Vec<DirectoryEntry>> {
     Ok(entries)
 }
 
+/// Irreversibly delete the old Windows installation on `target_root` in place, without formatting
+/// and without touching any `LetRecovery_*` staging directory or unrelated user data. This is the
+/// clean-reinstall counterpart of personal-file preservation: it lets a payload staged on the same
+/// volume survive while the previous system is removed just before the image is applied.
+///
+/// Returns the number of deleted top-level roots and total entries. Every `LetRecovery_` prefixed
+/// entry (staging data, reassembly directory, preserved-file roots, PE residue) is kept, so this
+/// is safe to call after the payload has been staged onto the target itself.
+pub fn delete_old_system_in_place(target_root: &Path) -> Result<InPlaceDeletionReport> {
+    validate_target_root(target_root)?;
+    let mut report = InPlaceDeletionReport::default();
+    for name in OLD_SYSTEM_DIRECTORIES {
+        let path = target_root.join(name);
+        if std::fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        match fast_remove_tree(&path) {
+            Ok(count) => {
+                report.deleted_roots += 1;
+                report.deleted_entries = report.deleted_entries.saturating_add(count);
+            }
+            Err(error) => {
+                // Handle-based deletion failed part-way; a second, different API path frequently
+                // clears what remains (for example entries whose disposition was refused).
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => report.deleted_roots += 1,
+                    Err(fallback) if fallback.kind() == std::io::ErrorKind::NotFound => {
+                        report.deleted_roots += 1
+                    }
+                    Err(fallback) => report
+                        .failures
+                        .push(format!("{}: {error:#}; fallback: {fallback}", path.display())),
+                }
+            }
+        }
+    }
+    for name in OLD_SYSTEM_FILES {
+        let path = target_root.join(name);
+        if std::fs::symlink_metadata(&path).is_err() {
+            continue;
+        }
+        match fast_delete_path(&path, false) {
+            Ok(()) => {
+                report.deleted_roots += 1;
+                report.deleted_entries = report.deleted_entries.saturating_add(1);
+            }
+            Err(error) => match std::fs::remove_file(&path) {
+                Ok(()) => report.deleted_roots += 1,
+                Err(fallback) if fallback.kind() == std::io::ErrorKind::NotFound => {}
+                Err(fallback) => report
+                    .failures
+                    .push(format!("{}: {error:#}; fallback: {fallback}", path.display())),
+            },
+        }
+    }
+    Ok(report)
+}
+
+/// Outcome of [`delete_old_system_in_place`]. Entries that could not be removed are listed in
+/// `failures`; the image is then applied over them, exactly like an install without formatting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InPlaceDeletionReport {
+    pub deleted_roots: usize,
+    pub deleted_entries: u64,
+    pub failures: Vec<String>,
+}
+
 #[cfg(windows)]
 fn fast_remove_tree(root: &Path) -> Result<u64> {
     use windows::Win32::Storage::FileSystem::{

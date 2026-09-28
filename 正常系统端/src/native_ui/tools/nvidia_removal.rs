@@ -9,7 +9,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateFontW, DeleteObject, HFONT};
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, MoveWindow, SendMessageW, SetWindowTextW, CBS_DROPDOWNLIST, CB_ADDSTRING,
+    GetClientRect, MoveWindow, SendMessageW, CBS_DROPDOWNLIST, CB_ADDSTRING,
     CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, LBS_NOINTEGRALHEIGHT, LB_ADDSTRING,
     LB_RESETCONTENT, WM_SETFONT, WS_BORDER, WS_TABSTOP, WS_VSCROLL,
 };
@@ -92,7 +92,7 @@ impl NativeNvidiaRemovalDialog {
         let dpi = GetDpiForWindow(shell.hwnd()).max(96);
         let face = wide("Microsoft YaHei");
         let font = CreateFontW(
-            -scale(14, dpi),
+            -scale(12, dpi),
             0,
             0,
             0,
@@ -638,8 +638,7 @@ unsafe fn add_string(control: HWND, message: u32, value: &str) {
 }
 
 unsafe fn set_text(control: HWND, value: &str) {
-    let value = wide(value);
-    let _ = SetWindowTextW(control, PCWSTR(value.as_ptr()));
+    crate::native_ui::redraw::set_window_text_if_changed(control, value);
 }
 
 fn scale(value: i32, dpi: u32) -> i32 {

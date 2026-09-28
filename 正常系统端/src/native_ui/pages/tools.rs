@@ -90,14 +90,21 @@ pub struct ToolLabels<'a> {
     pub introduction: &'a str,
 }
 
-fn tool_grid_layout(rect: PageRect, dpi: u32, tool_count: usize) -> ToolGridLayout {
+fn tool_grid_layout(
+    rect: PageRect,
+    dpi: u32,
+    tool_count: usize,
+    widest_caption: i32,
+) -> ToolGridLayout {
     let s = |value: i32| value * dpi.max(1) as i32 / 96;
     let width = rect.width.max(0);
     let height = rect.height.max(0);
     let gap = s(8);
     let grid_y = rect.y + s(34).min(height);
     let available_height = (rect.y + height - grid_y).max(0);
-    let preferred = ((width + gap) / (s(156) + gap)).clamp(1, 4);
+    // A column is at least as wide as the longest (translated) tool caption plus its margins.
+    let minimum_width = s(156).max(widest_caption + s(24));
+    let preferred = ((width + gap) / (minimum_width + gap)).clamp(1, 4);
     let minimum_height = s(26);
     let mut columns = preferred;
     while columns < 4 {
@@ -224,7 +231,15 @@ impl ToolsPage {
         let s = |value: i32| value * dpi as i32 / 96;
         let available = self.available.get();
         let tool_count = available.iter().filter(|supported| **supported).count();
-        let layout = tool_grid_layout(rect, dpi, tool_count);
+        let widest_caption = self
+            .buttons
+            .iter()
+            .zip(available.iter())
+            .filter(|(_, supported)| **supported)
+            .map(|(button, _)| crate::native_ui::layout::control_text_width(*button))
+            .max()
+            .unwrap_or(0);
+        let layout = tool_grid_layout(rect, dpi, tool_count, widest_caption);
         let _ = MoveWindow(
             self.introduction,
             rect.x,
@@ -344,7 +359,7 @@ mod tests {
                 192,
             ),
         ] {
-            let layout = tool_grid_layout(rect, dpi, ToolIntent::ALL.len());
+            let layout = tool_grid_layout(rect, dpi, ToolIntent::ALL.len(), 0);
             let last_index = ToolIntent::ALL.len() as i32 - 1;
             let last_row = last_index / layout.columns;
             let bottom = layout.grid_y
@@ -367,6 +382,7 @@ mod tests {
             },
             96,
             ToolIntent::ALL.len(),
+            0,
         );
         assert_eq!(layout.columns, 1);
         assert_eq!(layout.button_width, 140);

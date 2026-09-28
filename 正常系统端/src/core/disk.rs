@@ -68,6 +68,71 @@ fn auto_shrink_target_is_safe(
         && attachment != StorageAttachment::External
 }
 
+/// Role of a canonical partition-table entry, for inventories completed through the
+/// restricted-storage compatibility path.
+fn partition_kind_from_token(
+    token: lr_core::windows_storage::DiskLayoutPartitionToken,
+) -> lr_core::windows_storage::PartitionKind {
+    use lr_core::windows_storage::{DiskLayoutPartitionToken as Token, PartitionKind};
+    const ESP: [u8; 16] = 0xc12a_7328_f81f_11d2_ba4b_00a0_c93e_c93b_u128.to_le_bytes();
+    const MSR: [u8; 16] = 0xe3c9_e316_0b5c_4db8_817d_f92d_f002_15ae_u128.to_le_bytes();
+    match token {
+        Token::Gpt { partition_type, .. } if partition_type == ESP => PartitionKind::EfiSystem,
+        Token::Gpt { partition_type, .. } if partition_type == MSR => {
+            PartitionKind::MicrosoftReserved
+        }
+        Token::Mbr {
+            partition_type: 0xef,
+            ..
+        } => PartitionKind::EfiSystem,
+        token if lr_core::windows_storage::partition_token_is_installable_user_data(token) => {
+            PartitionKind::BasicData
+        }
+        _ => PartitionKind::Recovery,
+    }
+}
+
+/// Volume-level installability when the partition table cannot be read: an ordinary data file
+/// system that is not a lettered EFI system partition.
+fn volume_looks_installable(letter: &str) -> bool {
+    let root = format!("{}\\", letter.trim_end_matches(['\\', '/']));
+    let file_system = volume_file_system_name(&root).map(|name| name.to_ascii_uppercase());
+    match file_system.as_deref() {
+        Some("NTFS") | Some("REFS") => true,
+        Some("FAT32") | Some("FAT") | Some("EXFAT") => {
+            !Path::new(&format!("{root}EFI\\Microsoft\\Boot\\bootmgfw.efi")).exists()
+        }
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn volume_file_system_name(root: &str) -> Option<String> {
+    let wide_root: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut file_system = [0_u16; 64];
+    unsafe {
+        GetVolumeInformationW(
+            PCWSTR(wide_root.as_ptr()),
+            None,
+            None,
+            None,
+            None,
+            Some(&mut file_system),
+        )
+    }
+    .ok()?;
+    let name = String::from_utf16_lossy(&file_system)
+        .trim_end_matches('\0')
+        .trim()
+        .to_owned();
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(not(windows))]
+fn volume_file_system_name(_root: &str) -> Option<String> {
+    None
+}
+
 /// 自动创建分区的标志文件名
 pub const AUTO_CREATED_PARTITION_MARKER: &str = "LetRecovery_AutoCreated.marker";
 
@@ -1108,6 +1173,57 @@ impl DiskManager {
                 .map_or(StorageMedia::Unknown, |profile| profile.0);
         }
 
+        // Compatibility path for storage stacks that hide the physical disk (hardware-ID
+        // spoofers, some diskless/restore drivers): complete the geometry from the volume's own
+        // exact extent, then take the role from the partition table when it is readable, or
+        // from volume-level evidence when it is not.
+        for partition in &mut partitions {
+            if partition.partition_offset_bytes.is_some() && partition.partition_size_bytes.is_some() {
+                continue;
+            }
+            let Some(identity) = partition.stable_identity else {
+                continue;
+            };
+            let disk_number = identity.extent.disk_number;
+            partition.disk_number.get_or_insert(disk_number);
+            partition.partition_offset_bytes = Some(identity.extent.offset_bytes);
+            partition.partition_size_bytes = Some(identity.extent.extent_length_bytes);
+            let layout = canonical_layouts
+                .entry(disk_number)
+                .or_insert_with(|| lr_core::windows_storage::disk_layout_snapshot(disk_number));
+            let canonical = layout.as_ref().ok().and_then(|layout| {
+                layout
+                    .partitions
+                    .iter()
+                    .find(|candidate| {
+                        candidate.offset_bytes == identity.extent.offset_bytes
+                            && candidate.size_bytes == identity.extent.extent_length_bytes
+                    })
+                    .copied()
+                    .map(|candidate| (candidate, layout.disk_size_bytes, layout.disk_size_estimated))
+            });
+            if let Some((candidate, disk_size_bytes, estimated)) = canonical {
+                partition.partition_kind = Some(partition_kind_from_token(candidate.token));
+                partition.install_target_eligible =
+                    lr_core::windows_storage::partition_token_is_installable_user_data(candidate.token);
+                if !estimated {
+                    partition.disk_size_bytes = Some(disk_size_bytes);
+                }
+            } else {
+                let eligible = volume_looks_installable(&partition.letter);
+                partition.install_target_eligible = eligible;
+                partition.partition_kind =
+                    eligible.then_some(lr_core::windows_storage::PartitionKind::BasicData);
+            }
+            let letter = partition.letter.clone();
+            let eligible = partition.install_target_eligible;
+            lr_core::windows_storage::warn_storage_once(&format!("inventory-fallback:{letter}"), || {
+                format!(
+                    "[DISK INVENTORY] {letter} 的物理磁盘信息不可用，已用卷自身的精确范围补全（可作为安装目标: {eligible}）"
+                )
+            });
+        }
+
         Ok(partitions)
     }
 
@@ -1170,14 +1286,15 @@ impl DiskManager {
         let mut total_free_bytes: u64 = 0;
 
         #[cfg(windows)]
-        unsafe {
+        let space_available = unsafe {
             GetDiskFreeSpaceExW(
                 PCWSTR(wide_path.as_ptr()),
                 Some(&mut free_bytes_available as *mut u64),
                 Some(&mut total_bytes as *mut u64),
                 Some(&mut total_free_bytes as *mut u64),
-            )?;
-        }
+            )
+            .is_ok()
+        };
 
         // 获取卷标
         let mut volume_name = [0u16; 261];
@@ -1227,6 +1344,19 @@ impl DiskManager {
                 None
             }
         };
+        #[cfg(windows)]
+        if !space_available {
+            if let Some(identity) = stable_identity.as_ref() {
+                total_bytes = identity.extent.extent_length_bytes;
+                log::info!(
+                    "[DISK INVENTORY] {drive} file-system space is unavailable; using the authoritative volume extent for display capacity"
+                );
+            } else {
+                log::warn!(
+                    "[DISK INVENTORY] {drive} file-system space and volume extent are both unavailable"
+                );
+            }
+        }
 
         Ok((
             Partition {
@@ -1262,11 +1392,26 @@ impl DiskManager {
         let (disk_number, partition_number) = Self::get_device_number(letter);
 
         // 再获取分区表类型
-        let style = if let Some(disk_num) = disk_number {
+        // Filter drivers (hardware-ID spoofers) can reject the volume device-number query or hide
+        // the physical disk. The volume extent still names its disk.
+        let disk_number = disk_number.or_else(|| {
+            lr_core::windows_storage::volume_identity(letter)
+                .ok()
+                .map(|extent| extent.disk_number)
+        });
+        let mut style = if let Some(disk_num) = disk_number {
             Self::get_disk_partition_style_api(disk_num)
         } else {
             PartitionStyle::Unknown
         };
+        if style == PartitionStyle::Unknown {
+            // The partition manager answers for the volume itself even when disk IOCTLs fail.
+            match lr_core::windows_storage::volume_partition_style(letter) {
+                Ok(lr_core::windows_storage::DiskStyle::Gpt) => style = PartitionStyle::GPT,
+                Ok(lr_core::windows_storage::DiskStyle::Mbr) => style = PartitionStyle::MBR,
+                Err(error) => log::debug!("读取 {letter}: 所在分区样式失败: {error}"),
+            }
+        }
 
         PartitionDetail {
             style,
@@ -1451,6 +1596,11 @@ impl DiskManager {
         (StorageMedia::Unknown, StorageAttachment::Unknown)
     }
 
+    /// Public wrapper so other core modules can read (free, total) bytes of a volume.
+    pub(crate) fn get_volume_space_bytes_public(letter: char) -> Option<(u64, u64)> {
+        Self::get_volume_space_bytes(letter)
+    }
+
     #[cfg(windows)]
     fn get_volume_space_bytes(letter: char) -> Option<(u64, u64)> {
         let path = format!("{}:\\", letter.to_ascii_uppercase());
@@ -1602,7 +1752,10 @@ impl DiskManager {
             Ok(lr_core::windows_storage::DiskStyle::Mbr) => PartitionStyle::MBR,
             Ok(lr_core::windows_storage::DiskStyle::Gpt) => PartitionStyle::GPT,
             Err(error) => {
-                log::warn!("读取磁盘 {disk_number} 分区表样式失败: {error}");
+                lr_core::windows_storage::warn_storage_once(
+                    &format!("disk-style:{disk_number}"),
+                    || format!("读取磁盘 {disk_number} 分区表样式失败，改用卷自身信息: {error}"),
+                );
                 PartitionStyle::Unknown
             }
         }

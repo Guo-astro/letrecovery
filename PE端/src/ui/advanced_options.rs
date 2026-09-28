@@ -108,7 +108,10 @@ fn user_driver_path_matches_version(path: &Path, version: &str) -> bool {
         .filter_map(|component| component.as_os_str().to_str())
         .collect::<Vec<_>>();
     components.windows(2).any(|pair| {
-        pair[0].eq_ignore_ascii_case("user_drivers") && pair[1].eq_ignore_ascii_case(version)
+        // `custom` holds the advanced "import custom driver directory" payload for every version;
+        // DISM rejects packages that do not apply to the target image.
+        pair[0].eq_ignore_ascii_case("user_drivers")
+            && (pair[1].eq_ignore_ascii_case(version) || pair[1].eq_ignore_ascii_case("custom"))
     })
 }
 
@@ -133,6 +136,15 @@ fn detect_user_driver_version(target_partition: &str) -> Option<&'static str> {
         (10, _) => Some(if build >= 22000 { "win11" } else { "win10" }),
         _ => None,
     }
+}
+
+/// Target build from `\Windows\System32\ntdll.dll`; `None` when the version is unreadable.
+fn detect_target_build(target_partition: &str) -> Option<u32> {
+    let ntdll = Path::new(target_partition)
+        .join("Windows")
+        .join("System32")
+        .join("ntdll.dll");
+    crate::core::system_utils::get_file_version(&ntdll).map(|(_, _, build, _)| build)
 }
 
 fn disable_win7_processor_power_services(hive_name: &str) -> anyhow::Result<Vec<String>> {
@@ -190,6 +202,7 @@ pub fn apply_advanced_options(
         log::warn!("[ADVANCED] DEFAULT hive 加载失败，部分用户级设置可能无法应用");
     }
 
+    let target_build = detect_target_build(target_partition);
     if detect_user_driver_version(target_partition) == Some("win11") {
         match lr_core::windows11_shell::apply_offline_defaults("pc-soft") {
             Ok(report) => log::info!(
@@ -221,11 +234,13 @@ pub fn apply_advanced_options(
     // 1. 移除快捷方式小箭头
     if config.remove_shortcut_arrow {
         log::info!("[ADVANCED] 移除快捷方式小箭头");
-        OfflineRegistry::set_string(
+        if let Err(error) = OfflineRegistry::set_string(
             "HKLM\\pc-soft\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Icons",
             "29",
             "%systemroot%\\system32\\imageres.dll,197",
-        )?;
+        ) {
+            log::warn!("[ADVANCED] 移除快捷方式小箭头失败，安装继续: {error:#}");
+        }
     }
 
     // 2. Win11恢复经典右键菜单
@@ -244,7 +259,9 @@ pub fn apply_advanced_options(
                 "",
             )?;
         } else {
-            anyhow::bail!("the default-user registry hive is unavailable");
+            log::warn!(
+                "[ADVANCED] DEFAULT hive 不可用，经典右键菜单只写入系统级设置，安装继续"
+            );
         }
         // 同时在 SOFTWARE 中设置（系统级）
         OfflineRegistry::create_key(
@@ -259,12 +276,21 @@ pub fn apply_advanced_options(
 
     // 3. OOBE绕过强制联网
     if config.bypass_nro {
-        log::info!("[ADVANCED] 设置OOBE绕过联网");
-        OfflineRegistry::set_dword(
-            "HKLM\\pc-soft\\Microsoft\\Windows\\CurrentVersion\\OOBE",
-            "BypassNRO",
-            1,
-        )?;
+        if lr_core::windows_build::should_write_bypass_nro(target_build) {
+            log::info!("[ADVANCED] 设置OOBE绕过联网");
+            if let Err(error) = OfflineRegistry::set_dword(
+                "HKLM\\pc-soft\\Microsoft\\Windows\\CurrentVersion\\OOBE",
+                "BypassNRO",
+                1,
+            ) {
+                log::warn!("[ADVANCED] 设置OOBE绕过联网失败，安装继续: {error:#}");
+            }
+        } else {
+            log::warn!(
+                "[ADVANCED] 目标系统 build={:?} 已移除 BypassNRO 通道，跳过写入以免 OOBE 卡在“请稍等”；本地账户仍由无人值守 UserAccounts 创建",
+                target_build
+            );
+        }
     }
 
     // 4. 按目标系统家族移除 Windows Update 活动组件。
@@ -341,31 +367,43 @@ pub fn apply_advanced_options(
     // 7. 禁用UAC
     if config.disable_uac {
         log::info!("[ADVANCED] 禁用UAC");
-        OfflineRegistry::set_dword(
-            "HKLM\\pc-soft\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-            "EnableLUA",
-            0,
-        )?;
-        OfflineRegistry::set_dword(
-            "HKLM\\pc-soft\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-            "ConsentPromptBehaviorAdmin",
-            0,
-        )?;
+        let uac_result = (|| -> anyhow::Result<()> {
+            OfflineRegistry::set_dword(
+                "HKLM\\pc-soft\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                "EnableLUA",
+                0,
+            )?;
+            OfflineRegistry::set_dword(
+                "HKLM\\pc-soft\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                "ConsentPromptBehaviorAdmin",
+                0,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = uac_result {
+            log::warn!("[ADVANCED] 禁用UAC未完全应用，安装继续: {error:#}");
+        }
     }
 
     // 8. 禁用自动设备加密 (BitLocker)
     if config.disable_device_encryption {
         log::info!("[ADVANCED] 禁用自动设备加密");
-        // 禁用 BitLocker 自动加密
-        OfflineRegistry::set_dword(
-            "HKLM\\pc-sys\\ControlSet001\\Control\\BitLocker",
-            "PreventDeviceEncryption",
-            1,
-        )?;
-        // 禁用 MBAM (Microsoft BitLocker Administration and Monitoring)
-        OfflineRegistry::set_dword("HKLM\\pc-soft\\Policies\\Microsoft\\FVE", "OSRecovery", 0)?;
-        // 禁用 BitLocker 服务
-        OfflineRegistry::set_dword("HKLM\\pc-sys\\ControlSet001\\Services\\BDESVC", "Start", 4)?;
+        // Microsoft documents PreventDeviceEncryption as the switch for automatic device
+        // encryption. BDESVC keeps its inbox start type: disabling the service adds no protection
+        // but breaks unlocking BitLocker data/USB drives and the BitLocker UI after installation.
+        let encryption_result = (|| -> anyhow::Result<()> {
+            OfflineRegistry::set_dword(
+                "HKLM\\pc-sys\\ControlSet001\\Control\\BitLocker",
+                "PreventDeviceEncryption",
+                1,
+            )?;
+            // 禁用 MBAM (Microsoft BitLocker Administration and Monitoring)
+            OfflineRegistry::set_dword("HKLM\\pc-soft\\Policies\\Microsoft\\FVE", "OSRecovery", 0)?;
+            Ok(())
+        })();
+        if let Err(error) = encryption_result {
+            log::warn!("[ADVANCED] 禁用自动设备加密未完全应用，安装继续: {error:#}");
+        }
     }
 
     // 9. Curated AppX servicing is deferred until every externally loaded offline hive has
@@ -373,25 +411,35 @@ pub fn apply_advanced_options(
 
     // 10. 导入磁盘控制器驱动（Win10/Win11 x64）
     if config.import_storage_controller_drivers {
-        let hardware_ids = lr_core::driver::list_present_hardware_ids().map_err(|error| {
-            anyhow::anyhow!("storage-controller hardware enumeration failed: {error}")
-        })?;
-        let packages = lr_core::storage_driver_match::select_builtin_storage_driver_packages(
-            hardware_ids.iter().map(String::as_str),
-        )
-        .map_err(anyhow::Error::new)?;
-        let storage_drivers_dir = path::get_exe_dir()
-            .join("drivers")
-            .join("storage_controller");
-        let verified_packages = packages
-            .into_iter()
-            .map(|package| {
-                let directory = storage_drivers_dir.join(package.directory_name());
-                lr_core::storage_driver_match::verify_builtin_storage_driver_package(
-                    package, &directory,
-                )
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let verified_packages = match (|| -> anyhow::Result<Vec<_>> {
+            let hardware_ids = lr_core::driver::list_present_hardware_ids().map_err(|error| {
+                anyhow::anyhow!("storage-controller hardware enumeration failed: {error}")
+            })?;
+            let packages = lr_core::storage_driver_match::select_builtin_storage_driver_packages(
+                hardware_ids.iter().map(String::as_str),
+            )
+            .map_err(anyhow::Error::new)?;
+            let storage_drivers_dir = path::get_exe_dir()
+                .join("drivers")
+                .join("storage_controller");
+            packages
+                .into_iter()
+                .map(|package| {
+                    let directory = storage_drivers_dir.join(package.directory_name());
+                    lr_core::storage_driver_match::verify_builtin_storage_driver_package(
+                        package, &directory,
+                    )
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })() {
+            Ok(packages) => packages,
+            Err(error) => {
+                log::warn!(
+                    "[ADVANCED] built-in storage-controller driver selection is unavailable; skipping it and continuing: {error:#}"
+                );
+                Vec::new()
+            }
+        };
         if verified_packages.is_empty() {
             log::info!(
                 "[ADVANCED] no supported Intel VMD controller is present; built-in storage drivers were not staged"
@@ -450,8 +498,12 @@ pub fn apply_advanced_options(
                 }
                 Ok(())
             })();
-            stage_result?;
             reload_result?;
+            if let Err(error) = stage_result {
+                log::warn!(
+                    "[ADVANCED] built-in storage-controller driver staging failed; continuing with the remaining options: {error:#}"
+                );
+            }
         }
     }
 

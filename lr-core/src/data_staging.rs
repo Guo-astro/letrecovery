@@ -534,3 +534,549 @@ mod tests {
         );
     }
 }
+
+// ================================================================================================
+// Scattered staging on already existing volumes
+// ================================================================================================
+//
+// When no dedicated staging volume can be created (VDS and the Storage Management API both fail,
+// or the user enabled `scattered_staging_enabled`), the ViaPE payload is stored on the volumes
+// that already exist. One volume is the *primary* data volume: it carries the authenticated
+// control files, the PCA package, UefiSeven and every component that fits there. Other volumes
+// receive a directory named `LetRecovery_Scatter_<locator token>` whose inner layout mirrors the
+// primary `LetRecovery_Data` directory. The locator token is also written into a marker file in
+// that directory, so WinPE can find the volume again even when drive letters change.
+//
+// A single image file that fits on no volume is split into raw byte chunks. Chunks never need a
+// conversion, recompression or temporary copy: WinPE concatenates them onto the freshly formatted
+// target partition and checks the exact SHA-256 of the whole stream before the image engine opens
+// it. This works for WIM, ESD (solid) and any future single-file format alike.
+
+/// Directory prefix of a scattered-staging root. The full name is the prefix plus the
+/// 64-character lowercase hexadecimal locator token of that volume.
+pub const SCATTER_DIRECTORY_PREFIX: &str = "LetRecovery_Scatter_";
+/// Locator marker inside every scattered-staging root. Its exact content is the token.
+pub const SCATTER_MARKER_NAME: &str = "LetRecovery_Scatter.marker";
+/// Data directory mirrored below every scattered-staging root.
+pub const SCATTER_DATA_DIRECTORY: &str = "LetRecovery_Data";
+/// Directory (below the data directory) that holds raw chunks of a single image file.
+pub const IMAGE_CHUNK_DIRECTORY: &str = "image_chunks";
+/// Headroom left free on the primary scattered volume (control files, logs, rounding).
+pub const SCATTER_PRIMARY_RESERVE_BYTES: u64 = STAGING_OPERATIONAL_HEADROOM_BYTES;
+/// Headroom left free on every other scattered volume (allocation rounding, NTFS metadata).
+pub const SCATTER_SECONDARY_RESERVE_BYTES: u64 = 512 * MIB;
+/// Chunks smaller than this are only used for the final remainder of an image.
+pub const IMAGE_CHUNK_MIN_BYTES: u64 = 64 * MIB;
+/// FAT12/16/32 cannot store a file of 4 GiB or more.
+pub const FAT_MAX_FILE_BYTES: u64 = 4 * GIB - 1;
+/// Extra free space required on the formatted target in WinPE besides the reassembled image and
+/// the expanded Windows image (file-system metadata, page file creation during first boot).
+pub const IMAGE_REASSEMBLY_HEADROOM_BYTES: u64 = 2 * GIB;
+
+/// Name of the scattered-staging root directory for `token`.
+pub fn scatter_root_name(token: &str) -> String {
+    format!("{SCATTER_DIRECTORY_PREFIX}{token}")
+}
+
+fn is_locator_token(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Split `LetRecovery_Scatter_<token>\<rest>` into `(token, rest)`.
+///
+/// Any other form, including an unexpected token length, returns `None` so the caller keeps its
+/// historical single-volume interpretation of the path.
+pub fn split_scatter_prefix(relative_path: &str) -> Option<(&str, &str)> {
+    let without_prefix = relative_path.get(..SCATTER_DIRECTORY_PREFIX.len()).and_then(|head| {
+        head.eq_ignore_ascii_case(SCATTER_DIRECTORY_PREFIX)
+            .then(|| &relative_path[SCATTER_DIRECTORY_PREFIX.len()..])
+    })?;
+    let separator = without_prefix.find(['\\', '/'])?;
+    let token = &without_prefix[..separator];
+    let rest = &without_prefix[separator + 1..];
+    (is_locator_token(token) && !rest.is_empty()).then_some((token, rest))
+}
+
+/// Return the data-volume-relative form of a manifest path: scattered paths lose their
+/// `LetRecovery_Scatter_<token>\` prefix, every other path is returned unchanged.
+pub fn strip_scatter_prefix(relative_path: &str) -> &str {
+    split_scatter_prefix(relative_path).map_or(relative_path, |(_, rest)| rest)
+}
+
+/// Largest single file a file system can store. Unknown names are treated as unlimited; the real
+/// write still reports an error if that assumption is wrong.
+pub fn max_file_bytes_for_file_system(file_system: Option<&str>) -> u64 {
+    match file_system.map(str::trim) {
+        Some(name)
+            if ["FAT", "FAT12", "FAT16", "FAT32"]
+                .iter()
+                .any(|fat| name.eq_ignore_ascii_case(fat)) =>
+        {
+            FAT_MAX_FILE_BYTES
+        }
+        _ => u64::MAX,
+    }
+}
+
+/// File name of raw image chunk `ordinal` (zero based).
+pub fn image_chunk_file_name(image_file_name: &str, ordinal: u32) -> String {
+    format!("{image_file_name}.lrpart{:03}", u64::from(ordinal) + 1)
+}
+
+/// One existing volume that may receive scattered payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScatterVolume {
+    pub letter: char,
+    /// Free bytes available to the caller (`GetDiskFreeSpaceExW`, caller quota aware).
+    pub free_bytes: u64,
+    /// Largest file the volume's file system can store.
+    pub max_file_bytes: u64,
+}
+
+/// Shape of the installation source for scattered planning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScatterImageDemand {
+    /// One image file. `chunkable` is true only when WinPE will format the target and can
+    /// therefore reassemble raw chunks there.
+    SingleFile { bytes: u64, chunkable: bool },
+    /// Split WIM parts. Every part is an independent file and may live on any volume.
+    IndependentFiles { files: Vec<u64> },
+    /// Files that an external engine discovers by directory (GHO/GHS); they stay together.
+    TogetherFiles { files: Vec<u64> },
+    /// Directory tree that must remain on the primary volume (XP/2003 text mode source).
+    PrimaryTree { bytes: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScatterRequest {
+    pub volumes: Vec<ScatterVolume>,
+    pub image: ScatterImageDemand,
+    /// Components that are always stored on the primary volume (PCA package, UefiSeven).
+    pub primary_fixed_bytes: u64,
+    /// Components that may be distributed in whole units (drivers, user drivers, installers).
+    pub flexible_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScatterImagePlacement {
+    /// The complete image (single file, SWM set, GHO set or XP tree) on one volume.
+    Whole(char),
+    /// One volume per split WIM part, in source order.
+    PerFile(Vec<char>),
+    /// Raw byte chunks placed while copying; WinPE reassembles them on the formatted target.
+    Chunked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScatterPlan {
+    pub primary: char,
+    pub image: ScatterImagePlacement,
+    /// Bytes that later components must leave free on a volume because the image is assigned
+    /// there. Chunked images reserve nothing: chunks use whatever is left when they are copied.
+    pub image_reservations: Vec<(char, u64)>,
+}
+
+/// Reserve that a volume keeps free in scattered mode.
+pub const fn scatter_reserve_bytes(is_primary: bool) -> u64 {
+    if is_primary {
+        SCATTER_PRIMARY_RESERVE_BYTES
+    } else {
+        SCATTER_SECONDARY_RESERVE_BYTES
+    }
+}
+
+/// Pick one existing volume that can hold the complete payload plus the usual 2 GiB headroom.
+/// The volume with the most free space wins; ties keep the lowest drive letter.
+pub fn select_single_existing_volume(
+    volumes: &[ScatterVolume],
+    payload_bytes: u64,
+    largest_file_bytes: u64,
+) -> Option<char> {
+    let required = required_staging_bytes(payload_bytes)?;
+    volumes
+        .iter()
+        .filter(|volume| volume.free_bytes >= required && volume.max_file_bytes >= largest_file_bytes)
+        .max_by_key(|volume| (volume.free_bytes, std::cmp::Reverse(volume.letter)))
+        .map(|volume| volume.letter)
+}
+
+/// Choose the volume for one indivisible unit (one driver package, one installer, one chunk).
+///
+/// `candidates` holds `(letter, currently available bytes, largest storable file)`. The preferred
+/// volume is used when the unit fits there, keeping components together; otherwise the volume
+/// with the most available space that fits is used. `None` means the unit fits nowhere.
+pub fn choose_volume_for_unit(
+    candidates: &[(char, u64, u64)],
+    unit_bytes: u64,
+    largest_file_bytes: u64,
+    preferred: Option<char>,
+) -> Option<char> {
+    let fits = |(_, available, max_file): &(char, u64, u64)| {
+        *available >= unit_bytes && *max_file >= largest_file_bytes
+    };
+    if let Some(preferred) = preferred {
+        if candidates
+            .iter()
+            .any(|candidate| candidate.0 == preferred && fits(candidate))
+        {
+            return Some(preferred);
+        }
+    }
+    candidates
+        .iter()
+        .filter(|candidate| fits(candidate))
+        .max_by_key(|(letter, available, _)| (*available, std::cmp::Reverse(*letter)))
+        .map(|(letter, _, _)| *letter)
+}
+
+/// Length of the next raw image chunk, or `None` when the chosen volume is too small to be worth
+/// a chunk (smaller than [`IMAGE_CHUNK_MIN_BYTES`] while more data than that remains).
+pub fn next_image_chunk_len(remaining: u64, available: u64, max_file_bytes: u64) -> Option<u64> {
+    if remaining == 0 {
+        return None;
+    }
+    let length = remaining.min(available).min(max_file_bytes);
+    if length == 0 || (length < IMAGE_CHUNK_MIN_BYTES && length < remaining) {
+        None
+    } else {
+        Some(length)
+    }
+}
+
+/// Free bytes the target volume must retain after in-place staging, so the reassembled image,
+/// the applied Windows image and first-boot artifacts still fit once the old system is deleted.
+pub const IN_PLACE_TARGET_RESERVE_BYTES: u64 = 3 * GIB;
+
+/// Whether the target volume, with the old system still present, can host the entire payload
+/// in-place. `old_system_bytes` is what will be reclaimed by the pre-write old-system deletion;
+/// only that reclaimable space plus current free space is counted, and the applied image plus a
+/// fixed reserve must still fit afterwards.
+pub fn target_can_host_in_place(
+    target_free_bytes: u64,
+    old_system_bytes: u64,
+    payload_bytes: u64,
+    expanded_image_bytes: u64,
+) -> bool {
+    let reclaimable = target_free_bytes.saturating_add(old_system_bytes);
+    let required = match required_staging_bytes(payload_bytes) {
+        Some(value) => value,
+        None => return false,
+    };
+    // Payload must fit beside the old system that is still on disk at staging time.
+    if target_free_bytes < required {
+        return false;
+    }
+    // After deletion the volume must still hold the applied image plus a fixed reserve; the
+    // staged payload is consumed as the image is applied, so it is not double-counted here.
+    let after_delete_required = expanded_image_bytes
+        .saturating_add(IN_PLACE_TARGET_RESERVE_BYTES);
+    reclaimable >= after_delete_required
+}
+
+/// Plan a scattered layout from a fresh volume inventory.
+///
+/// The image, the least flexible component, is placed first (best fit, so the largest volumes
+/// remain available for drivers and installers). The plan fails only when the payload cannot fit
+/// in the combined free space at all, or when a component that must stay whole fits nowhere.
+pub fn plan_scattered_staging(request: &ScatterRequest) -> Result<ScatterPlan, String> {
+    let mut volumes = request.volumes.clone();
+    volumes.sort_by_key(|volume| (std::cmp::Reverse(volume.free_bytes), volume.letter));
+    let largest = volumes
+        .first()
+        .copied()
+        .ok_or_else(|| "no existing volume is available for scattered staging".to_owned())?;
+
+    let primary_needs = match &request.image {
+        ScatterImageDemand::PrimaryTree { bytes } => request
+            .primary_fixed_bytes
+            .checked_add(*bytes)
+            .ok_or_else(|| "primary payload size overflows u64".to_owned())?,
+        _ => request.primary_fixed_bytes,
+    };
+    let primary = volumes
+        .iter()
+        .find(|volume| {
+            volume.free_bytes.saturating_sub(scatter_reserve_bytes(true)) >= primary_needs
+        })
+        .map(|volume| volume.letter)
+        .ok_or_else(|| {
+            format!(
+                "no existing volume can hold the primary payload of {primary_needs} bytes plus {} bytes headroom (largest volume {}: has {} free bytes)",
+                scatter_reserve_bytes(true),
+                largest.letter,
+                largest.free_bytes
+            )
+        })?;
+
+    let mut capacity: Vec<(char, u64, u64)> = volumes
+        .iter()
+        .map(|volume| {
+            let is_primary = volume.letter == primary;
+            let usable = volume
+                .free_bytes
+                .saturating_sub(scatter_reserve_bytes(is_primary))
+                .saturating_sub(if is_primary { primary_needs } else { 0 });
+            (volume.letter, usable, volume.max_file_bytes)
+        })
+        .collect();
+    let best_fit = |capacity: &[(char, u64, u64)], total: u64, largest_file: u64| {
+        capacity
+            .iter()
+            .filter(|(_, usable, max_file)| *usable >= total && *max_file >= largest_file)
+            .min_by_key(|(letter, usable, _)| (*usable, *letter))
+            .map(|(letter, _, _)| *letter)
+    };
+    let take = |capacity: &mut Vec<(char, u64, u64)>, letter: char, bytes: u64| {
+        if let Some(entry) = capacity.iter_mut().find(|entry| entry.0 == letter) {
+            entry.1 = entry.1.saturating_sub(bytes);
+        }
+    };
+
+    let (image, image_reservations) = match &request.image {
+        ScatterImageDemand::PrimaryTree { .. } => (ScatterImagePlacement::Whole(primary), Vec::new()),
+        ScatterImageDemand::SingleFile { bytes, chunkable } => {
+            if let Some(letter) = best_fit(&capacity, *bytes, *bytes) {
+                take(&mut capacity, letter, *bytes);
+                (ScatterImagePlacement::Whole(letter), vec![(letter, *bytes)])
+            } else if *chunkable {
+                let total: u64 = capacity
+                    .iter()
+                    .map(|(_, usable, _)| *usable)
+                    .fold(0_u64, u64::saturating_add);
+                if total < *bytes {
+                    return Err(format!(
+                        "the image needs {bytes} bytes but all existing volumes together only have {total} usable bytes"
+                    ));
+                }
+                // Chunks consume the largest volumes first; account for that in the remaining
+                // capacity so the flexible-payload check below stays honest.
+                let mut remaining = *bytes;
+                let mut order: Vec<usize> = (0..capacity.len()).collect();
+                order.sort_by_key(|index| std::cmp::Reverse(capacity[*index].1));
+                for index in order {
+                    let used = remaining.min(capacity[index].1);
+                    capacity[index].1 -= used;
+                    remaining -= used;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
+                (ScatterImagePlacement::Chunked, Vec::new())
+            } else {
+                return Err(format!(
+                    "the {bytes}-byte image fits on no single existing volume and this installation mode cannot reassemble chunks on the target"
+                ));
+            }
+        }
+        ScatterImageDemand::TogetherFiles { files } | ScatterImageDemand::IndependentFiles { files } => {
+            let total = files
+                .iter()
+                .try_fold(0_u64, |sum, file| sum.checked_add(*file))
+                .ok_or_else(|| "image set size overflows u64".to_owned())?;
+            let largest_file = files.iter().copied().max().unwrap_or(0);
+            if let Some(letter) = best_fit(&capacity, total, largest_file) {
+                take(&mut capacity, letter, total);
+                (ScatterImagePlacement::Whole(letter), vec![(letter, total)])
+            } else if matches!(request.image, ScatterImageDemand::TogetherFiles { .. }) {
+                return Err(format!(
+                    "the {total}-byte GHO/GHS set must stay in one directory but fits on no single existing volume"
+                ));
+            } else {
+                let mut order: Vec<usize> = (0..files.len()).collect();
+                order.sort_by_key(|index| std::cmp::Reverse(files[*index]));
+                let mut assigned = vec![primary; files.len()];
+                let mut reservations: Vec<(char, u64)> = Vec::new();
+                for index in order {
+                    let size = files[index];
+                    let letter = capacity
+                        .iter()
+                        .filter(|(_, usable, max_file)| *usable >= size && *max_file >= size)
+                        .max_by_key(|(letter, usable, _)| (*usable, std::cmp::Reverse(*letter)))
+                        .map(|(letter, _, _)| *letter)
+                        .ok_or_else(|| {
+                            format!("split image part {} ({size} bytes) fits on no existing volume", index + 1)
+                        })?;
+                    take(&mut capacity, letter, size);
+                    assigned[index] = letter;
+                    match reservations.iter_mut().find(|entry| entry.0 == letter) {
+                        Some(entry) => entry.1 = entry.1.saturating_add(size),
+                        None => reservations.push((letter, size)),
+                    }
+                }
+                (ScatterImagePlacement::PerFile(assigned), reservations)
+            }
+        }
+    };
+
+    let remaining: u64 = capacity
+        .iter()
+        .map(|(_, usable, _)| *usable)
+        .fold(0_u64, u64::saturating_add);
+    if remaining < request.flexible_bytes {
+        return Err(format!(
+            "drivers and installers need {} bytes but only {remaining} bytes remain on existing volumes after placing the image",
+            request.flexible_bytes
+        ));
+    }
+    Ok(ScatterPlan {
+        primary,
+        image,
+        image_reservations,
+    })
+}
+
+#[cfg(test)]
+mod scatter_tests {
+    use super::*;
+
+    fn volume(letter: char, free_gib: u64) -> ScatterVolume {
+        ScatterVolume {
+            letter,
+            free_bytes: free_gib * GIB,
+            max_file_bytes: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn scatter_prefix_round_trips_only_exact_tokens() {
+        let token = "a".repeat(64);
+        let path = format!("{}\\LetRecovery_Data\\drivers\\x.inf", scatter_root_name(&token));
+        assert_eq!(
+            split_scatter_prefix(&path),
+            Some((token.as_str(), "LetRecovery_Data\\drivers\\x.inf"))
+        );
+        assert_eq!(strip_scatter_prefix(&path), "LetRecovery_Data\\drivers\\x.inf");
+        assert_eq!(strip_scatter_prefix("LetRecovery_Data\\a.wim"), "LetRecovery_Data\\a.wim");
+        assert_eq!(split_scatter_prefix("LetRecovery_Scatter_abc\\x"), None);
+        let upper = format!("letrecovery_scatter_{}/y", "B".repeat(64));
+        assert_eq!(split_scatter_prefix(&upper).map(|(_, rest)| rest), Some("y"));
+        assert_eq!(split_scatter_prefix(&format!("{}\\", scatter_root_name(&token))), None);
+    }
+
+    #[test]
+    fn fat_volumes_limit_single_files() {
+        assert_eq!(max_file_bytes_for_file_system(Some("FAT32")), FAT_MAX_FILE_BYTES);
+        assert_eq!(max_file_bytes_for_file_system(Some("fat")), FAT_MAX_FILE_BYTES);
+        assert_eq!(max_file_bytes_for_file_system(Some("NTFS")), u64::MAX);
+        assert_eq!(max_file_bytes_for_file_system(Some("exFAT")), u64::MAX);
+        assert_eq!(max_file_bytes_for_file_system(None), u64::MAX);
+        assert_eq!(image_chunk_file_name("a.esd", 0), "a.esd.lrpart001");
+        assert_eq!(image_chunk_file_name("a.esd", 11), "a.esd.lrpart012");
+    }
+
+    #[test]
+    fn a_single_volume_that_holds_everything_is_preferred() {
+        let volumes = [volume('D', 449), volume('E', 20)];
+        assert_eq!(select_single_existing_volume(&volumes, 10 * GIB, 5 * GIB), Some('D'));
+        assert_eq!(select_single_existing_volume(&volumes, 500 * GIB, 5 * GIB), None);
+        let fat = [ScatterVolume {
+            letter: 'F',
+            free_bytes: 100 * GIB,
+            max_file_bytes: FAT_MAX_FILE_BYTES,
+        }];
+        assert_eq!(select_single_existing_volume(&fat, 6 * GIB, 5 * GIB), None);
+    }
+
+    #[test]
+    fn single_image_uses_best_fit_and_keeps_large_volume_for_drivers() {
+        let plan = plan_scattered_staging(&ScatterRequest {
+            volumes: vec![volume('D', 30), volume('E', 8)],
+            image: ScatterImageDemand::SingleFile {
+                bytes: 5 * GIB,
+                chunkable: true,
+            },
+            primary_fixed_bytes: 100 * MIB,
+            flexible_bytes: 20 * GIB,
+        })
+        .unwrap();
+        assert_eq!(plan.primary, 'D');
+        assert_eq!(plan.image, ScatterImagePlacement::Whole('E'));
+        assert_eq!(plan.image_reservations, vec![('E', 5 * GIB)]);
+    }
+
+    #[test]
+    fn oversized_single_image_is_chunked_only_when_the_target_is_formatted() {
+        let request = |chunkable| ScatterRequest {
+            volumes: vec![volume('D', 5), volume('E', 5), volume('F', 5)],
+            image: ScatterImageDemand::SingleFile {
+                bytes: 9 * GIB,
+                chunkable,
+            },
+            primary_fixed_bytes: 0,
+            flexible_bytes: GIB,
+        };
+        let plan = plan_scattered_staging(&request(true)).unwrap();
+        assert_eq!(plan.image, ScatterImagePlacement::Chunked);
+        assert!(plan.image_reservations.is_empty());
+        assert!(plan_scattered_staging(&request(false)).is_err());
+    }
+
+    #[test]
+    fn split_wim_parts_are_distributed_and_ghost_sets_stay_together() {
+        let plan = plan_scattered_staging(&ScatterRequest {
+            volumes: vec![volume('D', 7), volume('E', 7)],
+            image: ScatterImageDemand::IndependentFiles {
+                files: vec![4 * GIB, 4 * GIB],
+            },
+            primary_fixed_bytes: 0,
+            flexible_bytes: 0,
+        })
+        .unwrap();
+        let ScatterImagePlacement::PerFile(letters) = plan.image else {
+            panic!("expected per-file placement");
+        };
+        assert_eq!(letters.len(), 2);
+        assert_ne!(letters[0], letters[1]);
+        assert!(plan_scattered_staging(&ScatterRequest {
+            volumes: vec![volume('D', 5), volume('E', 5)],
+            image: ScatterImageDemand::TogetherFiles {
+                files: vec![4 * GIB, 4 * GIB],
+            },
+            primary_fixed_bytes: 0,
+            flexible_bytes: 0,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn plan_rejects_payload_larger_than_total_free_space() {
+        assert!(plan_scattered_staging(&ScatterRequest {
+            volumes: vec![volume('D', 5), volume('E', 5)],
+            image: ScatterImageDemand::SingleFile {
+                bytes: 3 * GIB,
+                chunkable: true,
+            },
+            primary_fixed_bytes: 0,
+            flexible_bytes: 20 * GIB,
+        })
+        .is_err());
+        assert!(plan_scattered_staging(&ScatterRequest {
+            volumes: Vec::new(),
+            image: ScatterImageDemand::SingleFile {
+                bytes: 1,
+                chunkable: true,
+            },
+            primary_fixed_bytes: 0,
+            flexible_bytes: 0,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn unit_placement_prefers_the_requested_volume_then_the_largest() {
+        let candidates = [('D', 10 * GIB, u64::MAX), ('E', 20 * GIB, FAT_MAX_FILE_BYTES)];
+        assert_eq!(choose_volume_for_unit(&candidates, GIB, GIB, Some('D')), Some('D'));
+        assert_eq!(choose_volume_for_unit(&candidates, GIB, GIB, None), Some('E'));
+        assert_eq!(choose_volume_for_unit(&candidates, 12 * GIB, 5 * GIB, None), None);
+        assert_eq!(choose_volume_for_unit(&candidates, 5 * GIB, 5 * GIB, None), Some('D'));
+    }
+
+    #[test]
+    fn chunk_lengths_respect_space_file_limits_and_minimum() {
+        assert_eq!(next_image_chunk_len(10 * GIB, 3 * GIB, u64::MAX), Some(3 * GIB));
+        assert_eq!(next_image_chunk_len(10 * GIB, 8 * GIB, FAT_MAX_FILE_BYTES), Some(FAT_MAX_FILE_BYTES));
+        assert_eq!(next_image_chunk_len(10 * GIB, MIB, u64::MAX), None);
+        assert_eq!(next_image_chunk_len(MIB, 5 * MIB, u64::MAX), Some(MIB));
+        assert_eq!(next_image_chunk_len(0, 5 * MIB, u64::MAX), None);
+    }
+}

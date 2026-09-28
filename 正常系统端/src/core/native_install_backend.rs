@@ -583,11 +583,13 @@ fn partition_matches_stable_identity(
     match lr_core::windows_storage::stable_volume_identity(letter) {
         Ok(actual) => identity.matches_stable_volume(actual),
         Err(error) => {
-            log::error!(
-                "[NATIVE INSTALL TARGET] cannot re-probe stable identity for {}: {error}",
+            // The exact physical range already matched above. An unreadable identity token
+            // (filtered storage stack) is not evidence of a different partition.
+            log::warn!(
+                "[NATIVE INSTALL TARGET] cannot re-probe stable identity for {}: {error}; the exact extent matched, continuing",
                 partition.letter
             );
-            false
+            true
         }
     }
 }
@@ -748,15 +750,16 @@ where
     Ok(())
 }
 
-/// Distinguishes a verified manifest-only backup from a damaged or incomplete export. Automatic
-/// preservation may safely no-op only when there are no INF packages and no captured boot-storage
-/// requirements. Missing, malformed or contradictory manifests remain fail-closed.
+/// Distinguishes an exported driver payload from a verified manifest-only empty export. A real INF
+/// tree is always importable even when an older WinPE cannot produce topology evidence; the
+/// manifest is required only to prove that an otherwise empty directory is a valid zero-package
+/// result rather than a damaged export.
 fn automatic_driver_export_has_payload(driver_root: &Path) -> anyhow::Result<bool> {
     let inf_count = lr_core::driver::count_exported_driver_inf_files(driver_root)?;
-    let requirements = lr_core::driver::load_storage_driver_requirements(driver_root)?;
     if inf_count != 0 {
         return Ok(true);
     }
+    let requirements = lr_core::driver::load_storage_driver_requirements(driver_root)?;
     if !requirements.is_empty() {
         anyhow::bail!(
             "driver export contains no INF packages but declares {} boot-storage requirements",
@@ -764,6 +767,35 @@ fn automatic_driver_export_has_payload(driver_root: &Path) -> anyhow::Result<boo
         );
     }
     Ok(false)
+}
+
+/// Scattered form of [`automatic_driver_export_has_payload`]: driver packages may live below every
+/// scattered data directory, while the storage requirement manifest stays on the primary volume.
+fn scattered_driver_export_has_payload(
+    data_dirs: &[PathBuf],
+    primary_driver_root: &Path,
+) -> anyhow::Result<bool> {
+    let mut inf_count = 0_usize;
+    for directory in data_dirs {
+        let drivers = directory.join("drivers");
+        if !drivers.is_dir() {
+            continue;
+        }
+        match lr_core::driver::count_exported_driver_inf_files(&drivers) {
+            Ok(count) => inf_count = inf_count.saturating_add(count),
+            Err(error) => log::warn!(
+                "[SCATTER] 统计 {} 中的驱动 INF 失败: {error:#}",
+                drivers.display()
+            ),
+        }
+    }
+    if inf_count != 0 {
+        return Ok(true);
+    }
+    if !primary_driver_root.is_dir() {
+        return Ok(false);
+    }
+    automatic_driver_export_has_payload(primary_driver_root)
 }
 
 fn should_include_preserved_driver_tree(
@@ -956,6 +988,43 @@ pub struct ProductionInstallBackend {
     pe_auxiliary_file_locks: Vec<lr_core::install_source_lock::LockedPlainArtifact>,
     staging_transaction: Option<super::disk::PreparedStagingTransaction>,
     dual_boot_transaction: Option<super::disk::PreparedDualBootTransaction>,
+    /// Present only when the payload is stored on existing volumes instead of one data partition.
+    scattered_staging: Option<super::scattered_staging::ScatterStaging>,
+    /// Directory (below `LetRecovery_Data` on its volume) that holds the staged image when the
+    /// scattered plan put the whole image on a secondary volume.
+    image_data_dir_override: Option<PathBuf>,
+    /// Exact, handle-held files of a scattered image: split WIM parts or raw image chunks in
+    /// manifest order.
+    scattered_image_locks: Vec<lr_core::install_source_lock::LockedPlainArtifact>,
+    scattered_image_layout: ScatteredImageLayout,
+    /// Driver export failed in scattered mode; the installation continues without preserved
+    /// drivers instead of failing.
+    scattered_drivers_unavailable: bool,
+    /// In-place target-drive staging: the payload lives on the target volume itself and PE deletes
+    /// the old system in place instead of formatting. Set only for an ordinary partition reinstall.
+    in_place_target_staging: bool,
+    /// `<target>:\\LetRecovery_Data` of an in-place staging that has not been handed to PE yet.
+    /// Dropping the backend before the handoff commits deletes the staged payload from the
+    /// system drive (keeping logs), so a failed attempt never leaves gigabytes behind on C:.
+    in_place_uncommitted_dir: Option<PathBuf>,
+}
+
+/// How a scattered image is represented in the authenticated manifest.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum ScatteredImageLayout {
+    /// Historical layout: one directory, bound by the existing span/tree locks.
+    #[default]
+    Directory,
+    /// Split WIM parts in manifest order on several volumes.
+    SpanFiles,
+    /// Raw byte chunks of one image file.
+    Chunks {
+        file_name: String,
+        length: u64,
+        sha256: String,
+        expanded_bytes: u64,
+        verified: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1051,6 +1120,7 @@ impl Drop for ProductionInstallBackend {
         self.pe_xp_source_lock.take();
         self.pe_auxiliary_tree_locks.clear();
         self.pe_auxiliary_file_locks.clear();
+        self.scattered_image_locks.clear();
         if let Some(transaction) = self.install_config_transaction.take() {
             if let Err(error) = transaction.rollback() {
                 log::error!("failed to roll back an uncommitted PE install handoff: {error}");
@@ -1063,6 +1133,50 @@ impl Drop for ProductionInstallBackend {
             if let Err(error) = transaction.rollback() {
                 log::error!("failed to roll back an uncommitted dual-boot preparation: {error:#}");
             }
+        }
+        // Every handle on scattered files is gone now; an uncommitted scatter state deletes the
+        // directories it created on secondary volumes.
+        drop(self.scattered_staging.take());
+        if let Some(directory) = self.in_place_uncommitted_dir.take() {
+            remove_uncommitted_in_place_payload(&directory);
+        }
+    }
+}
+
+/// Delete an in-place staging payload that never reached PE. Only entries this installer writes
+/// are removed and the log directory is kept; failures are logged and never mask the real error.
+fn remove_uncommitted_in_place_payload(directory: &Path) {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            log::warn!(
+                "[SCATTER] 读取未提交的目标盘内暂存目录 {} 失败: {error}",
+                directory.display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(lr_core::install_log_handoff::HANDOFF_LOG_DIRECTORY)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let result = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        match result {
+            Ok(()) => log::info!("[SCATTER] 安装未交接给 PE，已删除系统盘上的暂存条目 {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "[SCATTER] 删除系统盘上的暂存条目 {} 失败，可以手动删除: {error}",
+                path.display()
+            ),
         }
     }
 }
@@ -1100,6 +1214,13 @@ impl ProductionInstallBackend {
             pe_auxiliary_file_locks: Vec::new(),
             staging_transaction: None,
             dual_boot_transaction: None,
+            scattered_staging: None,
+            image_data_dir_override: None,
+            scattered_image_locks: Vec::new(),
+            scattered_image_layout: ScatteredImageLayout::Directory,
+            scattered_drivers_unavailable: false,
+            in_place_target_staging: false,
+            in_place_uncommitted_dir: None,
         }
     }
 
@@ -1354,6 +1475,13 @@ impl ProductionInstallBackend {
             let Some(letter) = partition.letter.chars().next() else {
                 continue;
             };
+            // WinPE's X: RAM volume is not an installation volume and has no physical
+            // storage identity.  BitLocker probing can legitimately return Unknown for it;
+            // never add it to the fallback decrypt transaction.
+            if letter.eq_ignore_ascii_case(&'X') {
+                log::debug!("[NATIVE INSTALL] skipping WinPE RAM volume X: in BitLocker fallback");
+                continue;
+            }
             let drive = format!("{}:", letter.to_ascii_uppercase());
             match manager.get_status(letter) {
                 super::bitlocker::VolumeStatus::NotEncrypted => {}
@@ -1537,12 +1665,11 @@ impl ProductionInstallBackend {
                 Ok(())
             }
             super::bitlocker::VolumeStatus::EncryptedUnlocked => {
-                if manager.get_recovery_key(&drive).is_ok() {
-                    Ok(())
-                } else {
-                    self.begin_bitlocker_fallback_decryption()?;
-                    self.await_bitlocker_fallback_decryption(reporter, cancellation)
-                }
+                // An unlocked volume is already readable by the installer.  Possession of a
+                // recovery-password record is not a prerequisite for writing it, and must never
+                // trigger destructive full-volume decryption as a fallback.
+                log::info!("[NATIVE INSTALL] target {drive} is BitLocker-encrypted but unlocked; continuing without decryption");
+                Ok(())
             }
         }
     }
@@ -1551,6 +1678,15 @@ impl ProductionInstallBackend {
         Ok(super::install_config::ConfigFileManager::get_data_dir(
             self.data_partition()?,
         ))
+    }
+
+    /// `LetRecovery_Data` directory that receives the staged image. It is the primary data
+    /// directory except when a scattered plan put the complete image on another volume.
+    fn image_data_dir(&self) -> Result<PathBuf, InstallBackendError> {
+        match &self.image_data_dir_override {
+            Some(directory) => Ok(directory.clone()),
+            None => Ok(PathBuf::from(self.data_dir()?)),
+        }
     }
 
     fn download_software_packages(
@@ -1790,17 +1926,19 @@ impl ProductionInstallBackend {
         let packages = &intent.options.advanced_options.preinstalled_software;
         lr_core::software_install::validate_selected_packages(packages)
             .map_err(|error| Self::error("validate_preinstalled_software", error))?;
-        if !intent.options.unattended_install {
-            return Err(InstallBackendError::new(
-                "preinstalled_software_requires_unattended",
-                "preinstalled software requires LetRecovery unattended installation",
-            ));
-        }
-        if !intent.options.custom_unattend_path.trim().is_empty() {
-            return Err(InstallBackendError::new(
-                "preinstalled_software_conflicts_with_custom_unattend",
-                "preinstalled software requires LetRecovery's built-in unattended file",
-            ));
+        if !intent.options.unattended_install || !intent.options.custom_unattend_path.trim().is_empty()
+        {
+            // The applications are installed by LetRecovery's own first-logon finalizer, which
+            // exists only with the built-in answer file. Skip them instead of refusing the whole
+            // installation.
+            log::warn!(
+                "[PREINSTALL SOFTWARE] phase=pre_destructive status=skipped reason=built_in_unattend_not_used selected={}",
+                packages.len()
+            );
+            self.prepared_software_directory = None;
+            self.prepared_software_bytes = 0;
+            self.prepared_software_packages = Some(Vec::new());
+            return Ok(());
         }
         self.prepared_software_directory = None;
         self.prepared_software_bytes = 0;
@@ -1909,10 +2047,105 @@ impl ProductionInstallBackend {
         Ok(total)
     }
 
+    /// Scattered installer staging: every installer is one indivisible unit.
+    fn stage_preinstalled_software_scattered(&mut self) -> Result<(), InstallBackendError> {
+        let prepared = self
+            .prepared_software_directory
+            .as_ref()
+            .ok_or_else(|| {
+                InstallBackendError::new(
+                    "preinstalled_software_not_prepared",
+                    "preinstalled software download directory is missing",
+                )
+            })?
+            .path()
+            .to_path_buf();
+        let packages = self.prepared_software_packages.clone().ok_or_else(|| {
+            InstallBackendError::new(
+                "preinstalled_software_subset_missing",
+                "preinstalled software download result is missing",
+            )
+        })?;
+        let expected_total = self.prepared_software_bytes;
+        let scatter = self.scattered_staging.as_mut().ok_or_else(|| {
+            InstallBackendError::new(
+                "scattered_staging_missing",
+                "scattered staging state is missing before installer staging",
+            )
+        })?;
+        for directory in scatter.existing_data_dirs() {
+            let old = directory.join("preinstalled_software");
+            if old.exists() {
+                std::fs::remove_dir_all(&old)
+                    .map_err(|error| Self::error("clear_preinstalled_software_destination", error))?;
+            }
+        }
+        let mut total = 0_u64;
+        for package in &packages {
+            let source = prepared.join(&package.filename);
+            let source_metadata = std::fs::symlink_metadata(&source)
+                .map_err(|error| Self::error("inspect_prepared_software", error))?;
+            if !source_metadata.is_file()
+                || source_metadata.file_type().is_symlink()
+                || source_metadata.len() == 0
+            {
+                return Err(InstallBackendError::new(
+                    "unsafe_prepared_software_file",
+                    format!("{} is not an ordinary non-empty file", source.display()),
+                ));
+            }
+            let length = source_metadata.len();
+            let letter = scatter.choose_for_unit(length, length);
+            let directory = scatter
+                .data_dir_for(letter)
+                .map_err(|error| Self::error("prepare_scattered_software_directory", error))?
+                .join("preinstalled_software");
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| Self::error("create_preinstalled_software_destination", error))?;
+            let target = directory.join(&package.filename);
+            let mut input =
+                File::open(&source).map_err(|error| Self::error("open_prepared_software", error))?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map_err(|error| Self::error("create_staged_software", error))?;
+            let copied = std::io::copy(&mut input, &mut output)
+                .map_err(|error| Self::error("copy_preinstalled_software", error))?;
+            output
+                .flush()
+                .and_then(|_| output.sync_all())
+                .map_err(|error| Self::error("flush_staged_software", error))?;
+            drop(output);
+            let target_length = std::fs::symlink_metadata(&target)
+                .map_err(|error| Self::error("inspect_staged_software", error))?
+                .len();
+            if copied != length || target_length != length {
+                return Err(InstallBackendError::new(
+                    "staged_software_readback_mismatch",
+                    format!("staged installer readback failed for {}", package.name),
+                ));
+            }
+            scatter.record_placed(letter, length);
+            total = total.saturating_add(length);
+        }
+        if total != expected_total {
+            return Err(InstallBackendError::new(
+                "staged_software_budget_mismatch",
+                format!("downloaded {expected_total} bytes but staged {total} bytes"),
+            ));
+        }
+        self.prepared_software_directory = None;
+        Ok(())
+    }
+
     fn stage_preinstalled_software_for_pe(
         &mut self,
         _intent: &StartInstallIntent,
     ) -> Result<(), InstallBackendError> {
+        if self.scattered_staging.is_some() {
+            return self.stage_preinstalled_software_scattered();
+        }
         let destination = Path::new(&self.data_dir()?).join("preinstalled_software");
         let packages = self.prepared_software_packages.as_deref().ok_or_else(|| {
             InstallBackendError::new(
@@ -2201,6 +2434,10 @@ impl ProductionInstallBackend {
             };
         }
         config.commit();
+        if let Some(scatter) = self.scattered_staging.as_mut() {
+            scatter.mark_committed();
+        }
+        self.in_place_uncommitted_dir = None;
         if let Some(transaction) = self.staging_transaction.take() {
             transaction.commit();
         }
@@ -2342,6 +2579,37 @@ impl ProductionInstallBackend {
         Ok(total)
     }
 
+    /// The advanced "import custom driver directory" payload, staged for PE next to the versioned
+    /// user drivers. A missing or unreadable directory is skipped, never fatal.
+    fn planned_custom_driver_bytes(intent: &StartInstallIntent) -> u64 {
+        let advanced = &intent.options.advanced_options;
+        let path = advanced.custom_drivers_path.trim();
+        if !advanced.import_custom_drivers || path.is_empty() {
+            return 0;
+        }
+        let source = Path::new(path);
+        match Self::directory_has_inf_checked(source) {
+            Ok(true) => match Self::directory_size_checked(source) {
+                Ok(size) => size,
+                Err(error) => {
+                    log::warn!(
+                        "[DATA CAPACITY] custom driver directory cannot be measured and will be skipped: {}",
+                        error.detail
+                    );
+                    0
+                }
+            },
+            Ok(false) => 0,
+            Err(error) => {
+                log::warn!(
+                    "[DATA CAPACITY] custom driver directory is unavailable and will be skipped: {}",
+                    error.detail
+                );
+                0
+            }
+        }
+    }
+
     fn planned_uefiseven_bytes(intent: &StartInstallIntent) -> Result<u64, InstallBackendError> {
         if !(intent.options.repair_boot && intent.options.advanced_options.win7_uefi_patch) {
             return Ok(0);
@@ -2375,9 +2643,19 @@ impl ProductionInstallBackend {
     ) -> Result<StagingPayloadBudget, InstallBackendError> {
         let image_bytes = Self::source_payload_bytes(intent)?;
         let exported_driver_bytes = if intent.options.export_drivers {
-            lr_core::driver::estimate_online_oem_driver_export()
-                .map_err(|error| Self::error("measure_oem_driver_export", error))?
-                .bytes
+            // A damaged Driver Store must not block the installation. Reserve a conservative
+            // budget instead; the real export is reconciled against free space afterwards.
+            const DRIVER_EXPORT_FALLBACK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+            match lr_core::driver::estimate_online_oem_driver_export() {
+                Ok(estimate) => estimate.bytes,
+                Err(error) => {
+                    log::warn!(
+                        "[DATA CAPACITY] Driver Store size could not be measured; reserving {} bytes and continuing: {error:#}",
+                        DRIVER_EXPORT_FALLBACK_BYTES
+                    );
+                    DRIVER_EXPORT_FALLBACK_BYTES
+                }
+            }
         } else {
             0
         };
@@ -2417,7 +2695,9 @@ impl ProductionInstallBackend {
             })
             .transpose()?
             .unwrap_or(0);
-        let user_driver_bytes = Self::planned_user_driver_bytes()?;
+        let user_driver_bytes = Self::planned_user_driver_bytes()?
+            .saturating_add(Self::planned_custom_driver_bytes(intent))
+            .saturating_add(Self::planned_advanced_input_bytes(intent));
         let uefiseven_bytes = Self::planned_uefiseven_bytes(intent)?;
         let budget = StagingPayloadBudget {
             image_bytes,
@@ -2479,15 +2759,53 @@ impl ProductionInstallBackend {
         let force_target_shrink = super::pe::ci_force_auto_staging_requested();
         #[cfg(not(feature = "ci-automation"))]
         let force_target_shrink = false;
-        let selected = DiskManager::find_suitable_data_partition(
+        // Scattered staging never changes the partition table, so it is available only for an
+        // ordinary partition reinstall: a full-disk reinstall erases the other partitions on its
+        // disks and a dual-boot installation needs VDS for its new Windows partition anyway.
+        let scatter_allowed = matches!(
+            intent.options.custom_install_plan,
+            lr_core::custom_install::CustomInstallPlan::ReinstallPartition
+        ) && !force_target_shrink;
+        if scatter_allowed && super::app_config::AppConfig::load().scattered_staging_enabled {
+            log::info!(
+                "[SCATTER] config.json 已开启 scattered_staging_enabled：不调用 VDS/存储管理 API，直接使用已有分区"
+            );
+            return self.select_scattered_staging(intent, budget, payload_bytes);
+        }
+        if scatter_allowed
+            && lr_core::windows_storage::physical_storage_restricted(intent.target_disk_number)
+        {
+            // Filtered storage stacks (hardware-ID spoofers, diskless/restore drivers, or the
+            // simulation switch) make VDS / Storage Management unreliable. Never shrink or
+            // create partitions there; existing volumes are enough.
+            log::warn!(
+                "[SCATTER] 目标磁盘 {} 的底层查询受限，不调用 VDS/存储管理 API 改分区，直接使用已有分区暂存",
+                intent.target_disk_number
+            );
+            return self.select_scattered_staging(intent, budget, payload_bytes);
+        }
+        let selected = match DiskManager::find_suitable_data_partition(
             &intent.target_partition,
             payload_bytes,
             allow_target_shrink,
             force_target_shrink,
-        )
-        .map_err(|error| Self::error("select_data_partition", error))?;
+        ) {
+            Ok(selected) => selected,
+            Err(error) if scatter_allowed => {
+                log::warn!(
+                    "[SCATTER] 选择或新建数据分区失败（VDS/存储管理 API 不可用或缩卷失败），改用已有分区分散暂存: {error:#}"
+                );
+                return self.select_scattered_staging(intent, budget, payload_bytes);
+            }
+            Err(error) => return Err(Self::error("select_data_partition", error)),
+        };
         let selected = if let Some(selected) = selected {
             selected
+        } else if scatter_allowed {
+            log::warn!(
+                "[SCATTER] 没有单个分区能容纳全部文件且无法新建数据分区，改用已有分区分散暂存"
+            );
+            return self.select_scattered_staging(intent, budget, payload_bytes);
         } else if let lr_core::custom_install::CustomInstallPlan::DualBoot(plan) =
             &intent.options.custom_install_plan
         {
@@ -2545,6 +2863,509 @@ impl ProductionInstallBackend {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    /// Image files in source order: one entry for WIM/ESD/GHO, every part for SWM/GHS sets.
+    fn source_image_file_sizes(
+        intent: &StartInstallIntent,
+    ) -> Result<(Vec<u64>, Option<StagedImageSetKind>), InstallBackendError> {
+        let image_set = enumerate_staged_image_set(Path::new(&intent.image_path))
+            .map_err(|error| InstallBackendError::new("enumerate_source_image_set", error))?;
+        let sizes = image_set
+            .volumes
+            .iter()
+            .map(|path| {
+                std::fs::metadata(path)
+                    .map(|metadata| metadata.len())
+                    .map_err(|error| Self::error("measure_source_image_volume", error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((sizes, Some(image_set.kind)))
+    }
+
+    /// Bytes the selected image occupies after it is applied, or 0 when unknown.
+    fn expanded_image_bytes(intent: &StartInstallIntent) -> u64 {
+        let result = lr_core::wimlib::WimlibManager::new()
+            .and_then(|manager| manager.get_image_info(&intent.image_path))
+            .map(|images| {
+                images
+                    .into_iter()
+                    .find(|image| image.index == intent.volume_index)
+                    .map(|image| image.size_bytes.saturating_sub(image.hard_link_bytes))
+                    .unwrap_or(0)
+            });
+        match result {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!("[SCATTER] 读取镜像释放后大小失败，按未知处理: {error}");
+                0
+            }
+        }
+    }
+
+    /// Raw chunks are reassembled on the target after WinPE formats it, so they are possible only
+    /// for an ordinary, formatting partition reinstall of a single WIM/ESD-style file whose
+    /// target is large enough for the reassembled file plus the applied image.
+    fn image_chunking_supported(intent: &StartInstallIntent, image_bytes: u64) -> bool {
+        if intent.is_gho || intent.options.is_xp || intent.options.is_xp_i386 {
+            return false;
+        }
+        if !intent.options.format_partition
+            || intent.options.advanced_options.preserve_personal_files
+            || !matches!(
+                intent.options.custom_install_plan,
+                lr_core::custom_install::CustomInstallPlan::ReinstallPartition
+            )
+        {
+            log::warn!(
+                "[SCATTER] 本次不格式化目标分区，PE 无处拼回镜像分块；镜像必须整体放进某个已有分区"
+            );
+            return false;
+        }
+        let expanded = Self::expanded_image_bytes(intent);
+        let required = image_bytes
+            .saturating_add(expanded)
+            .saturating_add(lr_core::data_staging::IMAGE_REASSEMBLY_HEADROOM_BYTES);
+        let target_letter = intent
+            .target_partition
+            .chars()
+            .next()
+            .map(|letter| letter.to_ascii_uppercase());
+        let target_size = target_letter
+            .and_then(super::scattered_staging::volume_total_bytes)
+            .or((intent.target_partition_size_bytes != 0).then_some(intent.target_partition_size_bytes));
+        match target_size {
+            Some(size) if size < required => {
+                log::warn!(
+                    "[SCATTER] 目标分区只有 {size} 字节，放不下拼回的镜像 {image_bytes} 字节加释放后约 {expanded} 字节，不能使用镜像分块"
+                );
+                false
+            }
+            Some(_) => true,
+            None => {
+                log::warn!("[SCATTER] 读不到目标分区容量，仍允许镜像分块，PE 写盘前会再次核对");
+                true
+            }
+        }
+    }
+
+    /// Multi-volume scattering, raw image chunks and in-place staging need the PE helper that
+    /// declares `scattered-staging-v1`. Checking before any file is written turns an old PE into
+    /// a clear message now instead of a failure after the reboot.
+    fn require_pe_scatter_support(&self) -> Result<(), InstallBackendError> {
+        let Some(pe_path) = self.pe_path.as_deref() else {
+            return Ok(());
+        };
+        if super::pe::supports_scattered_staging(pe_path) {
+            return Ok(());
+        }
+        Err(InstallBackendError::new(
+            "scatter_requires_new_pe",
+            format!(
+                "the selected PE ({}) does not declare scattered-staging-v1; rebuild the PE with the current LetRecoveryPE",
+                pe_path.display()
+            ),
+        ))
+    }
+
+    /// Store the payload on existing volumes without creating a partition. One volume is used
+    /// when it can hold everything; otherwise the scattered plan distributes it.
+    fn select_scattered_staging(
+        &mut self,
+        intent: &StartInstallIntent,
+        budget: StagingPayloadBudget,
+        payload_bytes: u64,
+    ) -> Result<(), InstallBackendError> {
+        use lr_core::data_staging::{ScatterImageDemand, ScatterRequest};
+
+        self.scattered_staging = None;
+        self.image_data_dir_override = None;
+        self.scattered_image_layout = ScatteredImageLayout::Directory;
+        let mut excluded = intent
+            .target_partition
+            .chars()
+            .next()
+            .map(|letter| letter.to_ascii_uppercase())
+            .into_iter()
+            .collect::<Vec<_>>();
+        if intent.running_in_pe || DiskManager::is_pe_environment() {
+            excluded.push('X');
+        }
+        let inventory = super::scattered_staging::inventory_existing_volumes(&excluded);
+        if inventory.is_empty() {
+            log::warn!(
+                "[SCATTER] 目标分区之外没有可用的固定分区，尝试目标盘内暂存（不格式化，原地删除旧系统）"
+            );
+            return self.select_in_place_target_staging(intent, budget, payload_bytes);
+        }
+        let volumes = inventory
+            .iter()
+            .map(super::scattered_staging::InventoryVolume::as_scatter_volume)
+            .collect::<Vec<_>>();
+        let (image_files, image_kind) = if intent.options.is_xp_i386 {
+            (vec![budget.image_bytes], None)
+        } else {
+            Self::source_image_file_sizes(intent)?
+        };
+        let largest_image_file = image_files.iter().copied().max().unwrap_or(0);
+        if let Some(letter) = lr_core::data_staging::select_single_existing_volume(
+            &volumes,
+            payload_bytes,
+            largest_image_file,
+        ) {
+            log::info!(
+                "[SCATTER] 已有分区 {letter}: 能容纳全部文件（{payload_bytes} 字节另加 2 GiB 余量），不分散"
+            );
+            return self.finish_existing_volume_selection(format!("{letter}:"), budget);
+        }
+        let image = if intent.options.is_xp_i386 {
+            ScatterImageDemand::PrimaryTree {
+                bytes: budget.image_bytes,
+            }
+        } else if image_files.len() > 1 {
+            if image_kind == Some(StagedImageSetKind::Swm) {
+                ScatterImageDemand::IndependentFiles { files: image_files }
+            } else {
+                ScatterImageDemand::TogetherFiles { files: image_files }
+            }
+        } else {
+            ScatterImageDemand::SingleFile {
+                bytes: budget.image_bytes,
+                // In-place staging keeps the whole image on the target and never chunks; this
+                // branch is only reached for cross-volume scattering.
+                chunkable: Self::image_chunking_supported(intent, budget.image_bytes),
+            }
+        };
+        let flexible_bytes = budget
+            .exported_driver_bytes
+            .saturating_add(budget.user_driver_bytes)
+            .saturating_add(budget.preinstalled_software_bytes);
+        let request = ScatterRequest {
+            volumes,
+            image,
+            primary_fixed_bytes: budget.pca_bytes.saturating_add(budget.uefiseven_bytes),
+            flexible_bytes,
+        };
+        self.require_pe_scatter_support()?;
+        let plan = match lr_core::data_staging::plan_scattered_staging(&request) {
+            Ok(plan) => plan,
+            Err(error) => {
+                log::warn!(
+                    "[SCATTER] 已有分区无法容纳全部文件（{error}），尝试目标盘内暂存（不格式化，原地删除旧系统）"
+                );
+                return self.select_in_place_target_staging(intent, budget, payload_bytes);
+            }
+        };
+        let scatter = super::scattered_staging::ScatterStaging::new(plan, &inventory);
+        log::info!("[SCATTER] 分散暂存计划: {}", scatter.describe());
+        let primary = scatter.primary_partition();
+        self.scattered_staging = Some(scatter);
+        self.finish_existing_volume_selection(primary, budget)
+    }
+
+    /// Estimated bytes the current old system occupies on the target volume, i.e. what the
+    /// pre-write in-place old-system deletion will reclaim. Unknown or query failure yields 0,
+    /// which only makes the capacity check stricter.
+    fn target_old_system_bytes(intent: &StartInstallIntent) -> u64 {
+        let letter = match intent.target_partition.chars().next() {
+            Some(letter) => letter.to_ascii_uppercase(),
+            None => return 0,
+        };
+        let (free, total) = match DiskManager::get_volume_space_bytes_public(letter) {
+            Some(values) => values,
+            None => return 0,
+        };
+        // Used space is a safe lower bound on what the old-system deletion can reclaim; the real
+        // deletion keeps LetRecovery_ directories, but at selection time none exist yet.
+        total.saturating_sub(free)
+    }
+
+    /// Last-resort staging on the target volume itself. Valid only for an ordinary partition
+    /// reinstall (never dual-boot, full-disk or XP text mode): the payload is written into the
+    /// target's own LetRecovery_Data, PE deletes the old system in place and applies the image
+    /// without formatting. The whole image is stored as one file because it is applied back to the
+    /// same volume; raw chunking would add no benefit here.
+    fn select_in_place_target_staging(
+        &mut self,
+        intent: &StartInstallIntent,
+        budget: StagingPayloadBudget,
+        payload_bytes: u64,
+    ) -> Result<(), InstallBackendError> {
+        self.scattered_staging = None;
+        self.image_data_dir_override = None;
+        self.scattered_image_layout = ScatteredImageLayout::Directory;
+        // GHO restores sector content over the whole partition and XP text mode owns its own
+        // copy step; both would destroy an image staged on the same volume.
+        if !matches!(
+            intent.options.custom_install_plan,
+            lr_core::custom_install::CustomInstallPlan::ReinstallPartition
+        ) || intent.options.is_xp_i386
+            || intent.is_gho
+        {
+            return Err(InstallBackendError::new(
+                "scatter_no_space",
+                "no volume other than the target can hold the installation files and this install mode cannot stage in place",
+            ));
+        }
+        let letter = intent
+            .target_partition
+            .chars()
+            .next()
+            .map(|letter| letter.to_ascii_uppercase())
+            .ok_or_else(|| {
+                InstallBackendError::new("no_data_partition", "target partition has no drive letter")
+            })?;
+        let target_free = super::scattered_staging::volume_free_bytes(letter).unwrap_or(0);
+        let old_system = Self::target_old_system_bytes(intent);
+        let expanded = Self::expanded_image_bytes(intent);
+        if !lr_core::data_staging::target_can_host_in_place(
+            target_free,
+            old_system,
+            payload_bytes,
+            expanded,
+        ) {
+            return Err(InstallBackendError::new(
+                "scatter_no_space",
+                format!(
+                    "target volume cannot host installation files in place: free={target_free}, reclaimable_old_system={old_system}, payload={payload_bytes}, applied_image={expanded}"
+                ),
+            ));
+        }
+        self.require_pe_scatter_support()?;
+        self.in_place_target_staging = true;
+        log::info!(
+            "[SCATTER] 目标盘内暂存：把安装文件放在目标分区 {letter}: 自身，PE 不格式化，先原地删除旧系统再释放镜像。当前空闲={target_free} 可回收旧系统≈{old_system} 全部文件={payload_bytes} 释放后镜像≈{expanded}"
+        );
+        // The target IS the data partition. Chunking is disabled: the whole image is staged once
+        // and applied back to the same volume after the old system is deleted.
+        self.finish_existing_volume_selection(format!("{letter}:"), budget)?;
+        let data_dir = PathBuf::from(self.data_dir()?);
+        // Never arm the failure cleanup when the user's own source image already lives inside
+        // this directory: deleting it on a failed attempt would destroy user data.
+        let source_inside = match (
+            std::fs::canonicalize(&intent.image_path),
+            std::fs::canonicalize(&data_dir),
+        ) {
+            (Ok(source), Ok(directory)) => source.starts_with(&directory),
+            _ => Path::new(&intent.image_path)
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with(&data_dir.to_string_lossy().to_ascii_lowercase()),
+        };
+        if source_inside {
+            log::info!(
+                "[SCATTER] 源镜像本身位于 {}，失败时不自动清理该目录",
+                data_dir.display()
+            );
+        } else {
+            self.in_place_uncommitted_dir = Some(data_dir);
+        }
+        Ok(())
+    }
+
+    fn run_driver_export(intent: &StartInstallIntent, destination: &Path) -> anyhow::Result<()> {
+        let dism = super::dism::Dism::new();
+        let destination = destination.to_string_lossy();
+        if intent.options.driver_action == DriverAction::AutoImport {
+            dism.export_drivers_for_automatic_restore(&destination)
+        } else {
+            dism.export_drivers(&destination)
+        }
+        .map(|_| ())
+    }
+
+    /// Scattered driver export. DISM writes one destination directory, so the export goes
+    /// directly to a volume that can hold the whole estimate (primary first). When no single volume
+    /// can, DISM writes into a temporary directory on the target partition, which WinPE formats
+    /// anyway, and whole driver packages are then moved to volumes that have room. A failure is
+    /// only a warning: the installation continues without restoring the old drivers.
+    fn export_drivers_scattered(
+        &mut self,
+        intent: &StartInstallIntent,
+    ) -> Result<(), InstallBackendError> {
+        let estimate = self
+            .staging_payload_budget
+            .as_ref()
+            .map_or(0, |budget| budget.exported_driver_bytes);
+        let result = self.export_drivers_scattered_inner(intent, estimate);
+        match result {
+            Ok(actual) => {
+                log::info!(
+                    "[SCATTER] 当前系统驱动已导出并分散保存: 预估={estimate} 实际={actual} 字节"
+                );
+            }
+            Err(error) => {
+                log::warn!(
+                    "[SCATTER] 导出当前系统驱动失败，本次安装继续但不恢复旧驱动: {error:#}"
+                );
+                self.scattered_drivers_unavailable = true;
+                if let Some(scatter) = self.scattered_staging.as_ref() {
+                    for directory in scatter.existing_data_dirs() {
+                        let drivers = directory.join("drivers");
+                        if drivers.exists() {
+                            if let Err(error) = std::fs::remove_dir_all(&drivers) {
+                                log::warn!(
+                                    "[SCATTER] 清理未完成的驱动目录 {} 失败: {error}",
+                                    drivers.display()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn export_drivers_scattered_inner(
+        &mut self,
+        intent: &StartInstallIntent,
+        estimate: u64,
+    ) -> anyhow::Result<u64> {
+        use anyhow::Context as _;
+
+        self.scattered_drivers_unavailable = false;
+        let scatter = self
+            .scattered_staging
+            .as_mut()
+            .context("scattered staging state is missing")?;
+        for directory in scatter.existing_data_dirs() {
+            let drivers = directory.join("drivers");
+            if drivers.exists() {
+                std::fs::remove_dir_all(&drivers)
+                    .with_context(|| format!("clear old driver directory {}", drivers.display()))?;
+            }
+        }
+        let primary = scatter.primary_letter();
+        let primary_drivers = scatter.data_dir_for(primary)?.join("drivers");
+        let candidates = scatter.candidates(true);
+        if let Some(letter) =
+            lr_core::data_staging::choose_volume_for_unit(&candidates, estimate, 0, Some(primary))
+        {
+            let destination = scatter.data_dir_for(letter)?.join("drivers");
+            Self::run_driver_export(intent, &destination)?;
+            if letter != primary {
+                Self::move_driver_requirements_to_primary(&destination, &primary_drivers)?;
+            }
+            let (actual, _) = super::scattered_staging::measure_tree(&destination);
+            scatter.record_placed(letter, actual);
+            log::info!("[SCATTER] 驱动整体导出到 {letter}:");
+            return Ok(actual);
+        }
+
+        let target_letter = intent
+            .target_partition
+            .chars()
+            .next()
+            .map(|letter| letter.to_ascii_uppercase())
+            .context("target partition has no drive letter")?;
+        let target_free = super::scattered_staging::volume_free_bytes(target_letter).unwrap_or(0);
+        if target_free < estimate.saturating_add(lr_core::data_staging::SCATTER_SECONDARY_RESERVE_BYTES)
+        {
+            let (letter, _, _) = candidates
+                .iter()
+                .copied()
+                .max_by_key(|(letter, available, _)| (*available, std::cmp::Reverse(*letter)))
+                .context("no scattered volume is available for drivers")?;
+            log::warn!(
+                "[SCATTER] 没有分区能确定放下约 {estimate} 字节的驱动，目标分区也没有临时空间；尝试直接导出到剩余最多的 {letter}:"
+            );
+            let destination = scatter.data_dir_for(letter)?.join("drivers");
+            Self::run_driver_export(intent, &destination)?;
+            if letter != primary {
+                Self::move_driver_requirements_to_primary(&destination, &primary_drivers)?;
+            }
+            let (actual, _) = super::scattered_staging::measure_tree(&destination);
+            scatter.record_placed(letter, actual);
+            return Ok(actual);
+        }
+
+        struct ScratchDirectory(PathBuf);
+        impl Drop for ScratchDirectory {
+            fn drop(&mut self) {
+                if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        log::warn!(
+                            "[SCATTER] 删除驱动临时目录 {} 失败，可手动删除: {error}",
+                            self.0.display()
+                        );
+                    }
+                }
+            }
+        }
+        let scratch = ScratchDirectory(PathBuf::from(format!(
+            "{target_letter}:\\LetRecovery_DriverExport_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |value| value.as_millis())
+        )));
+        std::fs::create_dir_all(&scratch.0)
+            .with_context(|| format!("create driver scratch {}", scratch.0.display()))?;
+        log::info!(
+            "[SCATTER] 驱动先导出到目标分区临时目录 {}，再按驱动包分散到各分区",
+            scratch.0.display()
+        );
+        Self::run_driver_export(intent, &scratch.0)?;
+        let requirements_name = lr_core::driver::STORAGE_DRIVER_REQUIREMENTS_FILE;
+        let mut total = 0_u64;
+        let mut entries = std::fs::read_dir(&scratch.0)
+            .with_context(|| format!("enumerate driver scratch {}", scratch.0.display()))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .context("read driver scratch entry")?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            let source = entry.path();
+            if name
+                .to_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(requirements_name))
+            {
+                std::fs::create_dir_all(&primary_drivers)?;
+                super::scattered_staging::move_entry(&source, &primary_drivers.join(&name))
+                    .with_context(|| format!("move {}", source.display()))?;
+                continue;
+            }
+            let (bytes, largest) = super::scattered_staging::measure_tree(&source);
+            let letter = scatter.choose_for_unit(bytes, largest);
+            let destination = scatter.data_dir_for(letter)?.join("drivers").join(&name);
+            super::scattered_staging::move_entry(&source, &destination)
+                .with_context(|| format!("move driver package {}", source.display()))?;
+            scatter.record_placed(letter, bytes);
+            total = total.saturating_add(bytes);
+        }
+        drop(scratch);
+        Ok(total)
+    }
+
+    fn move_driver_requirements_to_primary(
+        exported: &Path,
+        primary_drivers: &Path,
+    ) -> anyhow::Result<()> {
+        let name = lr_core::driver::STORAGE_DRIVER_REQUIREMENTS_FILE;
+        let source = exported.join(name);
+        if !source.is_file() {
+            log::warn!(
+                "[SCATTER] 驱动导出目录中没有 {name}，PE 将无法确认启动存储驱动覆盖情况"
+            );
+            return Ok(());
+        }
+        std::fs::create_dir_all(primary_drivers)?;
+        super::scattered_staging::move_entry(&source, &primary_drivers.join(name))?;
+        Ok(())
+    }
+
+    fn finish_existing_volume_selection(
+        &mut self,
+        data_partition: String,
+        budget: StagingPayloadBudget,
+    ) -> Result<(), InstallBackendError> {
+        self.staging_payload_budget = Some(budget);
+        self.staging_transaction = None;
+        self.data_partition = Some(data_partition);
+        std::fs::create_dir_all(self.data_dir()?)
+            .map_err(|error| Self::error("create_data_directory", error))?;
         Ok(())
     }
 
@@ -2706,7 +3527,7 @@ impl ProductionInstallBackend {
                 InstallBackendError::new("invalid_image_name", "source image has no file name")
             })?
             .to_string();
-        let destination = Path::new(&self.data_dir()?).join(&file_name);
+        let destination = self.image_data_dir()?.join(&file_name);
         let source_path = Path::new(&intent.image_path);
         let fused_verify_copy = Self::supports_fused_verify_copy(source_path);
         let source_identity = std::fs::canonicalize(source_path)
@@ -2997,6 +3818,513 @@ impl ProductionInstallBackend {
         Ok(())
     }
 
+    fn scattered_state_missing() -> InstallBackendError {
+        InstallBackendError::new(
+            "scattered_staging_missing",
+            "scattered staging state is missing",
+        )
+    }
+
+    /// Stage the image according to the scattered plan: whole on one volume, split WIM parts on
+    /// several volumes, or raw byte chunks that WinPE concatenates on the formatted target.
+    fn copy_source_image_scattered(
+        &mut self,
+        intent: &StartInstallIntent,
+        reporter: &mut dyn InstallExecutionReporter,
+        cancellation: &dyn InstallCancellation,
+    ) -> Result<(), InstallBackendError> {
+        let placement = self
+            .scattered_staging
+            .as_ref()
+            .map(|scatter| scatter.image_placement().clone())
+            .ok_or_else(Self::scattered_state_missing)?;
+        self.scattered_image_locks.clear();
+        self.scattered_image_layout = ScatteredImageLayout::Directory;
+        self.image_data_dir_override = None;
+        match placement {
+            lr_core::data_staging::ScatterImagePlacement::Whole(letter) => {
+                let scatter = self
+                    .scattered_staging
+                    .as_mut()
+                    .ok_or_else(Self::scattered_state_missing)?;
+                if !letter.eq_ignore_ascii_case(&scatter.primary_letter()) {
+                    let directory = scatter.data_dir_for(letter).map_err(|error| {
+                        Self::error("prepare_scattered_image_directory", format!("{error:#}"))
+                    })?;
+                    self.image_data_dir_override = Some(directory);
+                }
+                self.copy_source_image(intent, reporter, cancellation)?;
+                let bytes = self
+                    .staging_payload_budget
+                    .as_ref()
+                    .map_or(0, |budget| budget.image_bytes);
+                if let Some(scatter) = self.scattered_staging.as_mut() {
+                    scatter.record_placed(letter, bytes);
+                    scatter.release_image_reservations();
+                }
+                log::info!("[SCATTER] 镜像整体暂存到 {letter}:");
+                Ok(())
+            }
+            lr_core::data_staging::ScatterImagePlacement::PerFile(letters) => {
+                self.copy_swm_parts_scattered(intent, &letters, reporter, cancellation)
+            }
+            lr_core::data_staging::ScatterImagePlacement::Chunked => {
+                self.copy_image_chunks_scattered(intent, reporter, cancellation)
+            }
+        }
+    }
+
+    /// Copy every split WIM part to the volume chosen for it. Each part is copied from the held
+    /// source handle, read back and compared by SHA-256; wimlib later references the exact list.
+    fn copy_swm_parts_scattered(
+        &mut self,
+        intent: &StartInstallIntent,
+        letters: &[char],
+        reporter: &mut dyn InstallExecutionReporter,
+        cancellation: &dyn InstallCancellation,
+    ) -> Result<(), InstallBackendError> {
+        self.staged_source_image_receipt = None;
+        self.pe_source_lock = None;
+        let image_set = enumerate_staged_image_set(Path::new(&intent.image_path))
+            .map_err(|error| InstallBackendError::new("enumerate_source_image_set", error))?;
+        if image_set.kind != StagedImageSetKind::Swm || image_set.volumes.len() != letters.len() {
+            return Err(InstallBackendError::new(
+                "split_image_inventory_changed",
+                "split image inventory changed after scattered planning",
+            ));
+        }
+        let first = image_set.volumes.first().ok_or_else(|| {
+            InstallBackendError::new("empty_split_image_set", "split image set is empty")
+        })?;
+        let source_set =
+            lr_core::install_source_lock::LockedInstallSourceSet::acquire_pinned_original(first)
+                .map_err(|error| Self::error("lock_split_image_set", error))?;
+        let identities = source_set
+            .artifact_identities()
+            .map_err(|error| Self::error("capture_split_image_set", error))?;
+        if identities.len() != letters.len() {
+            return Err(InstallBackendError::new(
+                "split_image_inventory_changed",
+                "split image inventory changed before scattered staging",
+            ));
+        }
+        let total = identities
+            .iter()
+            .map(|identity| identity.length_bytes)
+            .fold(0_u64, u64::saturating_add);
+        let mut completed = 0_u64;
+        let mut locks = Vec::with_capacity(identities.len());
+        let mut first_directory = None;
+        for (ordinal, identity) in identities.iter().enumerate() {
+            if cancellation.is_cancelled() {
+                return Err(InstallBackendError::new(
+                    "cancelled",
+                    "split image staging was cancelled",
+                ));
+            }
+            let file_name = identity
+                .path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    InstallBackendError::new(
+                        "invalid_split_image_name",
+                        "split image span has no Unicode file name",
+                    )
+                })?
+                .to_owned();
+            let letter = letters[ordinal];
+            let directory = self
+                .scattered_staging
+                .as_mut()
+                .ok_or_else(Self::scattered_state_missing)?
+                .data_dir_for(letter)
+                .map_err(|error| {
+                    Self::error("prepare_scattered_image_directory", format!("{error:#}"))
+                })?;
+            if ordinal == 0 {
+                first_directory = Some(directory.clone());
+            }
+            let destination = directory.join(&file_name);
+            if destination.exists() {
+                std::fs::remove_file(&destination)
+                    .map_err(|error| Self::error("clear_scattered_split_part", error))?;
+            }
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)
+                .map_err(|error| Self::error("create_scattered_split_part", error))?;
+            let completed_before = completed;
+            source_set
+                .copy_artifact_to_verified_writer_with_progress(ordinal, &mut output, |copied| {
+                    if cancellation.is_cancelled() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "split image staging was cancelled",
+                        ));
+                    }
+                    let aggregate = completed_before.saturating_add(copied);
+                    let percentage = if total == 0 {
+                        95
+                    } else {
+                        (aggregate.saturating_mul(95) / total).min(95) as u8
+                    };
+                    Self::report(
+                        reporter,
+                        InstallExecutionPhase::CopySourceImage,
+                        percentage,
+                        file_name.as_str(),
+                    );
+                    Ok(())
+                })
+                .map_err(|error| {
+                    if cancellation.is_cancelled() {
+                        InstallBackendError::new("cancelled", "split image staging was cancelled")
+                    } else {
+                        Self::error("copy_scattered_split_part", error)
+                    }
+                })?;
+            output
+                .sync_all()
+                .map_err(|error| Self::error("sync_scattered_split_part", error))?;
+            drop(output);
+            let lock = lr_core::install_source_lock::LockedPlainArtifact::acquire(&destination)
+                .map_err(|error| Self::error("lock_scattered_split_part", error))?;
+            if lock.identity().length_bytes != identity.length_bytes
+                || lock.identity().sha256 != identity.sha256
+            {
+                return Err(InstallBackendError::new(
+                    "scattered_split_part_mismatch",
+                    format!(
+                        "staged split part differs from its source: {}",
+                        destination.display()
+                    ),
+                ));
+            }
+            if let Some(scatter) = self.scattered_staging.as_mut() {
+                scatter.record_placed(letter, identity.length_bytes);
+            }
+            log::info!("[SCATTER] 镜像分卷 {} 已写入 {letter}:", ordinal + 1);
+            locks.push(lock);
+            completed = completed.saturating_add(identity.length_bytes);
+        }
+        source_set
+            .verify_unchanged()
+            .map_err(|error| Self::error("split_image_source_changed", error))?;
+        self.scattered_image_locks = locks;
+        self.image_data_dir_override = first_directory;
+        self.staged_image_name = Some(image_set.main_name.clone());
+        self.scattered_image_layout = ScatteredImageLayout::SpanFiles;
+        if let Some(scatter) = self.scattered_staging.as_mut() {
+            scatter.release_image_reservations();
+        }
+        Self::report(
+            reporter,
+            InstallExecutionPhase::CopySourceImage,
+            100,
+            image_set.main_name.clone(),
+        );
+        Ok(())
+    }
+
+    /// Split one image file into raw byte chunks on the volumes that still have room. No
+    /// conversion or temporary copy is involved; WIM/ESD sources are fully verified by wimlib in
+    /// parallel with the copy, exactly like the ordinary single-file staging path.
+    fn copy_image_chunks_scattered(
+        &mut self,
+        intent: &StartInstallIntent,
+        reporter: &mut dyn InstallExecutionReporter,
+        cancellation: &dyn InstallCancellation,
+    ) -> Result<(), InstallBackendError> {
+        use super::image_verify::{ImageVerifier, VerifyStatus};
+
+        self.staged_source_image_receipt = None;
+        self.pe_source_lock = None;
+        let source_path = Path::new(&intent.image_path);
+        let file_name = source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                InstallBackendError::new("invalid_image_name", "source image has no file name")
+            })?
+            .to_owned();
+        let source_identity = std::fs::canonicalize(source_path)
+            .map_err(|error| Self::error("canonicalize_source_image", error))?;
+        let source = Self::open_locked_source(&source_identity)
+            .map_err(|error| Self::error("lock_source_image", error))?;
+        let metadata = source
+            .metadata()
+            .map_err(|error| Self::error("inspect_source_image", error))?;
+        if !metadata.is_file() {
+            return Err(InstallBackendError::new(
+                "source_image_not_regular_file",
+                "source image is not a regular file",
+            ));
+        }
+        let total = metadata.len();
+        let fused_verify = Self::supports_fused_verify_copy(source_path);
+        let verify_cancel = Arc::new(AtomicBool::new(false));
+        let (verify_progress_rx, verify_result_rx) = if fused_verify {
+            let (progress_tx, progress_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let flag = Arc::clone(&verify_cancel);
+            let image = source_identity.to_string_lossy().into_owned();
+            std::thread::spawn(move || {
+                let result = ImageVerifier::with_cancel_flag_without_persistent_cache(flag)
+                    .verify(&image, Some(progress_tx));
+                let _ = result_tx.send(result);
+            });
+            (Some(progress_rx), Some(result_rx))
+        } else {
+            (None, None)
+        };
+        let mut reader = BufReader::with_capacity(4 << 20, source);
+        let written = self.write_image_chunks(
+            &mut reader,
+            total,
+            &file_name,
+            verify_progress_rx.as_ref(),
+            reporter,
+            cancellation,
+        );
+        let (locks, sha256, _) = match written {
+            Ok(value) => value,
+            Err(error) => {
+                verify_cancel.store(true, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        drop(reader);
+        let verified = if let Some(result_rx) = verify_result_rx {
+            let result = loop {
+                if let Some(progress_rx) = verify_progress_rx.as_ref() {
+                    while let Ok(progress) = progress_rx.try_recv() {
+                        Self::report(
+                            reporter,
+                            InstallExecutionPhase::CopySourceImage,
+                            90_u8.saturating_add(progress.percentage / 10).min(99),
+                            progress.status,
+                        );
+                    }
+                }
+                match result_rx.try_recv() {
+                    Ok(result) => break result,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(InstallBackendError::new(
+                            "source_verify_worker_disconnected",
+                            "the fused source verification worker ended without a result",
+                        ));
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+                if cancellation.is_cancelled() {
+                    verify_cancel.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            };
+            if result.status == VerifyStatus::Cancelled || cancellation.is_cancelled() {
+                return Err(InstallBackendError::new(
+                    "cancelled",
+                    "fused source image verification was cancelled",
+                ));
+            }
+            if result.status != VerifyStatus::Valid {
+                return Err(InstallBackendError::new(
+                    "source_image_verification_failed",
+                    format!("{}: {}", result.status, result.message),
+                ));
+            }
+            Self::verification_result_can_issue_receipt(&result)
+        } else {
+            false
+        };
+        let expanded_bytes = Self::expanded_image_bytes(intent);
+        log::info!(
+            "[SCATTER] 镜像已按原始字节分成 {} 块分散保存: 总长度={total} SHA-256={sha256} 正常端完整校验={verified}",
+            locks.len()
+        );
+        self.scattered_image_locks = locks;
+        self.scattered_image_layout = ScatteredImageLayout::Chunks {
+            file_name: file_name.clone(),
+            length: total,
+            sha256,
+            expanded_bytes,
+            verified,
+        };
+        self.staged_image_name = Some(file_name.clone());
+        self.image_data_dir_override = None;
+        Self::report(
+            reporter,
+            InstallExecutionPhase::CopySourceImage,
+            100,
+            file_name,
+        );
+        Ok(())
+    }
+
+    /// Write `total` bytes from `reader` as consecutive chunks. Every chunk is flushed, locked,
+    /// read back and compared with the SHA-256 of the bytes written into it.
+    fn write_image_chunks(
+        &mut self,
+        reader: &mut BufReader<File>,
+        total: u64,
+        file_name: &str,
+        verify_progress_rx: Option<&mpsc::Receiver<super::image_verify::VerifyProgress>>,
+        reporter: &mut dyn InstallExecutionReporter,
+        cancellation: &dyn InstallCancellation,
+    ) -> Result<
+        (
+            Vec<lr_core::install_source_lock::LockedPlainArtifact>,
+            String,
+            u8,
+        ),
+        InstallBackendError,
+    > {
+        use std::io::Read;
+
+        let cancelled =
+            || InstallBackendError::new("cancelled", "image chunk staging was cancelled");
+        let mut whole = lr_core::hash::Sha256Stream::new();
+        let mut buffer = vec![0_u8; 4 << 20];
+        let mut locks = Vec::new();
+        let mut remaining = total;
+        let mut copied = 0_u64;
+        let mut ordinal = 0_u32;
+        let mut verify_progress = 0_u8;
+        let scatter = self
+            .scattered_staging
+            .as_mut()
+            .ok_or_else(Self::scattered_state_missing)?;
+        while remaining > 0 {
+            if cancellation.is_cancelled() {
+                return Err(cancelled());
+            }
+            let best = scatter
+                .candidates(false)
+                .into_iter()
+                .max_by_key(|(letter, available, max_file)| {
+                    ((*available).min(*max_file), std::cmp::Reverse(*letter))
+                });
+            let length = best.and_then(|(_, available, max_file)| {
+                lr_core::data_staging::next_image_chunk_len(remaining, available, max_file)
+            });
+            let (Some((letter, _, _)), Some(length)) = (best, length) else {
+                return Err(InstallBackendError::new(
+                    "scatter_no_space",
+                    format!(
+                        "existing volumes have no room left for the remaining {remaining} image bytes"
+                    ),
+                ));
+            };
+            let directory = scatter
+                .data_dir_for(letter)
+                .map_err(|error| {
+                    Self::error("prepare_image_chunk_directory", format!("{error:#}"))
+                })?
+                .join(lr_core::data_staging::IMAGE_CHUNK_DIRECTORY);
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| Self::error("create_image_chunk_directory", error))?;
+            let path = directory.join(lr_core::data_staging::image_chunk_file_name(
+                file_name, ordinal,
+            ));
+            if path.exists() {
+                std::fs::remove_file(&path)
+                    .map_err(|error| Self::error("clear_image_chunk", error))?;
+            }
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|error| Self::error("create_image_chunk", error))?;
+            let mut writer = BufWriter::with_capacity(4 << 20, file);
+            let mut chunk_hash = lr_core::hash::Sha256Stream::new();
+            let mut written = 0_u64;
+            while written < length {
+                if cancellation.is_cancelled() {
+                    return Err(cancelled());
+                }
+                let want = usize::try_from((length - written).min(buffer.len() as u64))
+                    .unwrap_or(buffer.len());
+                let count = reader
+                    .read(&mut buffer[..want])
+                    .map_err(|error| Self::error("read_source_image", error))?;
+                if count == 0 {
+                    return Err(InstallBackendError::new(
+                        "source_image_truncated",
+                        format!(
+                            "source image ended after {} of {total} bytes",
+                            copied.saturating_add(written)
+                        ),
+                    ));
+                }
+                writer
+                    .write_all(&buffer[..count])
+                    .map_err(|error| Self::error("write_image_chunk", error))?;
+                chunk_hash.update(&buffer[..count]);
+                whole.update(&buffer[..count]);
+                written = written.saturating_add(count as u64);
+                if let Some(progress_rx) = verify_progress_rx {
+                    while let Ok(progress) = progress_rx.try_recv() {
+                        verify_progress = progress.percentage;
+                    }
+                }
+                let copy_percent =
+                    (copied.saturating_add(written).saturating_mul(100) / total.max(1)).min(100)
+                        as u16;
+                let percentage = if verify_progress_rx.is_some() {
+                    ((copy_percent + u16::from(verify_progress)) * 90 / 200) as u8
+                } else {
+                    (copy_percent * 90 / 100) as u8
+                };
+                Self::report(
+                    reporter,
+                    InstallExecutionPhase::CopySourceImage,
+                    percentage,
+                    file_name,
+                );
+            }
+            writer
+                .flush()
+                .map_err(|error| Self::error("flush_image_chunk", error))?;
+            writer
+                .get_ref()
+                .sync_all()
+                .map_err(|error| Self::error("sync_image_chunk", error))?;
+            drop(writer);
+            let expected = lr_core::install_handoff::decode_hex_array::<32>(
+                &chunk_hash.finish_hex(),
+                "image chunk SHA-256",
+            )
+            .map_err(|error| Self::error("decode_image_chunk_digest", error))?;
+            let lock = lr_core::install_source_lock::LockedPlainArtifact::acquire(&path)
+                .map_err(|error| Self::error("lock_image_chunk", error))?;
+            if lock.identity().length_bytes != length || lock.identity().sha256 != expected {
+                return Err(InstallBackendError::new(
+                    "image_chunk_readback_mismatch",
+                    format!(
+                        "staged image chunk differs from the source stream: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            scatter.record_placed(letter, length);
+            log::info!(
+                "[SCATTER] 镜像分块 {} 已写入 {letter}: {length} 字节",
+                u64::from(ordinal) + 1
+            );
+            locks.push(lock);
+            copied = copied.saturating_add(length);
+            remaining -= length;
+            ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                InstallBackendError::new("image_chunk_count_overflow", "too many image chunks")
+            })?;
+        }
+        Ok((locks, whole.finish_hex(), verify_progress))
+    }
+
     fn copy_split_source_image(
         &mut self,
         image_set: &StagedImageSet,
@@ -3036,7 +4364,7 @@ impl ProductionInstallBackend {
             })
         })?;
 
-        let data_dir = PathBuf::from(self.data_dir()?);
+        let data_dir = self.image_data_dir()?;
         let stage = lr_core::scoped_temp_file::ScopedTempDir::create_system_administrators_in(
             &data_dir,
             "install-image-set",
@@ -3446,7 +4774,12 @@ impl ProductionInstallBackend {
         let staged_name = self.staged_image_name.as_deref().ok_or_else(|| {
             InstallBackendError::new("staged_image_missing", "staged image name is missing")
         })?;
-        let staged = Path::new(&self.data_dir()?).join(staged_name);
+        if self.scattered_image_layout != ScatteredImageLayout::Directory {
+            // Split parts and raw chunks were read back and compared with the source stream
+            // while they were written to their volumes.
+            return Ok(());
+        }
+        let staged = self.image_data_dir()?.join(staged_name);
         let actual = if intent.options.is_xp_i386 {
             Self::directory_size_checked(&staged)?
         } else if let Some(lock) = self.pe_source_lock.as_ref() {
@@ -3491,7 +4824,9 @@ impl ProductionInstallBackend {
                 "data capacity budget is missing before image copy",
             )
         })?;
-        let user_driver_bytes = Self::planned_user_driver_bytes()?;
+        let user_driver_bytes = Self::planned_user_driver_bytes()?
+            .saturating_add(Self::planned_custom_driver_bytes(intent))
+            .saturating_add(Self::planned_advanced_input_bytes(intent));
         let uefiseven_bytes = Self::planned_uefiseven_bytes(intent)?;
         if user_driver_bytes > planned.user_driver_bytes {
             return Err(InstallBackendError::new(
@@ -3608,7 +4943,126 @@ impl ProductionInstallBackend {
         Ok(false)
     }
 
-    fn stage_user_drivers(&self) -> Result<(), InstallBackendError> {
+    /// Scattered user-driver staging. A version directory with loose INF files at its top level
+    /// stays together because such an INF may reference files in its subdirectories; otherwise
+    /// every top-level package directory is placed independently. Any failure skips only the
+    /// affected optional package.
+    fn stage_user_drivers_scattered(&mut self) -> Result<(), InstallBackendError> {
+        let scatter = self.scattered_staging.as_mut().ok_or_else(|| {
+            InstallBackendError::new(
+                "scattered_staging_missing",
+                "scattered staging state is missing before user-driver staging",
+            )
+        })?;
+        for directory in scatter.existing_data_dirs() {
+            let old = directory.join("user_drivers");
+            if old.exists() {
+                if let Err(error) = std::fs::remove_dir_all(&old) {
+                    log::warn!("[SCATTER] 清理旧用户驱动目录 {} 失败: {error}", old.display());
+                }
+            }
+        }
+        for version in ["win7", "win8", "win10", "win11"] {
+            let source = crate::utils::path::get_drivers_dir().join(version);
+            match Self::directory_has_inf_checked(&source) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    log::warn!(
+                        "[Driver] optional user-driver directory {version} is unavailable and was skipped: {}",
+                        error.detail
+                    );
+                    continue;
+                }
+            }
+            let entries = match std::fs::read_dir(&source) {
+                Ok(entries) => entries.filter_map(Result::ok).map(|entry| entry.path()).collect::<Vec<_>>(),
+                Err(error) => {
+                    log::warn!("[SCATTER] 读取用户驱动目录 {} 失败，已跳过: {error}", source.display());
+                    continue;
+                }
+            };
+            let root_has_inf = entries.iter().any(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.eq_ignore_ascii_case("inf"))
+            });
+            let units: Vec<(PathBuf, PathBuf)> = if root_has_inf {
+                vec![(source.clone(), PathBuf::new())]
+            } else {
+                let mut units = Vec::new();
+                let loose = entries.iter().filter(|path| path.is_file()).cloned().collect::<Vec<_>>();
+                for path in entries.iter().filter(|path| path.is_dir()) {
+                    if let Some(name) = path.file_name() {
+                        units.push((path.clone(), PathBuf::from(name)));
+                    }
+                }
+                for path in loose {
+                    if let Some(name) = path.file_name() {
+                        units.push((path.clone(), PathBuf::from(name)));
+                    }
+                }
+                units
+            };
+            for (unit_source, relative) in units {
+                let (bytes, largest) = super::scattered_staging::measure_tree(&unit_source);
+                let letter = scatter.choose_for_unit(bytes, largest);
+                let base = match scatter.data_dir_for(letter) {
+                    Ok(base) => base.join("user_drivers").join(version),
+                    Err(error) => {
+                        log::warn!("[SCATTER] 无法在 {letter}: 准备用户驱动目录，已跳过: {error:#}");
+                        continue;
+                    }
+                };
+                let destination = if relative.as_os_str().is_empty() {
+                    base
+                } else {
+                    base.join(&relative)
+                };
+                match super::scattered_staging::copy_entry(&unit_source, &destination) {
+                    Ok(()) => scatter.record_placed(letter, bytes),
+                    Err(error) => {
+                        log::warn!(
+                            "[SCATTER] 用户驱动 {} 复制到 {letter}: 失败，已跳过: {error}",
+                            unit_source.display()
+                        );
+                        let _ = if destination.is_dir() {
+                            std::fs::remove_dir_all(&destination)
+                        } else {
+                            std::fs::remove_file(&destination)
+                        };
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn stage_user_drivers(&mut self, intent: &StartInstallIntent) -> Result<(), InstallBackendError> {
+        if self.scattered_staging.is_some() {
+            self.stage_user_drivers_scattered()?;
+            // Optional user payloads go to the data directory on the same volume as their source
+            // (hard links, no second copy of the data); otherwise to the first data directory.
+            let data_dirs = self
+                .scattered_staging
+                .as_ref()
+                .map(|scatter| scatter.existing_data_dirs())
+                .unwrap_or_default();
+            if let Some(first) = data_dirs.first() {
+                let root_for = |source: &str| {
+                    data_dirs
+                        .iter()
+                        .find(|directory| Self::same_volume(Path::new(source), directory))
+                        .unwrap_or(first)
+                        .join("user_drivers")
+                };
+                Self::stage_custom_driver_directory(intent, &root_for);
+                Self::stage_advanced_inputs(intent, &root_for);
+            }
+            return Ok(());
+        }
         let root = Path::new(&self.data_dir()?).join("user_drivers");
         if root.exists() {
             std::fs::remove_dir_all(&root)
@@ -3635,6 +5089,10 @@ impl ProductionInstallBackend {
                 );
             }
         }
+        let staging_root = root.clone();
+        let root_for = |_: &str| staging_root.clone();
+        Self::stage_custom_driver_directory(intent, &root_for);
+        Self::stage_advanced_inputs(intent, &root_for);
         let actual = if root.exists() {
             lr_core::driver::measure_plain_tree_logical_bytes(&root)
                 .map_err(|error| Self::error("measure_staged_user_drivers", error))?
@@ -3665,6 +5123,39 @@ impl ProductionInstallBackend {
             );
         }
         Ok(())
+    }
+
+    /// Manifest record for a staged file on the primary data volume or on a scattered volume.
+    /// The relative path of a scattered file automatically starts with its
+    /// `LetRecovery_Scatter_<token>` directory.
+    fn scatter_artifact_record(
+        &self,
+        identity: &lr_core::install_source_lock::LockedSourceArtifactIdentity,
+        role: lr_core::handoff_manifest::ArtifactRole,
+        ordinal: u32,
+    ) -> Result<lr_core::handoff_manifest::ArtifactRecord, InstallBackendError> {
+        let primary_error = match super::install_config::ConfigFileManager::public_artifact_record(
+            self.data_partition()?,
+            identity,
+            role,
+            ordinal,
+        ) {
+            Ok(record) => return Ok(record),
+            Err(error) => error,
+        };
+        if let Some(scatter) = self.scattered_staging.as_ref() {
+            for partition in scatter.secondary_partitions() {
+                if let Ok(record) = super::install_config::ConfigFileManager::public_artifact_record(
+                    &partition, identity, role, ordinal,
+                ) {
+                    return Ok(record);
+                }
+            }
+        }
+        Err(Self::error(
+            "build_pe_manifest_record",
+            format!("{primary_error:#}"),
+        ))
     }
 
     fn write_pe_install_config(
@@ -3712,6 +5203,12 @@ impl ProductionInstallBackend {
                 .map_err(|error| Self::error("encode_preinstalled_software_config", error))?
         };
         config.target_partition.clone_from(&effective_target);
+        if self.in_place_target_staging {
+            // The payload lives on the target volume itself. PE never formats it; the user's
+            // format / personal-file choices are kept and PE maps "format" to an in-place deletion
+            // of the old system that preserves every LetRecovery_ directory.
+            config.in_place_target_staging = true;
+        }
         if let Some(plan) = prepared_dual_boot_plan {
             config.custom_install_plan = lr_core::custom_install::CustomInstallPlan::DualBoot(plan);
         }
@@ -3741,12 +5238,44 @@ impl ProductionInstallBackend {
                 });
             lr_core::custom_install::validate_full_disk_plan(plan)
                 .map_err(|error| Self::error("validate_full_disk_staging_plan", error))?;
+            // PE rebuilds a disk that also holds the staging volume only in front of that volume.
+            // Check that range now, in normal Windows, instead of failing after the reboot.
+            if let Some(staging_disk) = plan
+                .disks
+                .iter()
+                .find(|disk| disk.diagnostic_disk_number == staging.disk_number)
+            {
+                lr_core::custom_install::plan_full_disk_layout(
+                    staging_disk.style,
+                    staging_disk.role,
+                    staging.offset_bytes,
+                    plan.windows_partition_bytes,
+                )
+                .map_err(|error| {
+                    InstallBackendError::new(
+                        "full_disk_staging_leaves_no_room",
+                        format!(
+                            "安装文件暂存分区位于要清空的硬盘上，它前面的空间不足以建立新的系统分区（{error}）。请把安装文件暂存到其它硬盘或 U 盘后再试"
+                        ),
+                    )
+                })?;
+            }
         }
-        if intent.options.export_drivers && intent.options.driver_action == DriverAction::AutoImport
+        if intent.options.export_drivers && self.scattered_drivers_unavailable {
+            config.restore_drivers = false;
+            config.driver_action_mode = 0;
+            log::warn!("[SCATTER] 当前系统驱动导出失败，PE 配置已设为不导入旧驱动");
+        } else if intent.options.export_drivers
+            && intent.options.driver_action == DriverAction::AutoImport
         {
             let driver_root = Path::new(&self.data_dir()?).join("drivers");
-            if !automatic_driver_export_has_payload(&driver_root)
-                .map_err(|error| Self::error("verify_empty_pe_driver_backup", error))?
+            let has_payload = match self.scattered_staging.as_ref() {
+                Some(scatter) => {
+                    scattered_driver_export_has_payload(&scatter.existing_data_dirs(), &driver_root)
+                }
+                None => automatic_driver_export_has_payload(&driver_root),
+            };
+            if !has_payload.map_err(|error| Self::error("verify_empty_pe_driver_backup", error))?
             {
                 // Older PE packages treat any existing driver directory as importable. Encode the
                 // verified empty result explicitly so they never invoke DISM on a manifest-only
@@ -3766,7 +5295,7 @@ impl ProductionInstallBackend {
         }
         let auth_key = lr_core::handoff_auth::SessionAuthKey::generate()
             .map_err(|error| Self::error("generate_pe_handoff_auth", error))?;
-        let staged_root = Path::new(&self.data_dir()?).join(staged_name);
+        let staged_root = self.image_data_dir()?.join(staged_name);
         let identities = if intent.options.is_xp_i386 {
             let source_arch = self.staged_xp_source_arch.as_deref().ok_or_else(|| {
                 InstallBackendError::new(
@@ -3783,6 +5312,15 @@ impl ProductionInstallBackend {
                 .map_err(|error| Self::error("capture_pe_xp_source_manifest", error))?;
             self.pe_xp_source_lock = Some(lock);
             identities
+        } else if self.scattered_image_layout != ScatteredImageLayout::Directory {
+            for lock in &self.scattered_image_locks {
+                lock.verify_binding_unchanged()
+                    .map_err(|error| Self::error("scattered_image_changed", error))?;
+            }
+            self.scattered_image_locks
+                .iter()
+                .map(|lock| lock.identity().clone())
+                .collect::<Vec<_>>()
         } else if let Some(lock) = self.pe_source_lock.as_ref() {
             let expected = std::fs::canonicalize(&staged_root)
                 .map_err(|error| Self::error("canonicalize_pe_install_source", error))?;
@@ -3806,7 +5344,8 @@ impl ProductionInstallBackend {
             self.pe_source_lock = Some(lock);
             identities
         };
-        let receipt_matches = Self::receipt_matches_manifest_identities(
+        let receipt_matches = self.scattered_image_layout == ScatteredImageLayout::Directory
+            && Self::receipt_matches_manifest_identities(
             self.staged_source_image_receipt.as_ref(),
             &staged_root,
             &config,
@@ -3819,8 +5358,37 @@ impl ProductionInstallBackend {
                 "[IMAGE VERIFY] authenticated PE has no receipt capability; omitting the optional field and retaining legacy PE full verification"
             );
         }
+        if let ScatteredImageLayout::Chunks {
+            length,
+            sha256,
+            expanded_bytes,
+            verified,
+            ..
+        } = &self.scattered_image_layout
+        {
+            config.image_chunked = true;
+            config.image_chunked_length = *length;
+            config.image_chunked_sha256 = sha256.clone();
+            config.image_expanded_bytes = *expanded_bytes;
+            config.source_image_verified =
+                *verified && self.pe_supports_source_image_verification_receipt;
+        }
+        if self.scattered_staging.is_some() {
+            if let Some(pe_path) = self.pe_path.as_ref() {
+                if !super::pe::supports_scattered_staging(pe_path) {
+                    log::warn!(
+                        "[SCATTER] 所选 PE 没有声明 scattered-staging-v1；如果 PE 里的 LetRecoveryPE 是旧版本，它无法读取放在其他分区的文件，请用新版 PE端 重新打包 PE"
+                    );
+                }
+            }
+        }
         let role = if intent.options.is_xp_i386 {
             lr_core::handoff_manifest::ArtifactRole::XpSourceFile
+        } else if matches!(
+            self.scattered_image_layout,
+            ScatteredImageLayout::Chunks { .. }
+        ) {
+            lr_core::handoff_manifest::ArtifactRole::InstallImageChunk
         } else {
             lr_core::handoff_manifest::ArtifactRole::InstallImageSpan
         };
@@ -3834,13 +5402,7 @@ impl ProductionInstallBackend {
                         "install artifact ordinal overflow",
                     )
                 })?;
-                super::install_config::ConfigFileManager::public_artifact_record(
-                    self.data_partition()?,
-                    identity,
-                    role,
-                    ordinal,
-                )
-                .map_err(|error| Self::error("build_pe_install_source_manifest", error))
+                self.scatter_artifact_record(identity, role, ordinal)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let data_dir = PathBuf::from(self.data_dir()?);
@@ -3860,15 +5422,11 @@ impl ProductionInstallBackend {
                 &data_dir.join(&config.pca_compat_package),
             )
             .map_err(|error| Self::error("lock_pe_pca_manifest", error))?;
-            source_artifacts.push(
-                super::install_config::ConfigFileManager::public_artifact_record(
-                    self.data_partition()?,
-                    lock.identity(),
-                    lr_core::handoff_manifest::ArtifactRole::PcaPackage,
-                    0,
-                )
-                .map_err(|error| Self::error("build_pe_pca_manifest", error))?,
-            );
+            source_artifacts.push(self.scatter_artifact_record(
+                lock.identity(),
+                lr_core::handoff_manifest::ArtifactRole::PcaPackage,
+                0,
+            )?);
             self.pe_auxiliary_file_locks.push(lock);
         }
         let include_preserved_drivers = should_include_preserved_driver_tree(
@@ -3894,51 +5452,53 @@ impl ProductionInstallBackend {
                 lr_core::handoff_manifest::ArtifactRole::PreinstalledSoftware,
             ),
         ] {
+            // Scattered staging mirrors the same relative layout below every volume's data
+            // directory. Ordinals stay contiguous per role across all of them.
+            let bases = match self.scattered_staging.as_ref() {
+                Some(scatter) => scatter.existing_data_dirs(),
+                None => vec![data_dir.clone()],
+            };
             if relative == "drivers" && !include_preserved_drivers {
-                if data_dir.join(relative).exists() {
+                if bases.iter().any(|base| base.join(relative).exists()) {
                     log::info!(
                         "[PE HANDOFF] ignoring stale preserved-driver directory because the current task has no driver payload"
                     );
                 }
                 continue;
             }
-            let root = data_dir.join(relative);
-            if !root.is_dir() {
-                continue;
+            let mut next_ordinal = 0_u32;
+            for base in bases {
+                let root = base.join(relative);
+                if !root.is_dir() {
+                    continue;
+                }
+                let lock = lr_core::install_source_lock::LockedInstallTree::acquire(&root)
+                    .map_err(|error| Self::error("lock_pe_auxiliary_manifest", error))?;
+                let Some((lock, artifacts)) = capture_nonempty_auxiliary_tree(lock)
+                    .map_err(|error| Self::error("capture_pe_auxiliary_manifest", error))?
+                else {
+                    // Optional downloads and optional driver groups may legitimately yield no
+                    // files. Their producing phase already enforces any feature-specific
+                    // mandatory result; an undeclared empty directory is not an authenticated
+                    // artifact and must not convert a usable installation into a failure.
+                    log::info!(
+                        "[PE HANDOFF] ignoring empty optional auxiliary directory: {}",
+                        root.display()
+                    );
+                    continue;
+                };
+                for identity in &artifacts {
+                    let ordinal = next_ordinal;
+                    next_ordinal = next_ordinal.checked_add(1).ok_or_else(|| {
+                        Self::error(
+                            "build_pe_auxiliary_manifest",
+                            "auxiliary artifact ordinal overflow",
+                        )
+                    })?;
+                    source_artifacts.push(self.scatter_artifact_record(identity, role, ordinal)?);
+                }
+                self.pe_auxiliary_tree_locks.push(lock);
             }
-            let lock = lr_core::install_source_lock::LockedInstallTree::acquire(&root)
-                .map_err(|error| Self::error("lock_pe_auxiliary_manifest", error))?;
-            let Some((lock, artifacts)) = capture_nonempty_auxiliary_tree(lock)
-                .map_err(|error| Self::error("capture_pe_auxiliary_manifest", error))?
-            else {
-                // Optional downloads and optional driver groups may legitimately yield no files.
-                // Their producing phase already enforces any feature-specific mandatory result;
-                // an undeclared empty directory is not an authenticated artifact and must not
-                // convert a usable Windows installation into a total failure.
-                log::info!(
-                    "[PE HANDOFF] ignoring empty optional auxiliary directory: {}",
-                    root.display()
-                );
-                continue;
-            };
-            for (ordinal, identity) in artifacts.iter().enumerate() {
-                let ordinal = u32::try_from(ordinal).map_err(|_| {
-                    Self::error(
-                        "build_pe_auxiliary_manifest",
-                        "auxiliary artifact ordinal overflow",
-                    )
-                })?;
-                source_artifacts.push(
-                    super::install_config::ConfigFileManager::public_artifact_record(
-                        self.data_partition()?,
-                        identity,
-                        role,
-                        ordinal,
-                    )
-                    .map_err(|error| Self::error("build_pe_auxiliary_manifest", error))?,
-                );
-            }
-            self.pe_auxiliary_tree_locks.push(lock);
         }
         #[cfg(feature = "ci-automation")]
         let ci_stale_driver_manifest_receipt =
@@ -4025,7 +5585,20 @@ impl ProductionInstallBackend {
                     ),
                 )
             })?;
-        if !target.install_target_eligible {
+        let known_service_partition = matches!(
+            target.partition_kind,
+            Some(
+                lr_core::windows_storage::PartitionKind::EfiSystem
+                    | lr_core::windows_storage::PartitionKind::MicrosoftReserved
+                    | lr_core::windows_storage::PartitionKind::Recovery
+            )
+        );
+        if !target.install_target_eligible && !known_service_partition {
+            log::warn!(
+                "[NATIVE INSTALL TARGET] the role of {} cannot be read from the partition table (restricted storage); continuing with the user-selected volume",
+                target.letter
+            );
+        } else if !target.install_target_eligible {
             return Err(InstallBackendError::new(
                 "target_is_hidden_or_service_partition",
                 "the current canonical disk layout no longer identifies the selected extent as an ordinary installable user-data partition",
@@ -4298,6 +5871,151 @@ impl ProductionInstallBackend {
         Ok(())
     }
 
+    /// Hard-link when the source already lives on the staging volume (no second copy of the data),
+    /// otherwise copy. Any hard-link failure falls back to a plain copy.
+    fn link_or_copy_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+        if destination.exists() {
+            std::fs::remove_file(destination)?;
+        }
+        if std::fs::hard_link(source, destination).is_ok() {
+            return Ok(());
+        }
+        std::fs::copy(source, destination).map(|_| ())
+    }
+
+    fn link_or_copy_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let target = destination.join(entry.file_name());
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                Self::link_or_copy_directory(&entry.path(), &target)?;
+            } else if file_type.is_file() {
+                Self::link_or_copy_file(&entry.path(), &target)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn same_volume(left: &Path, right: &Path) -> bool {
+        let letter = |path: &Path| {
+            path.to_str()
+                .filter(|text| text.as_bytes().get(1) == Some(&b':'))
+                .and_then(|text| text.chars().next())
+                .map(|letter| letter.to_ascii_uppercase())
+        };
+        letter(left).is_some() && letter(left) == letter(right)
+    }
+
+    /// Deploy script, first-logon script, registry file and custom files staged for PE.
+    fn planned_advanced_input_bytes(intent: &StartInstallIntent) -> u64 {
+        let advanced = &intent.options.advanced_options;
+        let mut total = 0_u64;
+        for (enabled, path) in [
+            (advanced.run_script_during_deploy, advanced.deploy_script_path.trim()),
+            (advanced.run_script_first_login, advanced.first_login_script_path.trim()),
+            (advanced.import_registry_file, advanced.registry_file_path.trim()),
+        ] {
+            if enabled && !path.is_empty() {
+                total = total.saturating_add(
+                    std::fs::metadata(path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0),
+                );
+            }
+        }
+        let custom_files = advanced.custom_files_path.trim();
+        if advanced.import_custom_files && !custom_files.is_empty() {
+            total = total
+                .saturating_add(Self::directory_size_checked(Path::new(custom_files)).unwrap_or(0));
+        }
+        total
+    }
+
+    /// "Import custom driver directory": staged below `user_drivers\custom`, which PE injects for
+    /// every target version. A source on the staging volume is hard-linked, not copied again.
+    fn stage_custom_driver_directory(intent: &StartInstallIntent, root_for: &dyn Fn(&str) -> PathBuf) {
+        let advanced = &intent.options.advanced_options;
+        let custom_path = advanced.custom_drivers_path.trim();
+        if !advanced.import_custom_drivers || custom_path.is_empty() {
+            return;
+        }
+        let source = Path::new(custom_path);
+        match Self::directory_has_inf_checked(source) {
+            Ok(true) => {
+                let destination = root_for(custom_path).join("custom");
+                match Self::link_or_copy_directory(source, &destination) {
+                    Ok(()) => log::info!(
+                        "[Driver] custom driver directory staged for PE: {} -> {}",
+                        source.display(),
+                        destination.display()
+                    ),
+                    Err(error) => log::warn!(
+                        "[Driver] custom driver directory could not be staged and was skipped: {error}"
+                    ),
+                }
+            }
+            Ok(false) => log::warn!(
+                "[Driver] custom driver directory contains no INF and was skipped: {}",
+                source.display()
+            ),
+            Err(error) => log::warn!(
+                "[Driver] custom driver directory is unavailable and was skipped: {}",
+                error.detail
+            ),
+        }
+    }
+
+    /// Deploy script, first-logon script, registry file and custom files for PE. They travel in
+    /// the authenticated user-driver tree below `__advanced`; PE applies each one best-effort.
+    fn stage_advanced_inputs(intent: &StartInstallIntent, root_for: &dyn Fn(&str) -> PathBuf) {
+        let advanced = &intent.options.advanced_options;
+        for (enabled, source, kind, name) in [
+            (
+                advanced.run_script_during_deploy,
+                advanced.deploy_script_path.trim(),
+                "deploy_script",
+                "deploy.bat",
+            ),
+            (
+                advanced.run_script_first_login,
+                advanced.first_login_script_path.trim(),
+                "first_login_script",
+                "firstlogon.bat",
+            ),
+            (
+                advanced.import_registry_file,
+                advanced.registry_file_path.trim(),
+                "registry_import",
+                "import.reg",
+            ),
+        ] {
+            if !enabled || source.is_empty() {
+                continue;
+            }
+            let directory = root_for(source).join("__advanced").join(kind);
+            let result = std::fs::create_dir_all(&directory)
+                .and_then(|()| Self::link_or_copy_file(Path::new(source), &directory.join(name)));
+            match result {
+                Ok(()) => log::info!("[ADVANCED INPUT] staged {kind} for PE: {source}"),
+                Err(error) => log::warn!(
+                    "[ADVANCED INPUT] {kind} could not be staged and was skipped: {error}"
+                ),
+            }
+        }
+        let custom_files = advanced.custom_files_path.trim();
+        if advanced.import_custom_files && !custom_files.is_empty() {
+            let destination = root_for(custom_files).join("__advanced").join("custom_files");
+            match Self::link_or_copy_directory(Path::new(custom_files), &destination) {
+                Ok(()) => log::info!("[ADVANCED INPUT] staged custom files for PE: {custom_files}"),
+                Err(error) => log::warn!(
+                    "[ADVANCED INPUT] custom files could not be staged and were skipped: {error}"
+                ),
+            }
+        }
+    }
+
     fn copy_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(destination)?;
         for entry in std::fs::read_dir(source)? {
@@ -4314,8 +6032,10 @@ impl ProductionInstallBackend {
 
     fn process_drivers(&self, intent: &StartInstallIntent) -> Result<(), InstallBackendError> {
         if !self.driver_backup.exists() {
+            // `scattered_drivers_unavailable` also records a tolerated export failure.
             return if intent.options.export_drivers
                 && intent.options.driver_action != DriverAction::None
+                && !self.scattered_drivers_unavailable
             {
                 Err(InstallBackendError::new(
                     "driver_backup_missing",
@@ -4338,23 +6058,74 @@ impl ProductionInstallBackend {
                     );
                     return Ok(());
                 }
-                super::dism::Dism::new()
-                    .add_drivers_offline(&format!("{}\\", self.target), &backup)
-                    .map_err(|error| Self::error("import_preserved_drivers", error))?;
-                lr_core::driver::verify_offline_storage_driver_requirements(
-                    Path::new(&self.target),
-                    &self.driver_backup,
-                )
-                .map_err(|error| Self::error("verify_preserved_storage_drivers", error))?;
-                std::fs::remove_dir_all(&self.driver_backup)
-                    .map_err(|error| Self::error("clear_imported_driver_backup", error))?;
+                let import_result = super::dism::Dism::new()
+                    .add_drivers_offline(&format!("{}\\", self.target), &backup);
+                match import_result {
+                    Ok(()) => {
+                        // Standard DISM accepted the complete exported set. This is authoritative
+                        // and is the stop condition; a second inventory gate would only add a
+                        // mutable postcondition after the supported write already succeeded.
+                        log::info!(
+                            "[Driver] standard DISM accepted every preserved INF; no additional storage inventory gate is required"
+                        );
+                    }
+                    Err(import_error) => {
+                        match lr_core::driver::load_storage_driver_requirements(&self.driver_backup)
+                        {
+                            Err(manifest_error) => {
+                                // An old/minimal WinPE may export OEM packages but be unable to
+                                // establish the source disk's ConfigMgr ancestry. Without proven
+                                // requirements there is no factual basis for promoting one rejected
+                                // optional package to a boot-storage failure.
+                                log::warn!(
+                                    "[Driver] some preserved packages were rejected, and this WinPE could not produce topology-proven boot-storage requirements; installation continues with the drivers accepted by DISM: import={import_error:#}; evidence={manifest_error:#}"
+                                );
+                            }
+                            Ok(requirements) => {
+                                let proven = requirements
+                                    .iter()
+                                    .filter(|requirement| requirement.is_topology_proven())
+                                    .count();
+                                if proven == 0 {
+                                    log::warn!(
+                                        "[Driver] some preserved packages were rejected, but the manifest contains no topology-proven boot-storage requirement; installation continues: {import_error:#}"
+                                    );
+                                } else {
+                                    match lr_core::driver::verify_offline_storage_driver_requirements(
+                                        Path::new(&self.target),
+                                        &self.driver_backup,
+                                    ) {
+                                        Ok(_) => log::warn!(
+                                            "[Driver] optional packages were rejected, but all {proven} topology-proven boot-storage requirements are covered by the offline DriverStore; installation continues: {import_error:#}"
+                                        ),
+                                        Err(error) => log::warn!(
+                                            "[Driver] boot-storage driver coverage is unconfirmed (for example Intel VMD); installation continues, switch VMD off in the firmware setup if the new system cannot boot: {error:#}; import={import_error:#}"
+                                        ),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Err(error) = std::fs::remove_dir_all(&self.driver_backup) {
+                    log::warn!(
+                        "[Driver] imported driver staging cleanup failed after the boot-critical result was completed; installation continues: {error}"
+                    );
+                }
             }
             DriverAction::SaveOnly => {
                 let destination = PathBuf::from(format!("{}\\LetRecovery_Drivers", self.target));
-                Self::copy_directory(&self.driver_backup, &destination)
-                    .map_err(|error| Self::error("preserve_driver_backup", error))?;
-                std::fs::remove_dir_all(&self.driver_backup)
-                    .map_err(|error| Self::error("clear_preserved_driver_backup", error))?;
+                if let Err(error) = Self::copy_directory(&self.driver_backup, &destination) {
+                    log::warn!(
+                        "[Driver] 保存旧驱动到 {} 失败，安装继续: {error}",
+                        destination.display()
+                    );
+                }
+                if let Err(error) = std::fs::remove_dir_all(&self.driver_backup) {
+                    log::warn!(
+                        "[Driver] preserved driver staging cleanup failed after the requested copy completed; installation continues: {error}"
+                    );
+                }
             }
             DriverAction::None => {}
         }
@@ -4794,11 +6565,12 @@ impl ProductionInstallBackend {
         let architecture = match super::system_utils::get_system_architecture(&self.target) {
             super::system_utils::SystemArchitecture::X86 => UnattendArchitecture::X86,
             super::system_utils::SystemArchitecture::Amd64 => UnattendArchitecture::Amd64,
-            unexpected => {
-                return Err(InstallBackendError::new(
-                    "unsupported_unattend_architecture",
-                    format!("unsupported target architecture: {unexpected:?}"),
-                ));
+            super::system_utils::SystemArchitecture::Arm64 => UnattendArchitecture::Arm64,
+            super::system_utils::SystemArchitecture::Unknown => {
+                log::warn!(
+                    "[NATIVE INSTALL] target architecture could not be detected; the answer file uses amd64"
+                );
+                UnattendArchitecture::Amd64
             }
         };
         let first_logon_software = self
@@ -4848,8 +6620,14 @@ impl ProductionInstallBackend {
         // unattended local-account install. The first-logon finalizer always owns that bounded
         // cleanup, so its native NetAPI/Profile helper must be staged for every install rather
         // than only for the optional built-in Administrator transition.
-        lr_core::first_logon::stage_account_helper(&self.target)
-            .map_err(|error| Self::error("stage_account_helper", error))?;
+        if let Err(error) = lr_core::first_logon::stage_account_helper(&self.target) {
+            if temporary_oobe_account.is_some() {
+                return Err(Self::error("stage_account_helper", error));
+            }
+            log::warn!(
+                "[NATIVE INSTALL] first-logon account helper staging failed; only the defaultuser0 cleanup is skipped: {error:#}"
+            );
+        }
         let ntdll = Path::new(&self.target)
             .join("Windows")
             .join("System32")
@@ -4865,10 +6643,15 @@ impl ProductionInstallBackend {
             native_install_compat::WindowsFamily::Windows10
                 | native_install_compat::WindowsFamily::Windows11
         ) {
-            Some(
-                lr_core::offline_international::read_offline_international_settings(&self.target)
-                    .map_err(|error| Self::error("read_offline_international", error))?,
-            )
+            match lr_core::offline_international::read_offline_international_settings(&self.target) {
+                Ok(settings) => Some(settings),
+                Err(error) => {
+                    log::warn!(
+                        "[NATIVE INSTALL] target international settings are unavailable; the answer file omits International-Core and OOBE asks for region/keyboard: {error:#}"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -4889,14 +6672,24 @@ impl ProductionInstallBackend {
                         true
                     }
                     Ok(false) => {
-                        return Err(InstallBackendError::new(
-                            "security_ui_script_readback_mismatch",
-                            "Windows Security UI removal script readback mismatch",
-                        ))
+                        log::warn!(
+                            "[ADVANCED_SEC_HEALTH_UI] phase=online_hook status=skipped reason=script_readback_mismatch; installation continues"
+                        );
+                        false
                     }
-                    Err(error) => return Err(Self::error("security_ui_script_readback", error)),
+                    Err(error) => {
+                        log::warn!(
+                            "[ADVANCED_SEC_HEALTH_UI] phase=online_hook status=skipped detail={error:#}; installation continues"
+                        );
+                        false
+                    }
                 },
-                Err(error) => return Err(Self::error("stage_security_ui_script", error)),
+                Err(error) => {
+                    log::warn!(
+                        "[ADVANCED_SEC_HEALTH_UI] phase=online_hook status=skipped detail={error:#}; installation continues"
+                    );
+                    false
+                }
             }
         } else {
             false
@@ -4907,21 +6700,29 @@ impl ProductionInstallBackend {
                 native_install_compat::WindowsFamily::Windows10
                     | native_install_compat::WindowsFamily::Windows11
             ) {
-            let path = lr_core::offline_appx::stage_curated_online_removal_script(&self.target)
-                .map_err(|error| Self::error("stage_curated_appx_script", error))?;
-            if !lr_core::offline_appx::curated_online_script_is_staged(&self.target)
-                .map_err(|error| Self::error("curated_appx_script_readback", error))?
-            {
-                return Err(InstallBackendError::new(
-                    "curated_appx_script_readback_mismatch",
-                    "preinstalled application removal script readback mismatch",
-                ));
+            match lr_core::offline_appx::stage_curated_online_removal_script(&self.target).and_then(
+                |path| {
+                    if lr_core::offline_appx::curated_online_script_is_staged(&self.target)? {
+                        Ok(path)
+                    } else {
+                        anyhow::bail!("preinstalled application removal script readback mismatch")
+                    }
+                },
+            ) {
+                Ok(path) => {
+                    log::info!(
+                        "[ADVANCED_APPX] phase=online_hook status=staged path={:?}",
+                        path
+                    );
+                    true
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[ADVANCED_APPX] phase=online_hook status=skipped detail={error:#}; installation continues"
+                    );
+                    false
+                }
             }
-            log::info!(
-                "[ADVANCED_APPX] phase=online_hook status=staged path={:?}",
-                path
-            );
-            true
         } else {
             false
         };
@@ -5184,8 +6985,9 @@ impl InstallExecutionBackend for ProductionInstallBackend {
                         std::fs::remove_dir_all(&self.driver_backup)
                             .map_err(|error| Self::error("clear_driver_backup", error))?;
                     }
+                    self.scattered_drivers_unavailable = false;
                     let dism = super::dism::Dism::new();
-                    if dism.is_pe_environment() {
+                    let export_result = if dism.is_pe_environment() {
                         dism.export_drivers_from_system(
                             &format!("{}\\", self.target),
                             &self.driver_backup.to_string_lossy(),
@@ -5196,9 +6998,23 @@ impl InstallExecutionBackend for ProductionInstallBackend {
                         )
                     } else {
                         dism.export_drivers(&self.driver_backup.to_string_lossy())
+                    };
+                    if let Err(error) = export_result {
+                        // Old drivers are optional; continue with Windows' inbox drivers.
+                        log::warn!(
+                            "[Driver] 导出当前系统驱动失败，本次安装继续但不恢复旧驱动: {error:#}"
+                        );
+                        if self.driver_backup.exists() {
+                            if let Err(cleanup) = std::fs::remove_dir_all(&self.driver_backup) {
+                                log::warn!(
+                                    "[Driver] 清理未完成的驱动目录 {} 失败: {cleanup}",
+                                    self.driver_backup.display()
+                                );
+                            }
+                        }
+                        self.scattered_drivers_unavailable = true;
                     }
-                    .map(|_| ())
-                    .map_err(|error| Self::error("export_host_drivers", error))
+                    Ok(())
                 }
                 InstallExecutionPhase::ApplyXpTextModeSource => {
                     self.deactivate_xp_sibling_partitions()?;
@@ -5277,18 +7093,39 @@ impl InstallExecutionBackend for ProductionInstallBackend {
                 InstallExecutionPhase::SelectDataPartition => self.select_data_partition(intent),
                 InstallExecutionPhase::PersistPcaCompatibilityPackage => self.persist_pca_package(),
                 InstallExecutionPhase::ExportDriversToPeData => {
+                    if self.scattered_staging.is_some() {
+                        return self.export_drivers_scattered(intent);
+                    }
                     let destination = Path::new(&self.data_dir()?).join("drivers");
                     if destination.exists() {
                         std::fs::remove_dir_all(&destination)
                             .map_err(|error| Self::error("clear_pe_driver_backup", error))?;
                     }
+                    self.scattered_drivers_unavailable = false;
                     let dism = super::dism::Dism::new();
                     let result = if intent.options.driver_action == DriverAction::AutoImport {
                         dism.export_drivers_for_automatic_restore(&destination.to_string_lossy())
                     } else {
                         dism.export_drivers(&destination.to_string_lossy())
                     };
-                    result.map_err(|error| Self::error("export_drivers_to_pe_data", error))?;
+                    if let Err(error) = result {
+                        // Restoring the old drivers is optional. A damaged Driver Store or a
+                        // third-party package that DISM cannot export must not block the
+                        // reinstall; PE is told not to import old drivers instead.
+                        log::warn!(
+                            "[Driver] 导出当前系统驱动失败，本次安装继续但不恢复旧驱动: {error:#}"
+                        );
+                        if destination.exists() {
+                            if let Err(cleanup) = std::fs::remove_dir_all(&destination) {
+                                log::warn!(
+                                    "[Driver] 清理未完成的驱动目录 {} 失败: {cleanup}",
+                                    destination.display()
+                                );
+                            }
+                        }
+                        self.scattered_drivers_unavailable = true;
+                        return Ok(());
+                    }
                     #[cfg(feature = "ci-automation")]
                     if let Some(run_id) = ci_existing_target_driver_scenario_run_id() {
                         stage_ci_existing_target_driver_fixture(&destination, &run_id)
@@ -5340,14 +7177,18 @@ impl InstallExecutionBackend for ProductionInstallBackend {
                 }
                 InstallExecutionPhase::CopySourceImage => {
                     self.verify_late_payloads_fit_plan(intent)?;
-                    self.copy_source_image(intent, reporter, cancellation)?;
+                    if self.scattered_staging.is_some() {
+                        self.copy_source_image_scattered(intent, reporter, cancellation)?;
+                    } else {
+                        self.copy_source_image(intent, reporter, cancellation)?;
+                    }
                     self.verify_staged_source_payload_size(intent)
                 }
                 InstallExecutionPhase::StagePreinstalledSoftware => {
                     self.stage_preinstalled_software_for_pe(intent)
                 }
                 InstallExecutionPhase::StageUefiSeven => self.stage_uefiseven(),
-                InstallExecutionPhase::StageUserDrivers => self.stage_user_drivers(),
+                InstallExecutionPhase::StageUserDrivers => self.stage_user_drivers(intent),
                 InstallExecutionPhase::WritePeInstallConfig => self.write_pe_install_config(intent),
                 // Deliberately does not call shutdown/reboot. The UI owns the
                 // explicit user confirmation after ReadyToReboot is reported.
@@ -5867,6 +7708,12 @@ mod tests {
             .expect("empty manifest");
         assert!(!automatic_driver_export_has_payload(temporary.path()).unwrap());
 
+        std::fs::remove_file(
+            temporary
+                .path()
+                .join(lr_core::driver::STORAGE_DRIVER_REQUIREMENTS_FILE),
+        )
+        .expect("remove manifest to model a minimal WinPE export");
         std::fs::write(temporary.path().join("oem1.inf"), b"[Version]\r\n").expect("driver INF");
         assert!(automatic_driver_export_has_payload(temporary.path()).unwrap());
     }

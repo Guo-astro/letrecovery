@@ -318,28 +318,44 @@ impl Dism {
 
     fn prepare_storage_driver_manifest(
         destination: &Path,
-    ) -> Result<Vec<lr_core::driver::StorageDriverRequirement>> {
+    ) -> Result<Option<Vec<lr_core::driver::StorageDriverRequirement>>> {
         Self::remove_storage_driver_manifest(destination)?;
-        let requirements = lr_core::driver::list_present_oem_storage_driver_requirements()
-            .context("无法枚举当前硬件已绑定的 OEM 启动存储控制器驱动，已拒绝继续导出")?;
-        log::info!(
-            "[Dism] 导出前确认 {} 个当前硬件已绑定的 OEM 启动存储驱动包",
-            requirements.len()
-        );
-        Ok(requirements)
+        match lr_core::driver::list_present_oem_storage_driver_requirements() {
+            Ok(requirements) => {
+                log::info!(
+                    "[Dism] 导出前确认 {} 个当前硬件已绑定的 OEM 启动存储驱动包",
+                    requirements.len()
+                );
+                Ok(Some(requirements))
+            }
+            Err(error) => {
+                // Filter drivers (hardware-ID spoofers) can hide which controller carries the
+                // system disk. Export the drivers anyway; only the optional boot-storage coverage
+                // manifest is omitted (never replaced by a fabricated empty one).
+                log::warn!(
+                    "[Dism] 无法确定系统盘所在的存储控制器；照常导出驱动，但不生成启动存储驱动清单: {error:#}"
+                );
+                Ok(None)
+            }
+        }
     }
 
     fn finalize_driver_export(
         destination: &Path,
-        storage_requirements: &[lr_core::driver::StorageDriverRequirement],
+        storage_requirements: Option<&[lr_core::driver::StorageDriverRequirement]>,
         allow_verified_empty: bool,
     ) -> Result<usize> {
         let count = Self::count_exported_inf_files(destination)?;
         if count == 0 && !allow_verified_empty {
             Self::require_exported_drivers(destination)?;
         }
-        lr_core::driver::write_storage_driver_requirements(destination, storage_requirements)
-            .context("驱动导出完成，但启动存储驱动清单生成或覆盖验证失败")?;
+        match storage_requirements {
+            Some(storage_requirements) => {
+                lr_core::driver::write_storage_driver_requirements(destination, storage_requirements)
+                    .context("驱动导出完成，但启动存储驱动清单生成或覆盖验证失败")?;
+            }
+            None => log::warn!("[Dism] 本次导出不包含启动存储驱动清单"),
+        }
         Ok(count)
     }
 
@@ -495,7 +511,7 @@ impl Dism {
         match DismCmd::new().and_then(|dism| dism.export_drivers_online(destination, None)) {
             Ok(()) => match Self::finalize_driver_export(
                 destination_path,
-                &storage_requirements,
+                storage_requirements.as_deref(),
                 allow_verified_empty,
             ) {
                 Ok(count) => {
@@ -522,12 +538,13 @@ impl Dism {
             .map_err(|e| anyhow::anyhow!("{}", tr!("驱动管理器初始化失败: {}", e)))?;
         let count = manager.export_drivers(Path::new(destination), true)?;
         if count == 0 && !allow_verified_empty {
-            anyhow::bail!("{}", tr!("未找到可导出的第三方驱动"));
+            // A clean system with only inbox drivers is normal; it must not stop the install.
+            log::warn!("[Dism] 当前系统没有可导出的第三方驱动，继续安装");
         }
         let verified_count = Self::finalize_driver_export(
             destination_path,
-            &storage_requirements,
-            allow_verified_empty,
+            storage_requirements.as_deref(),
+            allow_verified_empty || count == 0,
         )?;
         if verified_count == 0 {
             log::info!("[Dism] 当前系统没有第三方 OEM 驱动；已生成并回读空启动存储驱动清单");
@@ -1037,7 +1054,7 @@ mod tests {
         std::fs::write(nested.join("OEM42.INF"), b"[Version]\r\n").unwrap();
 
         assert_eq!(
-            Dism::finalize_driver_export(temporary.path(), &[], false).unwrap(),
+            Dism::finalize_driver_export(temporary.path(), Some(&[]), false).unwrap(),
             1
         );
         let manifest = temporary
@@ -1060,9 +1077,9 @@ mod tests {
             lr_core::scoped_temp_file::ScopedTempDir::create_in(&std::env::temp_dir(), "lr-dism")
                 .expect("temporary driver directory");
 
-        assert!(Dism::finalize_driver_export(temporary.path(), &[], false).is_err());
+        assert!(Dism::finalize_driver_export(temporary.path(), Some(&[]), false).is_err());
         assert_eq!(
-            Dism::finalize_driver_export(temporary.path(), &[], true).unwrap(),
+            Dism::finalize_driver_export(temporary.path(), Some(&[]), true).unwrap(),
             0
         );
         assert!(temporary

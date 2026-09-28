@@ -261,7 +261,7 @@ impl BitLockerManager {
     /// 检查manage-bde是否可用
     #[cfg(windows)]
     fn is_manage_bde_available() -> bool {
-        std::process::Command::new("manage-bde")
+        std::process::Command::new(manage_bde_path())
             .arg("-?")
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
@@ -378,7 +378,7 @@ impl BitLockerManager {
         use std::process::Command;
 
         let drive = format!("{}:", drive_letter);
-        let output = match Command::new("manage-bde")
+        let output = match Command::new(manage_bde_path())
             .args(["-status", &drive])
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
@@ -425,7 +425,7 @@ impl BitLockerManager {
         use std::process::Command;
 
         let drive = format!("{}:", drive_letter);
-        let output = match Command::new("manage-bde")
+        let output = match Command::new(manage_bde_path())
             .args(["-status", &drive])
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
@@ -620,7 +620,7 @@ impl BitLockerManager {
         let letter = format!("{}:", drive_letter);
         let drive = format!("{}:", drive_letter);
 
-        let output = match Command::new("manage-bde")
+        let output = match Command::new(manage_bde_path())
             .args(["-unlock", &drive, "-password", password])
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
@@ -768,7 +768,7 @@ impl BitLockerManager {
         let letter = format!("{}:", drive_letter);
         let drive = format!("{}:", drive_letter);
 
-        let output = match Command::new("manage-bde")
+        let output = match Command::new(manage_bde_path())
             .args(["-unlock", &drive, "-recoverypassword", recovery_key])
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
@@ -998,7 +998,7 @@ impl BitLockerManager {
         let drive = format!("{}:", drive_letter);
 
         let command_result = {
-            let mut cmd = Command::new("manage-bde");
+            let mut cmd = Command::new(manage_bde_path());
             cmd.args(["-off", &drive]);
 
             #[cfg(windows)]
@@ -1069,7 +1069,7 @@ impl BitLockerManager {
         use std::process::Command;
         let letter = drive.chars().next().unwrap_or('C');
         let d = format!("{}:", letter);
-        let output = Command::new("manage-bde")
+        let output = Command::new(manage_bde_path())
             .args(["-protectors", action, &d])
             .creation_flags(0x08000000) // CREATE_NO_WINDOW
             .output()
@@ -1243,7 +1243,7 @@ impl BitLockerManager {
 
         let drive = format!("{}:", drive_letter);
         let command_result = {
-            let mut cmd = Command::new("manage-bde");
+            let mut cmd = Command::new(manage_bde_path());
             cmd.args(["-status", &drive]);
 
             #[cfg(windows)]
@@ -1533,12 +1533,19 @@ fn get_volume_info(drive: &str) -> (String, u64) {
             None,
         );
 
-        let _ = GetDiskFreeSpaceExW(
+        let space_read = GetDiskFreeSpaceExW(
             PCWSTR(wide_path.as_ptr()),
             None,
             Some(&mut total_bytes as *mut u64),
             None,
         );
+        if space_read.is_err() {
+            if let Some(letter) = drive.chars().next() {
+                if let Ok(identity) = lr_core::windows_storage::volume_identity(letter) {
+                    total_bytes = identity.extent_length_bytes;
+                }
+            }
+        }
     }
 
     let label = String::from_utf16_lossy(&volume_name)
@@ -1656,4 +1663,20 @@ Volume C: []
 "#;
         assert_eq!(get_encryption_percentage(fully_decrypted), Some(0));
     }
+}
+
+/// manage-bde.exe resolved independently of PATH. A 32-bit build on 64-bit Windows must use
+/// Sysnative, because manage-bde.exe exists only in the native System32 directory.
+fn manage_bde_path() -> std::path::PathBuf {
+    let windows = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    for directory in ["Sysnative", "System32"] {
+        let candidate = windows.join(directory).join("manage-bde.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    std::path::PathBuf::from("manage-bde")
 }

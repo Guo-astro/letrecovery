@@ -215,8 +215,50 @@ impl WimEngineManager {
         if cancellation_requested(cancel.as_ref()) {
             return Err(WIM_OPERATION_CANCELLED.to_owned());
         }
-        self.libwim
-            .apply_image_cancellable(image_file, target_dir, index, progress_tx, cancel)
+        let libwim_result = self.libwim.apply_image_cancellable(
+            image_file,
+            target_dir,
+            index,
+            progress_tx.clone(),
+            cancel.clone(),
+        );
+        let libwim_error = match libwim_result {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if cancellation_requested(cancel.as_ref()) || self.active == WimEngine::Wimgapi {
+            // wimgapi already ran above, or the user cancelled.
+            return Err(libwim_error);
+        }
+        // The default libwim engine failed. Windows' own WIM API reads every format Windows
+        // Setup accepts; try it once before failing the installation.
+        log::warn!("libwim 应用镜像失败，尝试 Windows 自带的 wimgapi：{}", libwim_error);
+        match WimgapiManager::new() {
+            Ok(wimgapi) => {
+                match wimgapi.apply_image_cancellable(
+                    image_file,
+                    target_dir,
+                    index,
+                    progress_tx,
+                    cancel.clone(),
+                ) {
+                    Ok(()) if cancellation_requested(cancel.as_ref()) => {
+                        Err(WIM_OPERATION_CANCELLED.to_owned())
+                    }
+                    Ok(()) => {
+                        log::info!("wimgapi 回退应用镜像成功");
+                        Ok(())
+                    }
+                    Err(wimgapi_error) => Err(format!(
+                        "{libwim_error}; wimgapi 回退也失败: {wimgapi_error}"
+                    )),
+                }
+            }
+            Err(error) => {
+                log::warn!("wimgapi 不可用，无法回退：{}", error);
+                Err(libwim_error)
+            }
+        }
     }
 
     /// Apply an authenticated SWM set by referencing only the exact ordered paths supplied by

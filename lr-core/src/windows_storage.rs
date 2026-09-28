@@ -10,6 +10,77 @@
 
 use std::fmt;
 
+/// Test switch for machines whose disk stack is filtered (hardware-ID spoofers, some diskless /
+/// restore-card drivers). When this environment variable is `1`, the physical-disk IOCTLs those
+/// drivers typically reject (device number, capacity, storage property queries) fail with
+/// ERROR_INVALID_FUNCTION and VDS / Storage Management report "unavailable". Partition-table and
+/// volume queries keep working, exactly as observed on such machines. It only makes read-only
+/// queries fail; it never writes anything. Intended for testing in an ordinary virtual machine.
+pub const SIMULATE_RESTRICTED_STORAGE_ENV: &str = "LETRECOVERY_SIMULATE_RESTRICTED_STORAGE";
+
+/// Whether the restricted-storage simulation switch is active for this process.
+pub fn simulate_restricted_storage() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = std::env::var_os(SIMULATE_RESTRICTED_STORAGE_ENV).is_some_and(|value| {
+            matches!(
+                value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+        if enabled {
+            log::warn!(
+                "[STORAGE SIMULATION] {SIMULATE_RESTRICTED_STORAGE_ENV}=1: 正在模拟“改机器码/磁盘过滤驱动”环境，物理磁盘编号、容量、属性查询与 VDS 将被当作不可用（只影响查询，不写盘）"
+            );
+        }
+        enabled
+    })
+}
+
+/// Log one degraded-storage warning per key; later repeats go to debug so UI refreshes cannot
+/// flood the log (the old build wrote the same bus-type warning dozens of times per second).
+pub fn warn_storage_once(key: &str, message: impl FnOnce() -> String) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let first = match seen.lock() {
+        Ok(mut guard) => guard.insert(key.to_owned()),
+        Err(poisoned) => poisoned.into_inner().insert(key.to_owned()),
+    };
+    if first {
+        log::warn!("{}", message());
+    } else {
+        log::debug!("[STORAGE] repeated degraded-storage condition: {key}");
+    }
+}
+
+fn degraded_disk_registry() -> &'static std::sync::Mutex<std::collections::BTreeSet<u32>> {
+    static DISKS: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<u32>>> =
+        std::sync::OnceLock::new();
+    DISKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+}
+
+/// Remember that a disk had to be reached through a compatibility fallback in this session.
+pub fn mark_disk_degraded(disk_number: u32) {
+    match degraded_disk_registry().lock() {
+        Ok(mut guard) => {
+            guard.insert(disk_number);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().insert(disk_number);
+        }
+    }
+}
+
+/// True when this disk needed a compatibility fallback (alias path, unverifiable number,
+/// estimated capacity) during this session.
+pub fn disk_marked_degraded(disk_number: u32) -> bool {
+    match degraded_disk_registry().lock() {
+        Ok(guard) => guard.contains(&disk_number),
+        Err(poisoned) => poisoned.into_inner().contains(&disk_number),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DiskStyle {
     Mbr,
@@ -320,6 +391,10 @@ pub fn partition_token_is_installable_user_data(token: DiskLayoutPartitionToken)
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiskLayoutSnapshot {
     pub disk_size_bytes: u64,
+    /// True when the storage stack rejected both capacity IOCTLs, so `disk_size_bytes` is only the
+    /// end of the usable GPT area (or of the last partition). Portable handoff digests then leave
+    /// the capacity out, because WinPE (without the filter driver) will see the exact value.
+    pub disk_size_estimated: bool,
     pub disk: StableDiskIdentity,
     pub device_id_hash: Option<[u8; 32]>,
     pub partitions: Vec<DiskLayoutPartitionSnapshot>,
@@ -347,7 +422,10 @@ fn reconcile_present_disk_snapshots(
         ));
     };
     for (path, observed) in observations.into_iter().skip(1) {
-        let fixed_conflict = trusted.disk_size_bytes != observed.disk_size_bytes
+        let size_conflict = !trusted.disk_size_estimated
+            && !observed.disk_size_estimated
+            && trusted.disk_size_bytes != observed.disk_size_bytes;
+        let fixed_conflict = size_conflict
             || trusted.disk != observed.disk
             || trusted.partitions != observed.partitions;
         let device_id_conflict = matches!(
@@ -364,6 +442,10 @@ fn reconcile_present_disk_snapshots(
         }
         if trusted.device_id_hash.is_none() {
             trusted.device_id_hash = observed.device_id_hash;
+        }
+        if trusted.disk_size_estimated && !observed.disk_size_estimated {
+            trusted.disk_size_bytes = observed.disk_size_bytes;
+            trusted.disk_size_estimated = false;
         }
     }
     Ok((selected_path, trusted))
@@ -488,9 +570,17 @@ pub fn same_stable_volume_identity(
     right: StableVolumeIdentity,
 ) -> bool {
     same_volume_identity(left.extent, right.extent)
-        && left.disk == right.disk
+        && same_stable_disk_token(left.disk, right.disk)
         && same_optional_device_id(left.device_id_hash, right.device_id_hash)
         && same_stable_partition_token(left.partition, right.partition)
+}
+
+/// `StableDiskIdentity::Raw` inside a volume identity means "the disk GUID/signature could not be
+/// read" (volume-only fallback on filtered storage stacks). The exact extent still has to match.
+fn same_stable_disk_token(left: StableDiskIdentity, right: StableDiskIdentity) -> bool {
+    left == right
+        || matches!(left, StableDiskIdentity::Raw)
+        || matches!(right, StableDiskIdentity::Raw)
 }
 
 pub fn same_stable_partition_identity(
@@ -498,7 +588,7 @@ pub fn same_stable_partition_identity(
     right: StableVolumeIdentity,
 ) -> bool {
     same_physical_partition(left.extent, right.extent)
-        && left.disk == right.disk
+        && same_stable_disk_token(left.disk, right.disk)
         && same_optional_device_id(left.device_id_hash, right.device_id_hash)
         && same_stable_partition_token(left.partition, right.partition)
 }
@@ -506,8 +596,9 @@ pub fn same_stable_partition_identity(
 fn same_optional_device_id(left: Option<[u8; 32]>, right: Option<[u8; 32]>) -> bool {
     match (left, right) {
         (Some(left), Some(right)) => left == right,
-        (None, None) => true,
-        _ => false,
+        // The device identifier is optional evidence. Filter drivers and some WinPE stacks
+        // expose it on one side only; a missing value is "unknown", not a mismatch.
+        _ => true,
     }
 }
 
@@ -742,6 +833,10 @@ fn same_stable_partition_token(
             },
         ) => left == right,
         (StablePartitionIdentity::Mbr { .. }, StablePartitionIdentity::Mbr { .. }) => true,
+        // `Mbr { partition_number: 0 }` is the volume-only fallback's "partition token unknown";
+        // the strict path never produces partition number zero.
+        (StablePartitionIdentity::Mbr { partition_number: 0 }, _)
+        | (_, StablePartitionIdentity::Mbr { partition_number: 0 }) => true,
         _ => false,
     }
 }
@@ -1144,6 +1239,9 @@ mod platform {
     pub unsafe fn query_present_disk_device_number(
         handle: HANDLE,
     ) -> Result<Option<(u32, &'static str)>, StorageError> {
+        if super::simulate_restricted_storage() {
+            return Err(simulated_invalid_function("read opened disk path device number"));
+        }
         use windows::Win32::System::Ioctl::{
             IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_GET_DEVICE_NUMBER_EX,
             STORAGE_DEVICE_NUMBER, STORAGE_DEVICE_NUMBER_EX,
@@ -1237,6 +1335,9 @@ mod platform {
 
         let result = (|| -> Result<Vec<PresentDiskInterfaceNode>, StorageError> {
             let mut interfaces = Vec::new();
+            // Interfaces whose disk number could not be read (filter drivers commonly reject
+            // IOCTL_STORAGE_GET_DEVICE_NUMBER). They are bound to `\\.\PhysicalDriveN` below.
+            let mut unresolved: Vec<(String, u32)> = Vec::new();
             let mut index = 0_u32;
             loop {
                 let mut interface = SP_DEVICE_INTERFACE_DATA {
@@ -1393,11 +1494,14 @@ mod platform {
                 let resolved = match resolved {
                     Ok(value) => value,
                     Err(error) => {
-                        log::warn!(
-                            "SetupAPI disk interface {} could not provide a current disk number and was skipped: {}",
-                            index - 1,
-                            error
-                        );
+                        super::warn_storage_once(&format!("setupapi-number:{device_path}"), || {
+                            format!(
+                                "[STORAGE] SetupAPI 磁盘接口 {} 读不到磁盘编号（常见于改机器码/磁盘过滤驱动），改用 PhysicalDriveN 兼容路径: {}",
+                                index - 1,
+                                error
+                            )
+                        });
+                        unresolved.push((device_path.clone(), device_info.DevInst));
                         continue;
                     }
                 };
@@ -1421,6 +1525,10 @@ mod platform {
                     },
                     dev_inst: device_info.DevInst,
                 });
+            }
+            if !unresolved.is_empty() || interfaces.is_empty() {
+                let fallback = physical_drive_alias_nodes(&interfaces, &unresolved);
+                interfaces.extend(fallback);
             }
             interfaces.sort_by(|left, right| {
                 left.interface
@@ -1501,21 +1609,33 @@ mod platform {
         expected_disk_number: u32,
         operation: &'static str,
     ) -> Result<(), StorageError> {
-        let Some((actual, source)) = query_present_disk_device_number(handle)? else {
-            return Err(StorageError::new(
-                operation,
-                "UntrustedStorage: opened disk interface is an MPIO path without a usable current disk number",
-            ));
-        };
-        if actual != expected_disk_number {
-            return Err(StorageError::new(
+        // Only a positive, different answer proves that the path now names another disk. Filter
+        // drivers that reject the number IOCTL (and MPIO paths without a number) are accepted:
+        // the path itself was enumerated or opened for this disk number.
+        match query_present_disk_device_number(handle) {
+            Ok(Some((actual, source))) if actual != expected_disk_number => Err(StorageError::new(
                 operation,
                 format!(
                     "UntrustedStorage: opened disk interface changed from current disk {expected_disk_number} to {actual} while binding it through {source}"
                 ),
-            ));
+            )),
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                log::debug!(
+                    "{operation}: opened disk path is an MPIO path without a number; accepted for disk {expected_disk_number}"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                super::mark_disk_degraded(expected_disk_number);
+                super::warn_storage_once(&format!("verify-number:{expected_disk_number}"), || {
+                    format!(
+                        "[STORAGE] 磁盘 {expected_disk_number} 的编号无法复核（{error}），按已打开的路径继续"
+                    )
+                });
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Read the complete canonical observation through every opaque SetupAPI path currently bound
@@ -1524,28 +1644,70 @@ mod platform {
     unsafe fn trusted_present_disk_snapshot(
         disk_number: u32,
     ) -> Result<(String, DiskLayoutSnapshot), StorageError> {
-        let interfaces = present_physical_disk_interfaces()?
-            .into_iter()
-            .filter(|interface| interface.disk_number == disk_number)
-            .collect::<Vec<_>>();
-        let mut observations = Vec::with_capacity(interfaces.len());
-        for interface in interfaces {
-            let handle = open_present_disk_interface_path(
-                &interface.device_path,
-                GENERIC_READ.0,
-                "open present disk interface for canonical snapshot",
-            )?;
-            verify_opened_present_disk_number(
-                handle.0,
+        let mut interfaces = match present_physical_disk_interfaces() {
+            Ok(list) => list
+                .into_iter()
+                .filter(|interface| interface.disk_number == disk_number)
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                super::warn_storage_once("present-interfaces", || {
+                    format!("[STORAGE] SetupAPI 磁盘枚举失败，改用 PhysicalDriveN 兼容路径: {error}")
+                });
+                Vec::new()
+            }
+        };
+        if interfaces.is_empty() {
+            // A volume reported this disk number, but SetupAPI did not expose it.
+            super::mark_disk_degraded(disk_number);
+            interfaces.push(PresentDiskInterface {
                 disk_number,
-                "verify present disk interface for canonical snapshot",
-            )?;
-            let snapshot = disk_layout_snapshot_from_handle(handle.0)?;
-            observations.push((interface.device_path, snapshot));
+                device_path: physical_drive_alias_path(disk_number),
+            });
+        }
+        let mut observations = Vec::with_capacity(interfaces.len());
+        let mut failures = Vec::new();
+        for interface in interfaces {
+            let observed = (|| -> Result<DiskLayoutSnapshot, StorageError> {
+                let handle = open_present_disk_interface_path(
+                    &interface.device_path,
+                    GENERIC_READ.0,
+                    "open present disk interface for canonical snapshot",
+                )?;
+                verify_opened_present_disk_number(
+                    handle.0,
+                    disk_number,
+                    "verify present disk interface for canonical snapshot",
+                )?;
+                disk_layout_snapshot_from_handle(handle.0)
+            })();
+            match observed {
+                Ok(snapshot) => observations.push((interface.device_path, snapshot)),
+                Err(error) => failures.push(format!("{}: {error}", interface.device_path)),
+            }
+        }
+        if observations.is_empty() {
+            return Err(StorageError::new(
+                "bind present physical disk",
+                format!(
+                    "no present interface of disk {disk_number} produced a layout snapshot: {}",
+                    failures.join("; ")
+                ),
+            ));
+        }
+        if !failures.is_empty() {
+            super::warn_storage_once(&format!("snapshot-alias:{disk_number}"), || {
+                format!(
+                    "[STORAGE] 磁盘 {disk_number} 的部分接口读取失败，已使用可读接口: {}",
+                    failures.join("; ")
+                )
+            });
         }
         let reconciled = reconcile_present_disk_snapshots(disk_number, observations)?;
         if reconciled.1.device_id_hash.is_none() {
             warn_missing_device_id_once(disk_number);
+        }
+        if reconciled.1.disk_size_estimated {
+            super::mark_disk_degraded(disk_number);
         }
         Ok(reconciled)
     }
@@ -1656,6 +1818,12 @@ mod platform {
 
     impl Vds {
         unsafe fn connect() -> Result<Self, StorageError> {
+            if crate::windows_storage::simulate_restricted_storage() {
+                return Err(StorageError::new(
+                    "connect storage provider",
+                    "simulated restricted storage: VDS / Storage Management provider unavailable",
+                ));
+            }
             let apartment = ComApartment::enter()?;
             let loader: IVdsServiceLoader =
                 CoCreateInstance(&CLSID_VdsLoader, None, CLSCTX_LOCAL_SERVER)
@@ -2583,7 +2751,7 @@ mod platform {
         for disk_number in disk_numbers {
             let mut matching = interfaces
                 .iter()
-                .filter(|node| node.interface.disk_number == disk_number)
+                .filter(|node| node.interface.disk_number == disk_number && node.dev_inst != 0)
                 .map(|node| node.dev_inst)
                 .collect::<Vec<_>>();
             matching.sort_unstable();
@@ -2920,6 +3088,9 @@ mod platform {
     unsafe fn physical_device_id_hash_from_handle(
         handle: HANDLE,
     ) -> Result<Option<[u8; 32]>, StorageError> {
+        if super::simulate_restricted_storage() {
+            return Ok(None);
+        }
         use sha2::{Digest, Sha256};
         use windows::Win32::System::Ioctl::{
             PropertyExistsQuery, PropertyStandardQuery, StorageDeviceIdProperty,
@@ -3277,7 +3448,15 @@ mod platform {
                 "drive layout response is shorter than its declared partition count",
             ));
         }
-        let device_id_hash = physical_device_id_hash_from_handle(handle)?;
+        // Optional evidence: any failure (including filter drivers returning odd statuses) means
+        // "not exposed", never "stop the inventory".
+        let device_id_hash = match physical_device_id_hash_from_handle(handle) {
+            Ok(value) => value,
+            Err(error) => {
+                log::debug!("physical disk device identity unavailable: {error}");
+                None
+            }
+        };
         let disk = if layout.PartitionStyle == PARTITION_STYLE_GPT.0 as u32 {
             let disk_id = guid_identity(layout.Anonymous.Gpt.DiskId);
             if disk_id == [0; 16] {
@@ -3382,15 +3561,55 @@ mod platform {
         // The caller's handle must carry GENERIC_READ because this IOCTL carries
         // FILE_READ_ACCESS. Reusing the same handle binds layout, length and device ID to one
         // opened PhysicalDrive object instead of mixing observations across reopen races.
-        let disk_size_bytes = disk_length_from_raw_handle(handle)?;
-        if disk_size_bytes == 0 {
-            return Err(StorageError::new(
-                "snapshot physical disk layout",
-                "physical disk reports zero capacity",
-            ));
+        let exact_length = match disk_length_from_raw_handle(handle) {
+            Ok(length) if length > 0 => Ok(length),
+            Ok(_) => Err("IOCTL_DISK_GET_LENGTH_INFO returned zero".to_owned()),
+            Err(error) => Err(error.to_string()),
         }
+        .or_else(|length_error| match disk_geometry_length_from_raw_handle(handle) {
+            Ok(length) if length > 0 => Ok(length),
+            Ok(_) => Err(format!("{length_error}; GEOMETRY_EX returned zero")),
+            Err(error) => Err(format!("{length_error}; {error}")),
+        });
+        let (disk_size_bytes, disk_size_estimated) = match exact_length {
+            Ok(length) => (length, false),
+            Err(detail) => {
+                // Filter drivers (hardware-ID spoofers) reject both capacity IOCTLs while the
+                // partition table is still served above them. Use the end of the usable GPT area
+                // (or of the last partition) as a conservative bound and mark it as estimated.
+                let partition_end = partitions
+                    .iter()
+                    .filter_map(|partition| partition.offset_bytes.checked_add(partition.size_bytes))
+                    .max()
+                    .unwrap_or(0);
+                let usable_end = if matches!(disk, StableDiskIdentity::Gpt { .. }) {
+                    let gpt = layout.Anonymous.Gpt;
+                    u64::try_from(gpt.StartingUsableOffset)
+                        .ok()
+                        .zip(u64::try_from(gpt.UsableLength).ok())
+                        .and_then(|(start, length)| start.checked_add(length))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let estimate = usable_end.max(partition_end);
+                if estimate == 0 {
+                    return Err(StorageError::new(
+                        "snapshot physical disk layout",
+                        format!("physical disk capacity is unavailable and the partition table gives no bound: {detail}"),
+                    ));
+                }
+                super::warn_storage_once(&format!("estimated-size:{estimate}:{}", partitions.len()), || {
+                    format!(
+                        "[STORAGE] 磁盘容量查询被拒绝（{detail}），改用分区表推算的容量 {estimate} 字节（仅用于边界检查，交接指纹不含容量）"
+                    )
+                });
+                (estimate, true)
+            }
+        };
         Ok(DiskLayoutSnapshot {
             disk_size_bytes,
+            disk_size_estimated,
             disk,
             device_id_hash,
             partitions,
@@ -3494,6 +3713,262 @@ mod platform {
         })
     }
 
+    fn simulated_invalid_function(operation: &'static str) -> StorageError {
+        api_error(
+            operation,
+            windows::core::Error::from(HRESULT::from_win32(ERROR_INVALID_FUNCTION.0)),
+        )
+    }
+
+    fn physical_drive_alias_path(disk_number: u32) -> String {
+        format!(r"\\.\PhysicalDrive{disk_number}")
+    }
+
+    /// Raw `DRIVE_LAYOUT_INFORMATION_EX` bytes of one openable disk path, used only to bind an
+    /// unnumbered SetupAPI interface to its `PhysicalDriveN` alias.
+    unsafe fn raw_layout_bytes_for_path(path: &str) -> Option<Vec<u8>> {
+        let handle = open_present_disk_interface_path(path, GENERIC_READ.0, "read layout for alias binding").ok()?;
+        let (storage, returned) = read_drive_layout_from_raw_handle(handle.0).ok()?;
+        let available = (returned as usize).min(storage.len() * size_of::<u64>());
+        let bytes = std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), available);
+        Some(bytes.to_vec())
+    }
+
+    /// When SetupAPI interfaces cannot report their disk numbers, reach the disks through the
+    /// documented `\\.\PhysicalDriveN` names. Each alias inherits the devnode of the unnumbered
+    /// SetupAPI interface whose partition table is byte-identical (needed for storage-controller
+    /// ancestry); clones or unreadable tables keep devnode 0 ("unknown").
+    unsafe fn physical_drive_alias_nodes(
+        existing: &[PresentDiskInterfaceNode],
+        unresolved: &[(String, u32)],
+    ) -> Vec<PresentDiskInterfaceNode> {
+        const PROBE_LIMIT: u32 = 64;
+        let unresolved_layouts = unresolved
+            .iter()
+            .map(|(path, dev_inst)| (raw_layout_bytes_for_path(path), *dev_inst))
+            .collect::<Vec<_>>();
+        let mut nodes = Vec::new();
+        for disk_number in 0..PROBE_LIMIT {
+            if existing
+                .iter()
+                .any(|node| node.interface.disk_number == disk_number)
+            {
+                continue;
+            }
+            let path = physical_drive_alias_path(disk_number);
+            let wide_path = wide(&path);
+            let Ok(probe) = CreateFileW(
+                PCWSTR(wide_path.as_ptr()),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                Default::default(),
+                None,
+            )
+            .map(OwnedHandle) else {
+                continue;
+            };
+            drop(probe);
+            // Devices whose partition table cannot be read (empty card readers, offline media)
+            // were skipped before this fallback existed and must stay out of the inventory.
+            let Some(layout) = raw_layout_bytes_for_path(&path) else {
+                continue;
+            };
+            let matches = unresolved_layouts
+                .iter()
+                .filter(|(candidate, _)| candidate.as_ref() == Some(&layout))
+                .map(|(_, dev_inst)| *dev_inst)
+                .collect::<Vec<_>>();
+            let dev_inst = match matches.as_slice() {
+                [dev_inst] => *dev_inst,
+                _ => 0,
+            };
+            super::mark_disk_degraded(disk_number);
+            super::warn_storage_once(&format!("alias:{disk_number}"), || {
+                format!(
+                    "[STORAGE] 磁盘 {disk_number} 通过 {path} 访问（SetupAPI 读不到编号），设备节点{}",
+                    if dev_inst != 0 { "已按分区表匹配" } else { "未知" }
+                )
+            });
+            nodes.push(PresentDiskInterfaceNode {
+                interface: PresentDiskInterface {
+                    disk_number,
+                    device_path: path,
+                },
+                dev_inst,
+            });
+        }
+        nodes
+    }
+
+    /// NVMe disks carry `VEN_NVME` (stornvme) or an `NVME\` enumerator in their PnP instance
+    /// IDs. Used only when the storage descriptor itself is rejected.
+    unsafe fn devnode_chain_looks_nvme(dev_inst: u32) -> bool {
+        use windows::Win32::Devices::DeviceAndDriverInstallation::{CM_Get_Parent, CR_SUCCESS};
+        let mut current = dev_inst;
+        for _ in 0..4 {
+            if let Ok(id) = device_instance_id(current) {
+                let upper = id.to_ascii_uppercase();
+                if upper.contains("VEN_NVME") || upper.starts_with("NVME\\") || upper.contains("\\NVME&") {
+                    return true;
+                }
+            }
+            let mut parent = 0_u32;
+            if CM_Get_Parent(&mut parent, current, 0) != CR_SUCCESS || parent == 0 {
+                break;
+            }
+            current = parent;
+        }
+        false
+    }
+
+    /// `IOCTL_DISK_GET_PARTITION_INFO_EX` on a volume path. Answered by the partition manager, so
+    /// it keeps working when a filter below it rejects disk IOCTLs.
+    unsafe fn volume_partition_information(
+        device_path: &str,
+    ) -> Result<windows::Win32::System::Ioctl::PARTITION_INFORMATION_EX, StorageError> {
+        use windows::Win32::System::Ioctl::{
+            IOCTL_DISK_GET_PARTITION_INFO_EX, PARTITION_INFORMATION_EX,
+        };
+        use windows::Win32::System::IO::DeviceIoControl;
+
+        let path = wide(device_path);
+        let handle = CreateFileW(
+            PCWSTR(path.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None,
+        )
+        .map(OwnedHandle)
+        .map_err(|error| api_error("open volume for partition information", error))?;
+        let mut info = PARTITION_INFORMATION_EX::default();
+        let mut returned = 0_u32;
+        DeviceIoControl(
+            handle.0,
+            IOCTL_DISK_GET_PARTITION_INFO_EX,
+            None,
+            0,
+            Some((&mut info as *mut PARTITION_INFORMATION_EX).cast()),
+            size_of::<PARTITION_INFORMATION_EX>() as u32,
+            Some(&mut returned),
+            None,
+        )
+        .map_err(|error| api_error("query volume partition information", error))?;
+        if (returned as usize) < size_of::<PARTITION_INFORMATION_EX>() {
+            return Err(StorageError::new(
+                "query volume partition information",
+                "partition information response is truncated",
+            ));
+        }
+        Ok(info)
+    }
+
+    pub unsafe fn volume_partition_style(drive_letter: char) -> Result<DiskStyle, StorageError> {
+        use windows::Win32::System::Ioctl::{PARTITION_STYLE_GPT, PARTITION_STYLE_MBR};
+        let letter = normalize_letter(drive_letter)?;
+        let info = volume_partition_information(&format!(r"\\.\{letter}:"))?;
+        if info.PartitionStyle == PARTITION_STYLE_GPT {
+            Ok(DiskStyle::Gpt)
+        } else if info.PartitionStyle == PARTITION_STYLE_MBR {
+            Ok(DiskStyle::Mbr)
+        } else {
+            Err(StorageError::new(
+                "query volume partition style",
+                "volume is not on an MBR or GPT partition",
+            ))
+        }
+    }
+
+    /// Read the GPT disk GUID or MBR signature straight from the first sectors. Plain reads are
+    /// not filtered by hardware-ID spoofers; 8 KiB covers both 512-byte and 4-KiB sector disks.
+    unsafe fn raw_disk_identity(disk_number: u32) -> Option<StableDiskIdentity> {
+        use windows::Win32::Storage::FileSystem::ReadFile;
+        let path = wide(&physical_drive_alias_path(disk_number));
+        let handle = CreateFileW(
+            PCWSTR(path.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None,
+        )
+        .map(OwnedHandle)
+        .ok()?;
+        let mut storage = vec![0_u64; 8192 / size_of::<u64>()];
+        let buffer = std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<u8>(), 8192);
+        let mut read = 0_u32;
+        ReadFile(handle.0, Some(buffer), Some(&mut read), None).ok()?;
+        let bytes = &buffer[..(read as usize).min(8192)];
+        for header in [512_usize, 4096] {
+            if bytes.len() >= header + 72 && &bytes[header..header + 8] == b"EFI PART" {
+                let id = &bytes[header + 56..header + 72];
+                let data4: [u8; 8] = id[8..16].try_into().ok()?;
+                let guid = GUID::from_values(
+                    u32::from_le_bytes(id[0..4].try_into().ok()?),
+                    u16::from_le_bytes(id[4..6].try_into().ok()?),
+                    u16::from_le_bytes(id[6..8].try_into().ok()?),
+                    data4,
+                );
+                let disk_id = guid_identity(guid);
+                return (disk_id != [0; 16]).then_some(StableDiskIdentity::Gpt { disk_id });
+            }
+        }
+        if bytes.len() >= 512 && bytes[510] == 0x55 && bytes[511] == 0xAA {
+            let signature = u32::from_le_bytes(bytes[440..444].try_into().ok()?);
+            return (signature != 0).then_some(StableDiskIdentity::Mbr { signature });
+        }
+        None
+    }
+
+    /// Identity built only from volume-level evidence. The exact physical extent (disk number,
+    /// offset, length) is always real; unreadable disk/partition tokens use the documented
+    /// "unknown" sentinels (`Raw`, `Mbr { partition_number: 0 }`).
+    unsafe fn volume_only_stable_identity(
+        device_path: &str,
+        extent: VolumeIdentity,
+    ) -> StableVolumeIdentity {
+        use windows::Win32::System::Ioctl::{PARTITION_STYLE_GPT, PARTITION_STYLE_MBR};
+        let raw_disk = raw_disk_identity(extent.disk_number);
+        let (disk, partition) = match volume_partition_information(device_path) {
+            Ok(info) if info.PartitionStyle == PARTITION_STYLE_GPT => {
+                let partition_id = guid_identity(info.Anonymous.Gpt.PartitionId);
+                (
+                    raw_disk
+                        .filter(|disk| matches!(disk, StableDiskIdentity::Gpt { .. }))
+                        .unwrap_or(StableDiskIdentity::Raw),
+                    if partition_id != [0; 16] {
+                        StablePartitionIdentity::Gpt { partition_id }
+                    } else {
+                        StablePartitionIdentity::Mbr { partition_number: 0 }
+                    },
+                )
+            }
+            Ok(info) if info.PartitionStyle == PARTITION_STYLE_MBR => (
+                raw_disk
+                    .filter(|disk| matches!(disk, StableDiskIdentity::Mbr { .. }))
+                    .unwrap_or(StableDiskIdentity::Raw),
+                StablePartitionIdentity::Mbr {
+                    partition_number: info.PartitionNumber,
+                },
+            ),
+            _ => (
+                raw_disk.unwrap_or(StableDiskIdentity::Raw),
+                StablePartitionIdentity::Mbr { partition_number: 0 },
+            ),
+        };
+        StableVolumeIdentity {
+            extent,
+            disk,
+            partition,
+            device_id_hash: None,
+        }
+    }
+
     pub unsafe fn disk_layout_snapshot(
         disk_number: u32,
     ) -> Result<DiskLayoutSnapshot, StorageError> {
@@ -3521,21 +3996,60 @@ mod platform {
     pub unsafe fn stable_volume_identity(
         drive_letter: char,
     ) -> Result<StableVolumeIdentity, StorageError> {
-        let mounted_extent = volume_identity(drive_letter)?;
-        let volume_guid_path = volume_guid_device_path_from_drive_letter(drive_letter)?;
-        let volume_guid_extent = volume_identity_from_device_path(&volume_guid_path)?;
-        let disk_snapshot = disk_layout_snapshot(mounted_extent.disk_number)?;
-        verify_current_volume_identity_closure(mounted_extent, volume_guid_extent, &disk_snapshot)?;
-        stable_identity_for_extent(mounted_extent)
+        let letter = normalize_letter(drive_letter)?;
+        let mounted_extent = volume_identity(letter)?;
+        let strict = (|| -> Result<StableVolumeIdentity, StorageError> {
+            let volume_guid_path = volume_guid_device_path_from_drive_letter(letter)?;
+            let volume_guid_extent = volume_identity_from_device_path(&volume_guid_path)?;
+            let disk_snapshot = disk_layout_snapshot(mounted_extent.disk_number)?;
+            verify_current_volume_identity_closure(
+                mounted_extent,
+                volume_guid_extent,
+                &disk_snapshot,
+            )?;
+            stable_identity_for_extent(mounted_extent)
+        })();
+        match strict {
+            Ok(identity) => Ok(identity),
+            Err(error) => {
+                super::mark_disk_degraded(mounted_extent.disk_number);
+                super::warn_storage_once(&format!("volume-only-identity:{letter}"), || {
+                    format!(
+                        "[STORAGE] {letter}: 的完整磁盘身份读取失败，改用卷级身份（精确物理范围仍然核对）: {error}"
+                    )
+                });
+                Ok(volume_only_stable_identity(
+                    &format!(r"\\.\{letter}:"),
+                    mounted_extent,
+                ))
+            }
+        }
     }
 
     pub unsafe fn stable_volume_identity_from_guid_path(
         volume_guid_root: &str,
     ) -> Result<StableVolumeIdentity, StorageError> {
         let extent = volume_identity_from_guid_path(volume_guid_root)?;
-        let disk_snapshot = disk_layout_snapshot(extent.disk_number)?;
-        verify_current_volume_identity_closure(extent, extent, &disk_snapshot)?;
-        stable_identity_for_extent(extent)
+        let strict = (|| -> Result<StableVolumeIdentity, StorageError> {
+            let disk_snapshot = disk_layout_snapshot(extent.disk_number)?;
+            verify_current_volume_identity_closure(extent, extent, &disk_snapshot)?;
+            stable_identity_for_extent(extent)
+        })();
+        match strict {
+            Ok(identity) => Ok(identity),
+            Err(error) => {
+                super::mark_disk_degraded(extent.disk_number);
+                super::warn_storage_once(&format!("volume-only-identity:{volume_guid_root}"), || {
+                    format!(
+                        "[STORAGE] {volume_guid_root} 的完整磁盘身份读取失败，改用卷级身份: {error}"
+                    )
+                });
+                Ok(volume_only_stable_identity(
+                    volume_guid_root.trim_end_matches('\\'),
+                    extent,
+                ))
+            }
+        }
     }
 
     pub fn drive_kind(drive_letter: char) -> Result<DriveKind, StorageError> {
@@ -3999,6 +4513,9 @@ mod platform {
     }
 
     unsafe fn disk_length_from_raw_handle(handle: HANDLE) -> Result<u64, StorageError> {
+        if super::simulate_restricted_storage() {
+            return Err(simulated_invalid_function("read retained physical disk length"));
+        }
         use windows::Win32::System::Ioctl::{GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO};
         use windows::Win32::System::IO::DeviceIoControl;
 
@@ -4024,12 +4541,49 @@ mod platform {
         Ok(length.Length as u64)
     }
 
+    unsafe fn disk_geometry_length_from_raw_handle(handle: HANDLE) -> Result<u64, StorageError> {
+        use windows::Win32::System::Ioctl::{DISK_GEOMETRY_EX, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX};
+        use windows::Win32::System::IO::DeviceIoControl;
+
+        if super::simulate_restricted_storage() {
+            return Err(simulated_invalid_function("read physical disk geometry"));
+        }
+        let mut storage = vec![0_u64; 64];
+        let mut returned = 0_u32;
+        DeviceIoControl(
+            handle,
+            IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+            None,
+            0,
+            Some(storage.as_mut_ptr().cast()),
+            (storage.len() * size_of::<u64>()) as u32,
+            Some(&mut returned),
+            None,
+        )
+        .map_err(|error| api_error("read physical disk geometry", error))?;
+        let size_end = std::mem::offset_of!(DISK_GEOMETRY_EX, DiskSize) + size_of::<i64>();
+        if (returned as usize) < size_end {
+            return Err(StorageError::new(
+                "read physical disk geometry",
+                "geometry response is shorter than DiskSize",
+            ));
+        }
+        let geometry = std::ptr::read_unaligned(storage.as_ptr().cast::<DISK_GEOMETRY_EX>());
+        u64::try_from(geometry.DiskSize)
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| StorageError::new("read physical disk geometry", "invalid DiskSize"))
+    }
+
     /// Reads `STORAGE_DEVICE_DESCRIPTOR.BusType` from one already-open disk interface.
     ///
     /// Microsoft documents a header query followed by an allocation using the returned `Size`;
     /// using the two-call form avoids truncating descriptors on storage stacks that append
     /// bus-specific properties.
     unsafe fn disk_bus_type_from_handle(handle: HANDLE) -> Result<DiskBusType, StorageError> {
+        if super::simulate_restricted_storage() {
+            return Err(simulated_invalid_function("query physical disk descriptor size"));
+        }
         use windows::Win32::Storage::FileSystem::BusTypeNvme;
         use windows::Win32::System::Ioctl::{
             PropertyStandardQuery, StorageDeviceProperty, IOCTL_STORAGE_QUERY_PROPERTY,
@@ -4109,33 +4663,54 @@ mod platform {
     /// Reads and reconciles `STORAGE_DEVICE_DESCRIPTOR.BusType` through every present opaque
     /// SetupAPI path that maps to the current disk number.
     pub unsafe fn disk_bus_type(disk_number: u32) -> Result<DiskBusType, StorageError> {
-        let interfaces = present_physical_disk_interfaces()?
+        let mut candidates = present_physical_disk_interface_nodes()
+            .unwrap_or_default()
             .into_iter()
-            .filter(|interface| interface.disk_number == disk_number)
+            .filter(|node| node.interface.disk_number == disk_number)
+            .map(|node| (node.interface.device_path, node.dev_inst))
             .collect::<Vec<_>>();
-        let mut snapshots = Vec::with_capacity(interfaces.len());
-        let mut bus_types = Vec::with_capacity(interfaces.len());
-        for interface in interfaces {
-            let handle = open_present_disk_interface_path(
-                &interface.device_path,
-                GENERIC_READ.0,
-                "open present physical disk for bus query",
-            )?;
-            verify_opened_present_disk_number(
-                handle.0,
-                disk_number,
-                "verify present physical disk for bus query",
-            )?;
-            snapshots.push((
-                interface.device_path.clone(),
-                disk_layout_snapshot_from_handle(handle.0)?,
-            ));
-            bus_types.push((interface.device_path, disk_bus_type_from_handle(handle.0)?));
+        if candidates.is_empty() {
+            candidates.push((physical_drive_alias_path(disk_number), 0));
         }
-        // Capacity, disk identity and canonical partition layout must agree before the auxiliary
-        // bus property is allowed to influence install defaults.
-        let _ = reconcile_present_disk_snapshots(disk_number, snapshots)?;
-        reconcile_present_disk_bus_types(disk_number, bus_types)
+        let mut bus_types = Vec::with_capacity(candidates.len());
+        let mut failures = Vec::new();
+        for (path, _) in &candidates {
+            let observed = (|| -> Result<DiskBusType, StorageError> {
+                let handle = open_present_disk_interface_path(
+                    path,
+                    GENERIC_READ.0,
+                    "open present physical disk for bus query",
+                )?;
+                verify_opened_present_disk_number(
+                    handle.0,
+                    disk_number,
+                    "verify present physical disk for bus query",
+                )?;
+                disk_bus_type_from_handle(handle.0)
+            })();
+            match observed {
+                Ok(bus) => bus_types.push((path.clone(), bus)),
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        if !bus_types.is_empty() {
+            return reconcile_present_disk_bus_types(disk_number, bus_types);
+        }
+        // The storage descriptor is rejected (typical for hardware-ID spoofers). The PnP device
+        // instance IDs are not filtered and name NVMe disks explicitly.
+        if candidates
+            .iter()
+            .any(|(_, dev_inst)| *dev_inst != 0 && devnode_chain_looks_nvme(*dev_inst))
+        {
+            return Ok(DiskBusType::Nvme);
+        }
+        Err(StorageError::new(
+            "query physical disk bus",
+            format!(
+                "bus type is unavailable for disk {disk_number}: {}",
+                failures.join("; ")
+            ),
+        ))
     }
 
     pub unsafe fn physical_disk_sector_geometry(
@@ -4147,6 +4722,9 @@ mod platform {
         };
         use windows::Win32::System::IO::DeviceIoControl;
 
+        if super::simulate_restricted_storage() {
+            return Err(simulated_invalid_function("query physical disk sector geometry"));
+        }
         let (handle, _) = open_trusted_present_disk(
             disk_number,
             GENERIC_READ.0,
@@ -4806,11 +5384,12 @@ mod platform {
         }
         if created.offset_bytes < selected.authorized_start_bytes {
             return Some(format!(
-                "created partition starts before the authorized range: actual_offset={} authorized_start={} provider_request_offset={} selection_evidence_offset={}",
+                "created partition starts before the authorized range: actual_offset={} authorized_start={} provider_request_offset={} selection_evidence_offset={} selection_evidence_size={}",
                 created.offset_bytes,
                 selected.authorized_start_bytes,
                 selected.offset_bytes,
-                selected.raw_offset_bytes
+                selected.raw_offset_bytes,
+                selected.raw_size_bytes
             ));
         }
         if created_end > selected.authorized_end_bytes {
@@ -5471,7 +6050,9 @@ mod platform {
     }
 
     fn same_snapshot_disk_identity(left: &DiskLayoutSnapshot, right: &DiskLayoutSnapshot) -> bool {
-        left.disk_size_bytes == right.disk_size_bytes
+        (left.disk_size_estimated
+            || right.disk_size_estimated
+            || left.disk_size_bytes == right.disk_size_bytes)
             && left.disk == right.disk
             && same_optional_device_id(left.device_id_hash, right.device_id_hash)
     }
@@ -6710,6 +7291,12 @@ mod platform {
         /// `ROOT\\Microsoft\\Windows\\Storage` namespace. `RPC_E_TOO_LATE` means another part of
         /// the process already established COM security and is therefore not a connection error.
         unsafe fn connect() -> Result<Self, StorageError> {
+            if crate::windows_storage::simulate_restricted_storage() {
+                return Err(StorageError::new(
+                    "connect storage provider",
+                    "simulated restricted storage: VDS / Storage Management provider unavailable",
+                ));
+            }
             let apartment = ComApartment::enter()?;
             let security = CoInitializeSecurity(
                 None,
@@ -7204,6 +7791,29 @@ mod platform {
             desired_bytes,
             minimum_bytes,
         )
+    }
+
+    pub unsafe fn query_max_reclaimable_bytes(drive_letter: char) -> Result<u64, StorageError> {
+        let expected = volume_identity(drive_letter)?;
+        let vds = Vds::connect()?;
+        let volume = find_checked_volume(
+            &vds,
+            drive_letter,
+            expected,
+            None,
+            "query shrink capacity",
+        )?;
+        let shrink = volume
+            .cast::<IVdsVolumeShrink>()
+            .map_err(|error| api_error("open VDS volume shrink interface", error))?;
+        let mut reclaimable = 0_u64;
+        (Interface::vtable(&shrink).QueryMaxReclaimableBytes)(
+            Interface::as_raw(&shrink),
+            &mut reclaimable,
+        )
+        .ok()
+        .map_err(|error| api_error("query VDS max reclaimable bytes", error))?;
+        Ok(reclaimable)
     }
 
     unsafe fn shrink_volume_expected(
@@ -8670,6 +9280,7 @@ mod platform {
         fn mbr_snapshot(partitions: Vec<DiskLayoutPartitionSnapshot>) -> DiskLayoutSnapshot {
             DiskLayoutSnapshot {
                 disk_size_bytes: 1024 * 1024 * 1024,
+                disk_size_estimated: false,
                 disk: StableDiskIdentity::Mbr {
                     signature: 0x1234_5678,
                 },
@@ -8699,6 +9310,7 @@ mod platform {
         fn gpt_snapshot(partitions: Vec<DiskLayoutPartitionSnapshot>) -> DiskLayoutSnapshot {
             DiskLayoutSnapshot {
                 disk_size_bytes: 1024 * 1024 * 1024,
+                disk_size_estimated: false,
                 disk: StableDiskIdentity::Gpt { disk_id: [9; 16] },
                 device_id_hash: Some([7; 32]),
                 partitions,
@@ -10019,6 +10631,13 @@ pub fn shrink_volume_stable_checked(
     }
 }
 
+/// Windows' own estimate of how many bytes a shrink of this volume could reclaim right now (the
+/// figure Disk Management offers). Read-only: it plans a donor shrink before anything is written.
+#[cfg(windows)]
+pub fn query_max_reclaimable_bytes(drive_letter: char) -> Result<u64, StorageError> {
+    unsafe { platform::query_max_reclaimable_bytes(drive_letter) }
+}
+
 #[cfg(windows)]
 pub fn extend_volume(
     drive_letter: char,
@@ -10418,6 +11037,45 @@ pub fn vds_disk_size(disk_number: u32) -> Result<u64, StorageError> {
 #[cfg(windows)]
 pub fn disk_bus_type(disk_number: u32) -> Result<DiskBusType, StorageError> {
     unsafe { platform::disk_bus_type(disk_number) }
+}
+
+/// Partition style read from the volume itself (partition manager), independent of the
+/// physical-disk IOCTLs that filter drivers may reject.
+#[cfg(windows)]
+pub fn volume_partition_style(drive_letter: char) -> Result<DiskStyle, StorageError> {
+    unsafe { platform::volume_partition_style(drive_letter) }
+}
+
+#[cfg(not(windows))]
+pub fn volume_partition_style(_drive_letter: char) -> Result<DiskStyle, StorageError> {
+    Err(StorageError::new(
+        "query volume partition style",
+        "Windows storage APIs are unavailable",
+    ))
+}
+
+/// True when this disk can only be reached through compatibility fallbacks (unreadable disk
+/// number, rejected capacity query, unreadable layout) or the simulation switch is active.
+/// Install code then prefers operations that never modify the partition table.
+#[cfg(windows)]
+pub fn physical_storage_restricted(disk_number: u32) -> bool {
+    if simulate_restricted_storage() {
+        return true;
+    }
+    match disk_layout_snapshot(disk_number) {
+        Ok(snapshot) => snapshot.disk_size_estimated || disk_marked_degraded(disk_number),
+        Err(error) => {
+            warn_storage_once(&format!("restricted:{disk_number}"), || {
+                format!("[STORAGE] 磁盘 {disk_number} 的分区表不可读，按受限存储处理: {error}")
+            });
+            true
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn physical_storage_restricted(_disk_number: u32) -> bool {
+    simulate_restricted_storage()
 }
 
 /// Query authoritative logical/physical sector geometry for the current physical disk.
@@ -10899,6 +11557,7 @@ mod tests {
     fn test_disk_snapshot(device_id_hash: Option<[u8; 32]>) -> DiskLayoutSnapshot {
         DiskLayoutSnapshot {
             disk_size_bytes: 80 * 1024 * 1024 * 1024,
+            disk_size_estimated: false,
             disk: StableDiskIdentity::Gpt { disk_id: [4; 16] },
             device_id_hash,
             partitions: vec![DiskLayoutPartitionSnapshot {
@@ -11258,6 +11917,7 @@ mod tests {
         };
         let mut snapshot = DiskLayoutSnapshot {
             disk_size_bytes: 500 * 1024 * 1024,
+            disk_size_estimated: false,
             disk: StableDiskIdentity::Mbr {
                 signature: 0x1234_5678,
             },

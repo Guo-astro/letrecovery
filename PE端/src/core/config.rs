@@ -411,6 +411,8 @@ pub struct AuthenticatedOperationTask {
     guard: AuthenticatedOperationGuard,
     data_volume_root: PathBuf,
     _data_locator: AuthenticatedLocatedVolume,
+    /// Volumes found through `LetRecovery_Scatter_<token>` markers, keyed by token.
+    scatter_locators: Vec<(String, AuthenticatedLocatedVolume)>,
     install_target: Option<AuthenticatedInstallTarget>,
     install_target_mount: Option<TemporaryLocatorMount>,
     full_disk_targets: Vec<AuthenticatedFullDiskTarget>,
@@ -499,10 +501,19 @@ struct AuthenticatedInstallImageSet {
     primary: PathBuf,
     ordered_paths: Vec<PathBuf>,
     _secure_directory: Option<File>,
+    /// Split WIM parts stored on several volumes. They cannot be enumerated from one directory;
+    /// each part is bound by its own locked, hashed manifest artifact instead.
+    scattered: bool,
 }
 
 impl AuthenticatedInstallImageSet {
     fn verify_unchanged(&self) -> Result<()> {
+        if self.scattered {
+            if let Some(missing) = self.ordered_paths.iter().find(|path| !path.is_file()) {
+                bail!("authenticated scattered image part is missing: {}", missing.display());
+            }
+            return Ok(());
+        }
         if let Some(directory) = &self._secure_directory {
             lr_core::scoped_temp_file::verify_system_administrators_directory_custody(directory)?;
             lr_core::install_source_lock::verify_engine_visible_directory_contains_only(
@@ -680,12 +691,56 @@ impl AuthenticatedOperationTask {
             .collect()
     }
 
+    /// Raw image chunks in manifest order (scattered staging).
+    pub fn install_image_chunk_paths(&self) -> Result<Vec<PathBuf>> {
+        self.install_artifact_paths(lr_core::handoff_manifest::ArtifactRole::InstallImageChunk)
+    }
+
+    /// `LetRecovery_Scatter_<token>` directories on the other volumes of this task.
+    pub fn scatter_roots(&self) -> Vec<PathBuf> {
+        self.scatter_locators
+            .iter()
+            .map(|(token, located)| {
+                located
+                    .root
+                    .join(lr_core::data_staging::scatter_root_name(token))
+            })
+            .collect()
+    }
+
+    /// After a successful installation, release every handle on scattered files and delete
+    /// their directories. Failures are only logged; the new system is already complete.
+    pub fn remove_scatter_payload(&mut self) {
+        let roots = self.scatter_roots();
+        if roots.is_empty() {
+            return;
+        }
+        self.public_artifacts.retain(|artifact| {
+            lr_core::data_staging::split_scatter_prefix(&artifact.record.relative_path).is_none()
+        });
+        self.install_image_set = None;
+        self.scatter_locators.clear();
+        for root in roots {
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => log::info!("[SCATTER] 已删除分散目录 {}", root.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => log::warn!(
+                    "[SCATTER] 删除分散目录 {} 失败，可以在新系统中手动删除: {error}",
+                    root.display()
+                ),
+            }
+        }
+    }
+
     pub fn verify_unchanged(&self) -> Result<()> {
         self.guard.verify_unchanged()?;
         self._data_locator
             .marker
             ._ancestor_pins
             .verify_unchanged()?;
+        for (_, located) in &self.scatter_locators {
+            located.marker._ancestor_pins.verify_unchanged()?;
+        }
         if let Some(target) = &self.install_target {
             target.marker._ancestor_pins.verify_unchanged()?;
         }
@@ -711,6 +766,7 @@ impl AuthenticatedOperationTask {
             guard: _,
             data_volume_root: _,
             _data_locator: data_locator,
+            scatter_locators: _,
             install_target,
             install_target_mount,
             full_disk_targets,
@@ -898,12 +954,25 @@ pub struct InstallConfig {
     /// Authenticated normal-endpoint receipt that the exact staged WIM/ESD/SWM byte stream
     /// already passed full decompression/hash verification. Missing legacy fields remain false.
     pub source_image_verified: bool,
+    /// 分散暂存：镜像按原始字节切块分布在多个已有分区，格式化目标分区后按顺序拼回
+    /// `image_path` 同名文件，并核对下面的总长度和 SHA-256。
+    pub image_chunked: bool,
+    pub image_chunked_length: u64,
+    pub image_chunked_sha256: String,
+    /// 所选镜像卷释放后约占用的字节数；0 表示未知。
+    pub image_expanded_bytes: u64,
+    /// 目标盘内暂存：PE 不格式化目标分区，先原地删除旧系统（保留 LetRecovery_ 暂存目录）再释放镜像。
+    pub in_place_target_staging: bool,
     /// 是否为GHO格式
     pub is_gho: bool,
     /// The secret-bearing XML remains in the authenticated private boot WIM.
     pub migrate_wifi: bool,
     pub wifi_profile_length: u64,
     pub wifi_profile_sha256: String,
+    /// Authenticated policy: allow the optional PE network runtime.
+    pub pe_network_enabled: bool,
+    /// Authenticated automatic feedback policy (disabled, normal, normal_and_pe).
+    pub automatic_feedback_mode: String,
     /// CAB更新包安装: true=安装, false=不安装
     pub install_cab_packages: bool,
 
@@ -1405,13 +1474,39 @@ impl ConfigFileManager {
             .context("authenticated artifact byte total overflow")?;
         let mut completed_before = 0_u64;
         let mut public_artifacts = Vec::with_capacity(guard.manifest.artifacts.len());
+        let mut scatter_locators: Vec<(String, AuthenticatedLocatedVolume)> = Vec::new();
         for record in &guard.manifest.artifacts {
             if record.location != lr_core::handoff_manifest::ArtifactLocation::PublicData {
                 continue;
             }
             let current_path = record.relative_path.clone();
+            // Scattered artifacts carry `LetRecovery_Scatter_<token>\` in front of the mirrored
+            // data layout; the token's marker identifies their volume independent of letters.
+            let artifact_root =
+                match lr_core::data_staging::split_scatter_prefix(&record.relative_path) {
+                    Some((token, _)) => match scatter_locators
+                        .iter()
+                        .find(|(known, _)| known.eq_ignore_ascii_case(token))
+                    {
+                        Some((_, located)) => located.root.clone(),
+                        None => {
+                            on_progress(TaskAuthenticationProgress::LocatingVolumes);
+                            let marker = format!(
+                                "{}\\{}",
+                                lr_core::data_staging::scatter_root_name(token),
+                                lr_core::data_staging::SCATTER_MARKER_NAME
+                            );
+                            let located =
+                                Self::find_volume_locator(&marker, token, "scatter volume")?;
+                            let root = located.root.clone();
+                            scatter_locators.push((token.to_owned(), located));
+                            root
+                        }
+                    },
+                    None => data_volume_root.clone(),
+                };
             let locked = lr_core::install_source_lock::LockedPlainArtifact::acquire_with_progress(
-                &data_volume_root.join(&record.relative_path),
+                &artifact_root.join(&record.relative_path),
                 |current_read| {
                     on_progress(TaskAuthenticationProgress::AuthenticatingArtifacts {
                         completed_bytes: completed_before.saturating_add(current_read),
@@ -1453,6 +1548,7 @@ impl ConfigFileManager {
             guard,
             data_volume_root,
             _data_locator: data_locator,
+            scatter_locators,
             install_target,
             install_target_mount: None,
             full_disk_targets,
@@ -1471,7 +1567,7 @@ impl ConfigFileManager {
         let AuthenticatedOperationConfig::Install(config) = config else {
             return Ok(None);
         };
-        if config.is_xp_i386 {
+        if config.is_xp_i386 || config.image_chunked {
             return Ok(None);
         }
         let mut spans = artifacts
@@ -1501,12 +1597,18 @@ impl ConfigFileManager {
             .iter()
             .map(|artifact| artifact.locked.identity().path.clone())
             .collect::<Vec<_>>();
-        lr_core::install_source_lock::verify_exact_install_image_span_paths(
-            &primary,
-            &ordered_paths,
-        )
-        .map_err(anyhow::Error::msg)?;
-        let secure_directory = if ordered_paths.len() > 1 {
+        let scattered =
+            !lr_core::install_source_lock::install_image_spans_share_directory(&ordered_paths);
+        if scattered {
+            log::info!("[SCATTER] 认证镜像分卷分布在多个分区，按清单中逐个锁定的文件释放");
+        } else {
+            lr_core::install_source_lock::verify_exact_install_image_span_paths(
+                &primary,
+                &ordered_paths,
+            )
+            .map_err(anyhow::Error::msg)?;
+        }
+        let secure_directory = if ordered_paths.len() > 1 && !scattered {
             let parent = primary
                 .parent()
                 .context("authenticated split image has no parent directory")?;
@@ -1521,6 +1623,7 @@ impl ConfigFileManager {
             primary,
             ordered_paths,
             _secure_directory: secure_directory,
+            scattered,
         };
         authorization.verify_unchanged()?;
         Ok(Some(authorization))
@@ -1546,6 +1649,7 @@ impl ConfigFileManager {
                 }
                 let supported = [
                     ArtifactRole::InstallImageSpan,
+                    ArtifactRole::InstallImageChunk,
                     ArtifactRole::XpSourceFile,
                     ArtifactRole::PreservedDriver,
                     ArtifactRole::UserDriver,
@@ -1567,6 +1671,7 @@ impl ConfigFileManager {
                     );
                 }
                 let images = count(ArtifactRole::InstallImageSpan);
+                let chunks = count(ArtifactRole::InstallImageChunk);
                 let xp_files = count(ArtifactRole::XpSourceFile);
                 let administrator_secrets = count(ArtifactRole::ProtectedAdministratorSecret);
                 if config.source_image_verified {
@@ -1593,7 +1698,7 @@ impl ConfigFileManager {
                     bail!("install handoff has more than one protected Administrator secret");
                 }
                 if config.is_xp_i386 {
-                    if images != 0 || xp_files == 0 {
+                    if images != 0 || chunks != 0 || xp_files == 0 {
                         bail!("XP directory install must have only XP source artifacts");
                     }
                     if !matches!(config.xp_source_arch.as_str(), "I386" | "AMD64") {
@@ -1609,18 +1714,51 @@ impl ConfigFileManager {
                         .artifacts
                         .iter()
                         .filter(|record| record.role == ArtifactRole::XpSourceFile)
-                        .any(|record| !record.relative_path.starts_with(&prefix))
+                        .any(|record| {
+                            !lr_core::data_staging::strip_scatter_prefix(&record.relative_path)
+                                .starts_with(&prefix)
+                        })
                     {
                         bail!("XP manifest artifact escapes the configured source/architecture");
                     }
+                } else if config.image_chunked {
+                    if images != 0 || xp_files != 0 || chunks == 0 {
+                        bail!("chunked image install requires raw image chunks only");
+                    }
+                    let chunk_prefix = format!(
+                        "{}\\{}\\",
+                        Self::DATA_DIR,
+                        lr_core::data_staging::IMAGE_CHUNK_DIRECTORY
+                    );
+                    let mut chunk_total = 0_u64;
+                    for record in manifest
+                        .artifacts
+                        .iter()
+                        .filter(|record| record.role == ArtifactRole::InstallImageChunk)
+                    {
+                        if !lr_core::data_staging::strip_scatter_prefix(&record.relative_path)
+                            .starts_with(&chunk_prefix)
+                        {
+                            bail!("authenticated image chunk has an unexpected path");
+                        }
+                        chunk_total = chunk_total
+                            .checked_add(record.length_bytes)
+                            .context("authenticated image chunk length overflow")?;
+                    }
+                    if chunk_total != config.image_chunked_length {
+                        bail!("authenticated image chunks do not add up to the configured image length");
+                    }
+                    if config.image_chunked_sha256.len() != 64 {
+                        bail!("chunked image configuration has no whole-image SHA-256");
+                    }
                 } else {
-                    if images == 0 || xp_files != 0 {
+                    if images == 0 || xp_files != 0 || chunks != 0 {
                         bail!("PE image install requires one or more authenticated image spans");
                     }
                     if !manifest.artifacts.iter().any(|record| {
                         record.role == ArtifactRole::InstallImageSpan
                             && record.ordinal == 0
-                            && record.relative_path
+                            && lr_core::data_staging::strip_scatter_prefix(&record.relative_path)
                                 == format!("{}\\{}", Self::DATA_DIR, config.image_path)
                     }) {
                         bail!("configured install image is absent from authenticated spans");
@@ -1638,7 +1776,7 @@ impl ConfigFileManager {
                     }
                 } else {
                     if pca.len() != 1
-                        || pca[0].relative_path
+                        || lr_core::data_staging::strip_scatter_prefix(&pca[0].relative_path)
                             != format!("{}\\{}", Self::DATA_DIR, config.pca_compat_package)
                     {
                         bail!("PCA config does not bind exactly one matching manifest artifact");
@@ -1675,8 +1813,7 @@ impl ConfigFileManager {
                 let software_prefix = "LetRecovery_Data\\preinstalled_software\\";
                 let mut actual_software = std::collections::BTreeSet::new();
                 for record in software_records {
-                    let filename = record
-                        .relative_path
+                    let filename = lr_core::data_staging::strip_scatter_prefix(&record.relative_path)
                         .strip_prefix(software_prefix)
                         .filter(|value| !value.is_empty() && !value.contains(['\\', '/']))
                         .ok_or_else(|| {
@@ -1702,7 +1839,10 @@ impl ConfigFileManager {
                         .artifacts
                         .iter()
                         .filter(|record| record.role == role)
-                        .any(|record| !record.relative_path.starts_with(prefix))
+                        .any(|record| {
+                            !lr_core::data_staging::strip_scatter_prefix(&record.relative_path)
+                                .starts_with(prefix)
+                        })
                     {
                         bail!("authenticated directory artifact has an unexpected root");
                     }
@@ -1857,6 +1997,24 @@ impl ConfigFileManager {
                     config.expected_donor_offset_bytes = decimal(value, key)?
                 }
                 "ExpectedDonorSizeBytes" => config.expected_donor_size_bytes = decimal(value, key)?,
+                "ExpectedMovedPartitions" => {
+                    let mut moved = Vec::new();
+                    for item in value.split(';') {
+                        let fields: Vec<&str> = item.split(':').collect();
+                        let [number, offset, length] = fields.as_slice() else {
+                            bail!("ExpectedMovedPartitions has a malformed entry");
+                        };
+                        moved.push((
+                            decimal(number, key)?,
+                            decimal(offset, key)?,
+                            decimal(length, key)?,
+                        ));
+                    }
+                    if moved.is_empty() || moved.len() > 8 {
+                        bail!("ExpectedMovedPartitions is outside its supported range");
+                    }
+                    config.expected_moved_partitions = moved;
+                }
                 "Language" => config.language = value.to_owned(),
                 "HandoffManifestVersion" | "HandoffManifestLength" | "HandoffManifestSha256" => {}
                 _ => bail!("authenticated expand config contains unknown field {key}"),
@@ -1962,10 +2120,27 @@ impl ConfigFileManager {
                             format!("invalid SourceImageVerified boolean: {value}")
                         })?
                     }
+                    "ImageChunked" => config.image_chunked = value.parse().unwrap_or(false),
+                    "ImageChunkedLength" => {
+                        config.image_chunked_length = value.parse().unwrap_or(0)
+                    }
+                    "ImageChunkedSha256" => {
+                        config.image_chunked_sha256 = value.trim().to_ascii_lowercase()
+                    }
+                    "ImageExpandedBytes" => {
+                        config.image_expanded_bytes = value.parse().unwrap_or(0)
+                    }
+                    "InPlaceTargetStaging" => {
+                        config.in_place_target_staging = value.parse().unwrap_or(false)
+                    }
                     "IsGho" => config.is_gho = value.parse().unwrap_or(false),
                     "MigrateWifi" => config.migrate_wifi = value.parse().unwrap_or(false),
                     "WifiProfileLength" => config.wifi_profile_length = value.parse().unwrap_or(0),
                     "WifiProfileSha256" => config.wifi_profile_sha256 = value.to_string(),
+                    "PeNetworkEnabled" => {
+                        config.pe_network_enabled = value.parse().unwrap_or(false)
+                    }
+                    "AutomaticFeedbackMode" => config.automatic_feedback_mode = value.to_string(),
                     "WimEngine" => config.wim_engine = value.parse().unwrap_or(0),
                     "IsXp" => config.is_xp = value.parse().unwrap_or(false),
                     "IsXpI386" => config.is_xp_i386 = value.parse().unwrap_or(false),
@@ -2420,6 +2595,9 @@ pub struct ExpandConfig {
     pub expected_donor_partition_number: u32,
     pub expected_donor_offset_bytes: u64,
     pub expected_donor_size_bytes: u64,
+    /// Partitions between the target and the donor that a confirmed plan moves along, as
+    /// (partition number, offset, size). Empty when the donor is right behind the target.
+    pub expected_moved_partitions: Vec<(u32, u64, u64)>,
     /// 界面语言代码（如 "zh-TW"、"en-US"），由正常系统端随重启写入；空=简体中文。
     pub language: String,
 }

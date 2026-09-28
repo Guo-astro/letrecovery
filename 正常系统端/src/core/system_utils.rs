@@ -300,7 +300,7 @@ pub fn get_system_architecture(system_root: &str) -> SystemArchitecture {
 
 /// 启用指定权限
 #[cfg(windows)]
-fn enable_privilege(privilege_name: &str) -> Result<()> {
+pub(crate) fn enable_privilege(privilege_name: &str) -> Result<()> {
     unsafe {
         let mut token_handle = HANDLE::default();
         let process = GetCurrentProcess();
@@ -360,7 +360,7 @@ fn enable_privilege(privilege_name: &str) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn enable_privilege(_privilege_name: &str) -> Result<()> {
+pub(crate) fn enable_privilege(_privilege_name: &str) -> Result<()> {
     Ok(())
 }
 

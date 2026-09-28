@@ -41,6 +41,7 @@ pub struct Palette {
     pub accent_border: COLORREF,
     pub progress: COLORREF,
     pub error: COLORREF,
+    #[allow(dead_code)]
     pub warning: COLORREF,
 }
 
@@ -94,6 +95,7 @@ impl Palette {
 
 /// DPI-scaled metrics shared by the eventual PE window and its dialogs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Shared PE metric table; not every metric has a consumer yet.
 pub struct InnoMetrics {
     pub control_height: i32,
     pub button_height: i32,

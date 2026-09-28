@@ -459,6 +459,7 @@ mod tests {
         let mut expected = DiskFingerprint::from(&disk());
         expected.layout_snapshot = Some(lr_core::windows_storage::DiskLayoutSnapshot {
             disk_size_bytes: expected.size_bytes,
+            disk_size_estimated: false,
             disk: lr_core::windows_storage::StableDiskIdentity::Gpt { disk_id: [1; 16] },
             device_id_hash: Some([2; 32]),
             partitions: vec![lr_core::windows_storage::DiskLayoutPartitionSnapshot {

@@ -229,11 +229,46 @@ impl BootManager {
         let disk_num = target.disk_number;
         log::info!("目标分区在磁盘 {}", disk_num);
 
-        let esp = lr_core::windows_storage::partitions(disk_num)?
+        let same_disk_esp = lr_core::windows_storage::partitions(disk_num)?
             .into_iter()
-            .find(|partition| partition.kind == lr_core::windows_storage::PartitionKind::EfiSystem)
-            .ok_or_else(|| anyhow::anyhow!("{}", tr!("未找到 ESP 分区")))?;
-        log::info!("找到 ESP: 分区 {}", esp.partition_number);
+            .find(|partition| partition.kind == lr_core::windows_storage::PartitionKind::EfiSystem);
+        let (disk_num, esp) = match same_disk_esp {
+            Some(esp) => (disk_num, esp),
+            None => {
+                // Installing to a second disk without an ESP (for example a new SSD next to the
+                // disk that already boots Windows) is common. Instead of leaving the applied
+                // system unbootable, use an existing full-size ESP on another disk. 100 MiB is the
+                // smallest Windows ESP; smaller EFI partitions such as Ventoy's 32-MiB VTOYEFI
+                // belong to boot media and are never selected.
+                const MIN_FALLBACK_ESP_BYTES: u64 = 100 * 1024 * 1024;
+                let fallback = lr_core::windows_storage::physical_disk_numbers()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|candidate| *candidate != disk_num)
+                    .find_map(|candidate| {
+                        lr_core::windows_storage::partitions(candidate)
+                            .ok()?
+                            .into_iter()
+                            .find(|partition| {
+                                partition.kind
+                                    == lr_core::windows_storage::PartitionKind::EfiSystem
+                                    && partition.size_bytes >= MIN_FALLBACK_ESP_BYTES
+                            })
+                            .map(|esp| (candidate, esp))
+                    });
+                let Some((candidate, esp)) = fallback else {
+                    anyhow::bail!("{}", tr!("未找到 ESP 分区"));
+                };
+                log::warn!(
+                    "目标磁盘 {} 没有 ESP，改用磁盘 {} 上已有的 ESP（分区 {}）写入引导",
+                    disk_num,
+                    candidate,
+                    esp.partition_number
+                );
+                (candidate, esp)
+            }
+        };
+        log::info!("找到 ESP: 磁盘 {} 分区 {}", disk_num, esp.partition_number);
 
         let existing_letters = lr_core::windows_storage::assigned_drive_letters_for_partition(
             disk_num,

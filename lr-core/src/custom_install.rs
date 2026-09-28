@@ -214,6 +214,81 @@ pub fn plan_full_disk_layout(
     usable_end_bytes: u64,
     windows_partition_bytes: u64,
 ) -> Result<Vec<PlannedPartition>, CustomInstallPlanError> {
+    // Historical contract used for capacity checks: the Windows volume receives exactly the
+    // requested capacity whenever the remainder can hold a useful data volume.
+    plan_layout(
+        style,
+        role,
+        usable_end_bytes,
+        windows_partition_bytes,
+        windows_partition_bytes,
+        0,
+    )
+}
+
+/// Capacity up to which the automatic full-disk layout gives the whole disk to Windows.
+pub const FULL_DISK_WHOLE_WINDOWS_MAX_CAPACITY_BYTES: u64 = 256 * GIB;
+/// Capacity from which the automatic full-disk layout uses the larger Windows size.
+pub const FULL_DISK_LARGE_CAPACITY_BYTES: u64 = 1536 * GIB;
+/// Automatic Windows volume size on ordinary disks (more than 256 GiB, less than 1.5 TiB).
+pub const FULL_DISK_WINDOWS_DEFAULT_BYTES: u64 = 200 * GIB;
+/// Automatic Windows volume size on large disks.
+pub const FULL_DISK_WINDOWS_LARGE_DEFAULT_BYTES: u64 = 300 * GIB;
+/// Practical floor for a Windows volume that shares its disk with a data volume.
+pub const WINDOWS_PREFERRED_FLOOR_BYTES: u64 = 64 * GIB;
+/// Data volume kept in front of a same-disk staging extent, so that the post-install cleanup
+/// grows the data volume instead of the Windows volume.
+pub const STAGING_RECIPIENT_DATA_BYTES: u64 = MIN_USEFUL_DATA_BYTES + 256 * MIB;
+
+/// Automatic Windows capacity for a full-disk install on a disk of `disk_capacity_bytes`.
+///
+/// The image-derived value carried by the plan is only a lower bound. Using it directly as the
+/// partition size produced 12-GB system volumes on 512-GB and 1-TB disks, too small for drivers,
+/// updates and the first boot. Small disks keep everything on the Windows volume; larger disks
+/// keep a practical system volume and give the rest to a data volume. The minimum always wins.
+pub fn automatic_full_disk_windows_bytes(
+    disk_capacity_bytes: u64,
+    windows_minimum_bytes: u64,
+) -> u64 {
+    let recommended = if disk_capacity_bytes <= FULL_DISK_WHOLE_WINDOWS_MAX_CAPACITY_BYTES {
+        u64::MAX
+    } else if disk_capacity_bytes < FULL_DISK_LARGE_CAPACITY_BYTES {
+        FULL_DISK_WINDOWS_DEFAULT_BYTES
+    } else {
+        FULL_DISK_WINDOWS_LARGE_DEFAULT_BYTES
+    };
+    recommended.max(windows_minimum_bytes)
+}
+
+/// Capacity-aware full-disk layout used by the installer. `disk_capacity_bytes` is the whole
+/// selected disk; `usable_end_bytes` is the disk end or the start of an existing same-disk staging
+/// extent that the post-install cleanup later returns to the last planned volume.
+pub fn plan_full_disk_layout_for_disk(
+    style: RequestedPartitionStyle,
+    role: FullDiskRole,
+    usable_end_bytes: u64,
+    disk_capacity_bytes: u64,
+    windows_minimum_bytes: u64,
+) -> Result<Vec<PlannedPartition>, CustomInstallPlanError> {
+    let disk_capacity_bytes = disk_capacity_bytes.max(usable_end_bytes);
+    plan_layout(
+        style,
+        role,
+        usable_end_bytes,
+        windows_minimum_bytes,
+        automatic_full_disk_windows_bytes(disk_capacity_bytes, windows_minimum_bytes),
+        disk_capacity_bytes - usable_end_bytes,
+    )
+}
+
+fn plan_layout(
+    style: RequestedPartitionStyle,
+    role: FullDiskRole,
+    usable_end_bytes: u64,
+    windows_minimum_bytes: u64,
+    desired_windows_bytes: u64,
+    reclaimable_after_bytes: u64,
+) -> Result<Vec<PlannedPartition>, CustomInstallPlanError> {
     // `usable_end_bytes` is either the provider's current disk capacity or the exact start of an
     // existing staging extent.  Flooring it to a whole MiB discards legal provider space and can
     // reject a disk that fits the exact image requirement by less than one cosmetic alignment
@@ -251,7 +326,7 @@ pub fn plan_full_disk_layout(
         });
         return Ok(output);
     }
-    if windows_partition_bytes == 0 {
+    if windows_minimum_bytes == 0 {
         return Err(CustomInstallPlanError::InvalidWindowsPartitionSize);
     }
     let infrastructure = match style {
@@ -284,16 +359,27 @@ pub fn plan_full_disk_layout(
     let available = limit
         .checked_sub(cursor)
         .ok_or(CustomInstallPlanError::InvalidDiskCapacity)?;
-    // A non-zero value is the minimum capacity derived from the selected image metadata (or the
-    // documented opaque-image fallback).  Giving Windows the whole remaining disk is only a
-    // substitute for an optional data partition; it must never silently shrink this minimum.
-    if windows_partition_bytes > available {
+    // The minimum is derived from the selected image metadata (or the documented opaque-image
+    // fallback). It is never silently shrunk.
+    if windows_minimum_bytes > available {
         return Err(CustomInstallPlanError::InvalidDiskCapacity);
     }
-    let requested = if available.saturating_sub(windows_partition_bytes) < MIN_USEFUL_DATA_BYTES {
+    let desired = desired_windows_bytes.max(windows_minimum_bytes);
+    let requested = if desired == u64::MAX {
+        // Whole-disk policy for small disks.
         available
+    } else if available.saturating_sub(desired) >= MIN_USEFUL_DATA_BYTES {
+        desired
+    } else if reclaimable_after_bytes >= MIN_USEFUL_DATA_BYTES
+        && available.saturating_sub(STAGING_RECIPIENT_DATA_BYTES)
+            >= windows_minimum_bytes.max(WINDOWS_PREFERRED_FLOOR_BYTES)
+    {
+        // An existing staging extent follows this layout and the post-install cleanup returns it
+        // to the last planned volume. Keep a small data volume there so that the cleanup grows
+        // the data volume instead of turning the whole disk into the Windows volume.
+        available - STAGING_RECIPIENT_DATA_BYTES
     } else {
-        windows_partition_bytes
+        available
     };
     if requested == 0 || requested > available {
         return Err(CustomInstallPlanError::InvalidDiskCapacity);
@@ -904,6 +990,101 @@ mod tests {
             ),
             Err(CustomInstallPlanError::InvalidDiskCapacity)
         );
+    }
+
+    #[test]
+    fn automatic_full_disk_layout_keeps_a_practical_windows_volume() {
+        // 512-GB and 1-TB disks previously received only the ~12-GiB image minimum.
+        for (capacity, expected_windows) in [
+            (476 * GIB, FULL_DISK_WINDOWS_DEFAULT_BYTES),
+            (931 * GIB, FULL_DISK_WINDOWS_DEFAULT_BYTES),
+            (1863 * GIB, FULL_DISK_WINDOWS_LARGE_DEFAULT_BYTES),
+        ] {
+            let layout = plan_full_disk_layout_for_disk(
+                RequestedPartitionStyle::Gpt,
+                FullDiskRole::Windows,
+                capacity,
+                capacity,
+                12 * GIB,
+            )
+            .unwrap();
+            let windows = layout
+                .iter()
+                .find(|partition| partition.role == PlannedPartitionRole::Windows)
+                .unwrap();
+            assert_eq!(windows.length_bytes, expected_windows);
+            let data = layout
+                .iter()
+                .find(|partition| partition.role == PlannedPartitionRole::Data)
+                .unwrap();
+            assert_eq!(data.offset_bytes + data.length_bytes, capacity);
+        }
+        let small = plan_full_disk_layout_for_disk(
+            RequestedPartitionStyle::Gpt,
+            FullDiskRole::Windows,
+            238 * GIB,
+            238 * GIB,
+            12 * GIB,
+        )
+        .unwrap();
+        assert!(!small
+            .iter()
+            .any(|partition| partition.role == PlannedPartitionRole::Data));
+        let windows = small
+            .iter()
+            .find(|partition| partition.role == PlannedPartitionRole::Windows)
+            .unwrap();
+        assert_eq!(windows.offset_bytes + windows.length_bytes, 238 * GIB);
+        let large_image = plan_full_disk_layout_for_disk(
+            RequestedPartitionStyle::Gpt,
+            FullDiskRole::Windows,
+            931 * GIB,
+            931 * GIB,
+            250 * GIB,
+        )
+        .unwrap();
+        assert_eq!(
+            large_image
+                .iter()
+                .find(|partition| partition.role == PlannedPartitionRole::Windows)
+                .unwrap()
+                .length_bytes,
+            250 * GIB
+        );
+    }
+
+    #[test]
+    fn same_disk_staging_keeps_a_data_volume_for_the_cleanup() {
+        // Old layout: C: 120 GiB, then the LetRecovery staging volume up to the end of a 512-GB disk.
+        let staging_offset = 120 * GIB;
+        let layout = plan_full_disk_layout_for_disk(
+            RequestedPartitionStyle::Gpt,
+            FullDiskRole::Windows,
+            staging_offset,
+            476 * GIB,
+            12 * GIB,
+        )
+        .unwrap();
+        let windows = layout
+            .iter()
+            .find(|partition| partition.role == PlannedPartitionRole::Windows)
+            .unwrap();
+        let data = layout.last().unwrap();
+        assert!(windows.length_bytes >= WINDOWS_PREFERRED_FLOOR_BYTES);
+        assert_eq!(data.role, PlannedPartitionRole::Data);
+        assert_eq!(data.length_bytes, STAGING_RECIPIENT_DATA_BYTES);
+        assert_eq!(data.offset_bytes + data.length_bytes, staging_offset);
+        let small = plan_full_disk_layout_for_disk(
+            RequestedPartitionStyle::Gpt,
+            FullDiskRole::Windows,
+            100 * GIB,
+            238 * GIB,
+            12 * GIB,
+        )
+        .unwrap();
+        assert!(!small
+            .iter()
+            .any(|partition| partition.role == PlannedPartitionRole::Data));
     }
 
     #[test]

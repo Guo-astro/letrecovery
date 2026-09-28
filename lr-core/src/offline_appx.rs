@@ -107,8 +107,27 @@ pub const CURATED_PREINSTALLED_APPX: &[CuratedAppxIdentity] = &[
 ];
 
 const CURATED_ONLINE_REMOVAL_SCRIPT: &str = r#"[CmdletBinding()]
-param()
+param(
+  [switch]$LetRecoveryWorker
+)
 $ErrorActionPreference = 'Stop'
+if (-not $LetRecoveryWorker) {
+  # Windows Setup waits for RunSynchronous commands without any timeout. AppX servicing on a new
+  # or damaged image can block indefinitely and would leave Setup on its wait screen forever.
+  # Run the real work in a bounded child PowerShell and always let Windows Setup continue.
+  try {
+    $workerPowerShell = [System.IO.Path]::Combine($env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    $worker = Start-Process -FilePath $workerPowerShell -ArgumentList @('-NoP', '-NonI', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath), '-LetRecoveryWorker') -WindowStyle Hidden -PassThru
+    try { $null = $worker.Handle } catch {}
+    if (-not $worker.WaitForExit(900000)) {
+      try { $worker.Kill() } catch {}
+      [Console]::Error.WriteLine('LETRECOVERY_APPX_WARNING bounded_worker_timeout_ms=900000')
+    }
+  } catch {
+    try { [Console]::Error.WriteLine(('LETRECOVERY_APPX_WARNING bounded_worker_failed:0x{0:X8}' -f $_.Exception.HResult)) } catch {}
+  }
+  exit 0
+}
 $allowed = @(
   @{ Name='Clipchamp.Clipchamp'; Family='Clipchamp.Clipchamp_yxz26nhyzhsrt' },
   @{ Name='Microsoft.BingNews'; Family='Microsoft.BingNews_8wekyb3d8bbwe' },
@@ -195,14 +214,14 @@ try {
     }
     if ($retirementPackages.Count -gt 0) {
       try { Import-LetRecoveryAppxRetirementMarkers $identity.Family @($retirementPackages) }
-      catch { $diagnostics.Add(('markers:{0}:0x{1:X8}' -f $identity.Family, [uint32]$_.Exception.HResult)) }
+      catch { $diagnostics.Add(('markers:{0}:0x{1:X8}' -f $identity.Family, $_.Exception.HResult)) }
       try { Set-NonRemovableAppsPolicy -Online -PackageFamilyName $identity.Family -NonRemovable 0 -ErrorAction Stop | Out-Null }
-      catch { $diagnostics.Add(('policy:{0}:0x{1:X8}' -f $identity.Family, [uint32]$_.Exception.HResult)) }
+      catch { $diagnostics.Add(('policy:{0}:0x{1:X8}' -f $identity.Family, $_.Exception.HResult)) }
     }
     foreach ($package in $provisioned) {
       if ([string]::Equals([string]$package.DisplayName, [string]$identity.Name, [System.StringComparison]::Ordinal)) {
         try { Remove-AppxProvisionedPackage -Online -PackageName ([string]$package.PackageName) -ErrorAction Stop | Out-Null }
-        catch { $diagnostics.Add(('deprovision:{0}:0x{1:X8}' -f $identity.Family, [uint32]$_.Exception.HResult)) }
+        catch { $diagnostics.Add(('deprovision:{0}:0x{1:X8}' -f $identity.Family, $_.Exception.HResult)) }
       }
     }
   }
@@ -211,7 +230,7 @@ try {
     foreach ($package in $registered) {
       if ([string]::Equals([string]$package.PackageFamilyName, [string]$identity.Family, [System.StringComparison]::OrdinalIgnoreCase)) {
         try { Remove-AppxPackage -Package ([string]$package.PackageFullName) -AllUsers -Confirm:$false -ErrorAction Stop }
-        catch { $diagnostics.Add(('remove:{0}:0x{1:X8}' -f $identity.Family, [uint32]$_.Exception.HResult)) }
+        catch { $diagnostics.Add(('remove:{0}:0x{1:X8}' -f $identity.Family, $_.Exception.HResult)) }
       }
     }
   }
@@ -231,7 +250,7 @@ try {
     }
   }
 } catch {
-  $failures.Add(('inventory_failed:0x{0:X8}' -f [uint32]$_.Exception.HResult))
+  $failures.Add(('inventory_failed:0x{0:X8}' -f $_.Exception.HResult))
 }
 $failures = @($failures | Sort-Object -Unique)
 $diagnostics = @($diagnostics | Sort-Object -Unique)
@@ -931,6 +950,7 @@ fn resolve_windows_package_identity(
     const MAX_IDENTITY_BUFFER: u32 = 64 * 1024;
 
     #[repr(C)]
+    #[allow(dead_code)] // ABI layout mirror: every field keeps the native offsets even if unread.
     struct PackageId {
         reserved: u32,
         processor_architecture: u32,

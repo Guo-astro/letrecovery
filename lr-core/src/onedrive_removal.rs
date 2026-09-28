@@ -323,6 +323,8 @@ try {
             # Deliberately omit Start-Process -Wait: Microsoft documents that -Wait follows the
             # entire descendant tree and can therefore retain this Setup console indefinitely.
             $process = Start-Process -FilePath $selected.path -ArgumentList @('/uninstall') -PassThru -WindowStyle Hidden
+            # Windows PowerShell 5.1 reports ExitCode only for a Process object that owns its handle.
+            try { $null = $process.Handle } catch {}
             $remainingMilliseconds = $operationTimeoutMilliseconds - [int]$stopwatch.ElapsedMilliseconds
             $exited = $remainingMilliseconds -gt 0 -and $process.WaitForExit([int]$remainingMilliseconds)
             if (-not $exited) {

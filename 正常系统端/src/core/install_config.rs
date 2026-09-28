@@ -396,6 +396,18 @@ pub struct InstallConfig {
     /// 正常端已经对本次精确字节内容完成完整镜像校验。该声明与镜像长度/SHA-256 一同
     /// 进入认证交接；旧配置缺失时默认为 false，PE 必须自行完整校验。
     pub source_image_verified: bool,
+    /// 分散暂存：单个镜像文件被按原始字节切成若干块，分布在多个已有分区上。PE 在格式化后的
+    /// 目标分区上按清单顺序拼回 `image_path` 同名文件，并核对下面的总长度与 SHA-256。
+    pub image_chunked: bool,
+    /// 拼回后完整镜像文件的字节数。
+    pub image_chunked_length: u64,
+    /// 拼回后完整镜像文件的 SHA-256（小写十六进制）。
+    pub image_chunked_sha256: String,
+    /// 所选镜像卷释放后大约占用的字节数（0 表示未知），供 PE 在写盘前核对目标分区容量。
+    pub image_expanded_bytes: u64,
+    /// 目标盘内暂存：分散暂存找不到其他分区时，把安装文件放在目标分区自身的 LetRecovery_Data 里。
+    /// PE 不格式化目标分区，而是先原地删除旧系统（保留 LetRecovery_ 前缀的暂存目录），再拼回/释放镜像。
+    pub in_place_target_staging: bool,
     /// 是否为GHO格式
     pub is_gho: bool,
     /// A private boot-WIM Wi-Fi profile is requested. Only its authenticated length/hash are
@@ -403,6 +415,10 @@ pub struct InstallConfig {
     pub migrate_wifi: bool,
     pub wifi_profile_length: u64,
     pub wifi_profile_sha256: String,
+    /// Authenticated policy: allow PE to attempt the optional network runtime.
+    pub pe_network_enabled: bool,
+    /// Authenticated automatic feedback policy (disabled, normal, normal_and_pe).
+    pub automatic_feedback_mode: String,
 
     // 高级选项
     /// 移除快捷方式小箭头
@@ -559,6 +575,8 @@ pub struct ExpandConfig {
     pub expected_donor_partition_number: u32,
     pub expected_donor_offset_bytes: u64,
     pub expected_donor_size_bytes: u64,
+    /// Partitions between the target and the donor that move along: (number, offset, size).
+    pub expected_moved_partitions: Vec<(u32, u64, u64)>,
 }
 
 /// 配置文件管理器
@@ -626,6 +644,20 @@ impl ConfigFileManager {
         if !config.source_image_verified {
             return Ok(());
         }
+        if config.image_chunked {
+            // A chunked image is bound by its whole-file length and SHA-256 in the authenticated
+            // config; PE recomputes both while reassembling before it relies on the receipt.
+            let chunks = source_artifacts
+                .iter()
+                .filter(|artifact| {
+                    artifact.role == lr_core::handoff_manifest::ArtifactRole::InstallImageChunk
+                })
+                .count();
+            if chunks == 0 || config.image_chunked_sha256.len() != 64 {
+                anyhow::bail!("SourceImageVerified chunked image has no manifest chunks or digest");
+            }
+            return Ok(());
+        }
         let install_images = source_artifacts
             .iter()
             .filter(|artifact| {
@@ -645,8 +677,7 @@ impl ConfigFileManager {
         let artifact = install_images[0];
         if artifact.location != lr_core::handoff_manifest::ArtifactLocation::PublicData
             || artifact.ordinal != 0
-            || !artifact
-                .relative_path
+            || !lr_core::data_staging::strip_scatter_prefix(&artifact.relative_path)
                 .eq_ignore_ascii_case(&expected_relative)
             || artifact.length_bytes == 0
         {
@@ -1140,7 +1171,7 @@ impl ConfigFileManager {
         .to_bytes()?;
         let manifest_binding = lr_core::handoff_manifest::ManifestBinding::new(&manifest)?;
         let content = format!(
-            "[Expand]\r\nSessionId={}\r\nTargetPartition={}\r\nTargetSizeMb={}\r\nWimEngine={}\r\nBorrowFromLeft={}\r\nDonorTargetSizeMb={}\r\nExpectedDiskNumber={}\r\nExpectedDiskSizeBytes={}\r\nExpectedPartitionNumber={}\r\nExpectedPartitionOffsetBytes={}\r\nExpectedPartitionSizeBytes={}\r\nExpectedDonorPartitionNumber={}\r\nExpectedDonorOffsetBytes={}\r\nExpectedDonorSizeBytes={}\r\nLanguage={}\r\n{}",
+            "[Expand]\r\nSessionId={}\r\nTargetPartition={}\r\nTargetSizeMb={}\r\nWimEngine={}\r\nBorrowFromLeft={}\r\nDonorTargetSizeMb={}\r\nExpectedDiskNumber={}\r\nExpectedDiskSizeBytes={}\r\nExpectedPartitionNumber={}\r\nExpectedPartitionOffsetBytes={}\r\nExpectedPartitionSizeBytes={}\r\nExpectedDonorPartitionNumber={}\r\nExpectedDonorOffsetBytes={}\r\nExpectedDonorSizeBytes={}\r\n{}Language={}\r\n{}",
             config.session_id,
             config.target_partition,
             config.target_size_mb,
@@ -1155,6 +1186,19 @@ impl ConfigFileManager {
             config.expected_donor_partition_number,
             config.expected_donor_offset_bytes,
             config.expected_donor_size_bytes,
+            if config.expected_moved_partitions.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "ExpectedMovedPartitions={}\r\n",
+                    config
+                        .expected_moved_partitions
+                        .iter()
+                        .map(|(number, offset, size)| format!("{number}:{offset}:{size}"))
+                        .collect::<Vec<_>>()
+                        .join(";")
+                )
+            },
             crate::utils::i18n::current_language(),
             manifest_binding.to_config_lines()
         );
@@ -1341,10 +1385,30 @@ impl ConfigFileManager {
         } else {
             String::new()
         };
-        let source_verification_binding = if config.source_image_verified {
-            "SourceImageVerified=true\r\n"
+        let mut source_verification_binding = if config.source_image_verified {
+            "SourceImageVerified=true\r\n".to_owned()
         } else {
-            ""
+            String::new()
+        };
+        if config.in_place_target_staging {
+            source_verification_binding.push_str("InPlaceTargetStaging=true\r\n");
+        }
+        if config.image_chunked {
+            let sha256 = config.image_chunked_sha256.trim().to_ascii_lowercase();
+            if config.image_chunked_length == 0
+                || sha256.len() != 64
+                || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                anyhow::bail!("chunked image binding is invalid");
+            }
+            source_verification_binding.push_str(&format!(
+                "ImageChunked=true\r\nImageChunkedLength={}\r\nImageChunkedSha256={}\r\nImageExpandedBytes={}\r\n",
+                config.image_chunked_length, sha256, config.image_expanded_bytes
+            ));
+        }
+        let feedback_mode = match config.automatic_feedback_mode.as_str() {
+            "disabled" | "normal" | "normal_and_pe" => config.automatic_feedback_mode.as_str(),
+            _ => "normal_and_pe",
         };
         Ok(format!(
             r#"[Install]
@@ -1377,6 +1441,8 @@ PcaCompatImageIndex={}
 PcaCompatTargetBuild={}
 PcaCompatTargetArchitecture={}
 Language={}
+PeNetworkEnabled={}
+AutomaticFeedbackMode={}
 {}{}
 
 [Advanced]
@@ -1439,6 +1505,8 @@ XpInjectNvmeDriver={}
             config.pca_compat_target_build,
             config.pca_compat_target_architecture,
             crate::utils::i18n::current_language(),
+            config.pe_network_enabled,
+            feedback_mode,
             wifi_binding,
             canonical_target,
             config.remove_shortcut_arrow,
@@ -1580,6 +1648,19 @@ Language={}
                         config.source_image_verified = value.parse::<bool>().with_context(|| {
                             format!("invalid SourceImageVerified boolean: {value}")
                         })?
+                    }
+                    "ImageChunked" => config.image_chunked = value.parse().unwrap_or(false),
+                    "ImageChunkedLength" => {
+                        config.image_chunked_length = value.parse().unwrap_or(0)
+                    }
+                    "ImageChunkedSha256" => {
+                        config.image_chunked_sha256 = value.trim().to_ascii_lowercase()
+                    }
+                    "ImageExpandedBytes" => {
+                        config.image_expanded_bytes = value.parse().unwrap_or(0)
+                    }
+                    "InPlaceTargetStaging" => {
+                        config.in_place_target_staging = value.parse().unwrap_or(false)
                     }
                     "IsGho" => config.is_gho = value.parse().unwrap_or(false),
                     "WimEngine" => config.wim_engine = value.parse().unwrap_or(0),
@@ -2448,6 +2529,7 @@ mod tests {
                 expected_donor_partition_number: 3,
                 expected_donor_offset_bytes: 200_000,
                 expected_donor_size_bytes: 400_000,
+                expected_moved_partitions: Vec::new(),
             },
             &handoff_test_key(),
         )
@@ -2485,6 +2567,7 @@ mod tests {
                 expected_donor_partition_number: 0,
                 expected_donor_offset_bytes: 0,
                 expected_donor_size_bytes: 0,
+                expected_moved_partitions: Vec::new(),
             },
             &handoff_test_key(),
         )

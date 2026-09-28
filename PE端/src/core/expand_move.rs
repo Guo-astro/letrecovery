@@ -176,6 +176,7 @@ const BASIC_DATA_GUID: [u8; 16] = [
 ];
 #[repr(C)]
 #[derive(Default)]
+#[allow(dead_code)] // ABI layout mirror of DISK_GEOMETRY_EX; only disk_size is consumed.
 struct DiskGeometryEx {
     geometry_cylinders: i64,
     geometry_media_type: u32,
@@ -232,6 +233,17 @@ struct PartEntry {
     mbr_type: Option<u8>,
     mbr_active: bool,
     gpt_metadata: Option<lr_core::windows_storage::GptPartitionMetadata>,
+    /// GPT partition type GUID (in-memory byte order); None on MBR disks.
+    gpt_type: Option<[u8; 16]>,
+}
+
+/// Windows RE (recovery) partition type {DE94BBA4-06D1-4D40-A16A-BFD50179D6AC}, in-memory order.
+const RECOVERY_GUID: [u8; 16] = [
+    0xa4, 0xbb, 0x94, 0xde, 0xd1, 0x06, 0x40, 0x4d, 0xa1, 0x6a, 0xbf, 0xd5, 0x01, 0x79, 0xd6, 0xac,
+];
+
+fn is_gpt_recovery(gpt: bool, partition: &PartEntry) -> bool {
+    gpt && partition.gpt_type == Some(RECOVERY_GUID)
 }
 
 /// 读取卷所在物理磁盘号与起始偏移、长度（字节）。
@@ -316,6 +328,13 @@ unsafe fn read_disk_layout(disk_number: u32) -> Option<(PartitionStyle, u64, Vec
             continue;
         }
         let mbr_type = (style == PartitionStyle::MBR).then_some(d[32]);
+        let gpt_type = if style == PartitionStyle::GPT {
+            let mut type_id = [0u8; 16];
+            type_id.copy_from_slice(&d[32..48]);
+            Some(type_id)
+        } else {
+            None
+        };
         let mbr_active = style == PartitionStyle::MBR && d[33] != 0;
         let (is_special, gpt_metadata) = if style == PartitionStyle::GPT {
             let mut g = [0u8; 16];
@@ -349,6 +368,7 @@ unsafe fn read_disk_layout(disk_number: u32) -> Option<(PartitionStyle, u64, Vec
             mbr_type,
             mbr_active,
             gpt_metadata,
+            gpt_type,
         });
     }
     parts.sort_by_key(|p| p.offset);
@@ -413,6 +433,7 @@ unsafe fn raw_move_right(
     len: u64,
     delta: u64,
     expected_layout: &lr_core::windows_storage::DiskLayoutSnapshot,
+    progress: &dyn Fn(u64, u64),
 ) -> Result<()> {
     let geometry = lr_core::windows_storage::physical_disk_sector_geometry(disk_number)
         .map_err(|error| anyhow!("{}", tr!("查询物理磁盘真实扇区约束失败：{}", error)))?;
@@ -448,6 +469,7 @@ unsafe fn raw_move_right(
         .map_err(|error| anyhow!("{}", tr!("物理磁盘在原始搬移写入前已变化：{}", error)))?;
         let mut buffer = AlignedIoBuffer::new(io_plan.chunk_bytes, io_plan.physical_sector_bytes)?;
         let mut pos = len; // 已处理到区域内的字节位置（从尾部往头部）
+        let mut reported_percent = 0_u64;
         while pos > 0 {
             let this = (io_plan.chunk_bytes as u64).min(pos);
             let rel = pos - this;
@@ -465,6 +487,14 @@ unsafe fn raw_move_right(
             write_exact(handle, io_buffer)?;
 
             pos -= this;
+            // Report whole-percent steps only: a long copy stays visibly alive without flooding
+            // the UI channel with one message per 4 MiB chunk.
+            let done = len - pos;
+            let percent = done.saturating_mul(100) / len.max(1);
+            if percent != reported_percent {
+                reported_percent = percent;
+                progress(done, len);
+            }
         }
         // 刷盘
         windows::Win32::Storage::FileSystem::FlushFileBuffers(handle)
@@ -932,6 +962,7 @@ pub fn expand_c_drive(
     config: &crate::core::config::ExpandConfig,
     data_partition: &str,
     expected_target: lr_core::windows_storage::VolumeIdentity,
+    progress: &dyn Fn(String, u8),
 ) -> Result<String> {
     let target_size_mb = config.target_size_mb;
     // 0=尽量扩到相邻未分配空间最大 → 直接 Case 1。
@@ -982,14 +1013,8 @@ pub fn expand_c_drive(
         .map_err(|e| anyhow!(e));
     }
 
-    if config.donor_target_size_mb != 0 || delta > adj_unalloc {
-        bail!(
-            "partition-moving expansion is disabled until the authenticated canonical target and donor layout can remain pinned through every raw-write stage"
-        );
-    }
-
     // 否则需要移动后方分区（Case 2）。
-    let n = next.ok_or_else(|| {
+    let first_behind = next.ok_or_else(|| {
         anyhow!(
             "{}",
             tr!(
@@ -998,8 +1023,58 @@ pub fn expand_c_drive(
             )
         )
     })?;
+    // The donor gives up the space. It is normally the partition right behind the target; a
+    // confirmed plan may pin a donor further back instead and carry the partitions in between
+    // (a recovery partition, another data partition) along by the same distance.
+    let n = if config.expected_moved_partitions.is_empty() {
+        first_behind
+    } else {
+        parts
+            .iter()
+            .find(|p| {
+                p.number == config.expected_donor_partition_number
+                    && p.offset == config.expected_donor_offset_bytes
+                    && p.length == config.expected_donor_size_bytes
+            })
+            .ok_or_else(|| anyhow!("{}", tr!("重启后磁盘或相邻分区身份/几何已变化，拒绝写盘")))?
+    };
+    let mut carried: Vec<PartEntry> = parts
+        .iter()
+        .filter(|p| p.offset >= c_end && p.offset < n.offset)
+        .cloned()
+        .collect();
+    carried.sort_by_key(|p| p.offset);
+    if carried.len() != config.expected_moved_partitions.len()
+        || carried
+            .iter()
+            .zip(&config.expected_moved_partitions)
+            .any(|(p, &(number, offset, length))| {
+                p.number != number || p.offset != offset || p.length != length
+            })
+    {
+        bail!("{}", tr!("重启后磁盘或相邻分区身份/几何已变化，拒绝写盘"));
+    }
 
     // ===== 防呆校验（任一不满足，安全失败，不触碰磁盘）=====
+    // Every raw-write plan is pinned to the target and donor partitions the user confirmed in
+    // Windows. Partition numbers and byte ranges come from the partition table and are identical
+    // in WinPE (disk numbers are not), so any difference after the reboot stops before the first
+    // write.
+    if config.expected_partition_number == 0
+        || config.expected_partition_offset_bytes == 0
+        || config.expected_partition_size_bytes == 0
+        || config.expected_donor_partition_number == 0
+        || config.expected_donor_offset_bytes == 0
+        || config.expected_donor_size_bytes == 0
+        || target_layout.number != config.expected_partition_number
+        || c_off != config.expected_partition_offset_bytes
+        || c_len != config.expected_partition_size_bytes
+        || n.number != config.expected_donor_partition_number
+        || n.offset != config.expected_donor_offset_bytes
+        || n.length != config.expected_donor_size_bytes
+    {
+        bail!("{}", tr!("重启后磁盘或相邻分区身份/几何已变化，拒绝写盘"));
+    }
     if config.donor_target_size_mb > 0
         && (config.expected_disk_number == 0
             || config.expected_disk_size_bytes == 0
@@ -1032,13 +1107,70 @@ pub fn expand_c_drive(
             tr!("后方 MBR 分区类型不是受支持的 NTFS 基础数据类型（0x07），拒绝移动")
         );
     }
-    // N 必须紧贴 C（中间最多只有已计入的 adj_unalloc）。
-    if n.offset != c_end + adj_unalloc {
+    // The first partition behind the target (carried or donor) starts right after the gap.
+    if carried.first().map_or(n.offset, |p| p.offset) != c_end + adj_unalloc {
         bail!("{}", tr!("分区布局异常（后方分区不连续），拒绝移动"));
+    }
+    // Carried partitions: a GPT recovery partition (moved as a block, its GPT identity kept) or an
+    // NTFS data partition with a drive letter. Anything else stops the plan before any write.
+    let gpt = style == PartitionStyle::GPT;
+    let mut carried_letters: Vec<Option<char>> = Vec::with_capacity(carried.len());
+    for p in &carried {
+        let recovery = is_gpt_recovery(gpt, p);
+        if p.is_special && !recovery {
+            bail!("{}", tr!("C 盘和供体分区之间有不能移动的系统分区，拒绝操作"));
+        }
+        let letter = letter_for(disk, p.offset);
+        if !recovery {
+            let letter = letter.ok_or_else(|| {
+                anyhow!("{}", tr!("要一起挪动的分区没有盘符，无法安全移动"))
+            })?;
+            let file_system = volume_file_system(letter).map_err(|error| {
+                anyhow!(
+                    "{}",
+                    tr!(
+                        "无法读取分区 {}: 的文件系统（可能被 BitLocker 锁定），拒绝移动：{}",
+                        letter,
+                        error
+                    )
+                )
+            })?;
+            if !file_system.eq_ignore_ascii_case("NTFS")
+                || (style == PartitionStyle::MBR && p.mbr_type != Some(0x07))
+            {
+                bail!(
+                    "{}",
+                    tr!("要一起挪动的分区 {}: 不是 NTFS 数据分区，拒绝移动", letter)
+                );
+            }
+        }
+        carried_letters.push(letter);
     }
     // N 必须有盘符（用于卸载与重建后还原）。
     let n_letter = letter_for(disk, n.offset)
         .ok_or_else(|| anyhow!("{}", tr!("后方分区无盘符，无法安全移动")))?;
+    // A BitLocker volume cannot be unlocked here, and Windows can only shrink NTFS; both are
+    // refused before the first write.
+    let donor_file_system = volume_file_system(n_letter).map_err(|error| {
+        anyhow!(
+            "{}",
+            tr!(
+                "无法读取后方分区 {}: 的文件系统（可能被 BitLocker 锁定），拒绝移动：{}",
+                n_letter,
+                error
+            )
+        )
+    })?;
+    if !donor_file_system.eq_ignore_ascii_case("NTFS") {
+        bail!(
+            "{}",
+            tr!(
+                "后方分区 {}: 的文件系统是 {}，只支持移动 NTFS 分区",
+                n_letter,
+                donor_file_system
+            )
+        );
+    }
     // N 后方边界（下一分区起点或磁盘尾）。
     let after_n = parts
         .iter()
@@ -1079,6 +1211,28 @@ pub fn expand_c_drive(
         shift,
         RawMoveDirection::Right,
     )?;
+    for p in &carried {
+        plan_raw_move_io(
+            sector_geometry,
+            disk_size,
+            p.offset,
+            p.length,
+            shift,
+            RawMoveDirection::Right,
+        )?;
+    }
+    if !carried.is_empty() {
+        journal(
+            data_partition,
+            &format!(
+                "CARRY {:?}",
+                carried
+                    .iter()
+                    .map(|p| (p.number, p.offset, p.length))
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
 
     journal(
         data_partition,
@@ -1098,6 +1252,10 @@ pub fn expand_c_drive(
     );
 
     // ===== Step A：必要时 shrink N 文件系统 =====
+    progress(
+        tr!("正在检查并收缩分区 {}:（不移动任何数据）...", n_letter),
+        32,
+    );
     let mut n_len_now = n.length;
     let mut shrink_before = None;
     if shrink_by > 0 {
@@ -1173,7 +1331,24 @@ pub fn expand_c_drive(
     );
     let vol_handle = unsafe { lock_dismount_volume(n_letter) }
         .map_err(|error| pre_move_error_with_shrink_recovery(n_letter, shrink_before, error))?;
-    let move_res = unsafe { raw_move_right(disk, n.offset, n_len_now, shift, &move_layout) };
+    let report_move = |done: u64, total: u64| {
+        let percent = if total == 0 {
+            100
+        } else {
+            (done.saturating_mul(100) / total).min(100)
+        };
+        progress(
+            tr!(
+                "正在搬移分区 {}: 的数据 {}%（请勿断电或强制关机）",
+                n_letter,
+                percent
+            ),
+            35 + (percent * 50 / 100) as u8,
+        );
+    };
+    report_move(0, n_len_now);
+    let move_res =
+        unsafe { raw_move_right(disk, n.offset, n_len_now, shift, &move_layout, &report_move) };
     unsafe {
         let _ = CloseHandle(vol_handle);
     }
@@ -1191,6 +1366,7 @@ pub fn expand_c_drive(
     journal(data_partition, "MOVE done");
 
     // ===== Step C：VDS 删除旧表项、按原大小在新偏移重建、还原盘符 =====
+    progress(tr!("正在更新分区 {}: 的分区表项...", n_letter), 86);
     let new_off = n.offset + shift;
     journal(
         data_partition,
@@ -1239,7 +1415,125 @@ pub fn expand_c_drive(
     })?;
     reject_and_cleanup_mismatched_recreate(disk, created, new_off, n_len_now, data_partition)?;
 
+    // ===== Step C2：夹在中间的分区从后往前依次右移同样距离 =====
+    // The donor has moved, so its old place is free; each carried partition moves into the space
+    // freed by the one behind it. The same lock, raw copy, entry recreation and verification as
+    // for the donor are used for every partition.
+    let mut moved_data: Vec<(u64, u64)> = vec![(n.offset, new_off)];
+    let mut moved_recovery: Vec<(u64, u64)> = Vec::new();
+    for (p, letter) in carried.iter().zip(carried_letters.iter()).rev() {
+        let recovery = is_gpt_recovery(gpt, p);
+        let label = letter.map_or_else(|| tr!("恢复分区"), |letter| format!("{}:", letter));
+        let p_new = p.offset + shift;
+        journal(
+            data_partition,
+            &format!(
+                "CARRY MOVE #{} off={} len={} -> {}",
+                p.number, p.offset, p.length, p_new
+            ),
+        );
+        let carry_layout = lr_core::windows_storage::disk_layout_snapshot(disk)?;
+        let lock = match letter {
+            Some(letter) => Some(unsafe { lock_dismount_volume(*letter) }?),
+            None => match lr_core::windows_storage::try_volume_guid_path_for_partition(
+                disk, p.offset,
+            )? {
+                Some(path) => Some(unsafe { lock_dismount_volume_path(&path) }?),
+                // Not mounted as a volume: no file system can write to it meanwhile.
+                None => None,
+            },
+        };
+        let report = |done: u64, total: u64| {
+            let percent = if total == 0 {
+                100
+            } else {
+                (done.saturating_mul(100) / total).min(100)
+            };
+            progress(
+                tr!(
+                    "正在搬移分区 {} 的数据 {}%（请勿断电或强制关机）",
+                    label,
+                    percent
+                ),
+                35 + (percent * 50 / 100) as u8,
+            );
+        };
+        report(0, p.length);
+        let moved = unsafe { raw_move_right(disk, p.offset, p.length, shift, &carry_layout, &report) };
+        if let Some(handle) = lock {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+        }
+        moved.map_err(|error| {
+            journal(data_partition, &format!("CARRY MOVE FAILED: {}", error));
+            anyhow!(
+                "{}",
+                tr!(
+                    "搬移分区 {} 的数据失败（该分区可能已损坏，请用 journal 诊断）：{}",
+                    label,
+                    error
+                )
+            )
+        })?;
+        lr_core::windows_storage::delete_partition_checked(disk, p.offset, true, &carry_layout)
+            .map_err(|error| {
+                anyhow!(
+                    "{}",
+                    tr!(
+                        "搬移已完成但删除 {} 的旧分区表项失败（数据在新位置 offset={}，请据 journal 修复）：{}",
+                        label,
+                        p_new,
+                        error
+                    )
+                )
+            })?;
+        let carry_recreate_layout = lr_core::windows_storage::disk_layout_snapshot(disk)?;
+        let carried_created = lr_core::windows_storage::create_partition_checked(
+            &lr_core::windows_storage::CreatePartitionRequest {
+                disk_number: disk,
+                offset_bytes: p_new,
+                size_bytes: p.length,
+                kind: if recovery {
+                    lr_core::windows_storage::PartitionKind::Recovery
+                } else {
+                    lr_core::windows_storage::PartitionKind::BasicData
+                },
+                file_system: None,
+                label: String::new(),
+                drive_letter: *letter,
+                active: style == PartitionStyle::MBR && p.mbr_active,
+                preserve_gpt_metadata: p.gpt_metadata.clone(),
+            },
+            &carry_recreate_layout,
+        )
+        .map_err(|error| {
+            anyhow!(
+                "{}",
+                tr!(
+                    "搬移已完成但重建 {} 的分区表项失败（数据在新位置 offset={}，请据 journal 修复）：{}",
+                    label,
+                    p_new,
+                    error
+                )
+            )
+        })?;
+        reject_and_cleanup_mismatched_recreate(
+            disk,
+            carried_created,
+            p_new,
+            p.length,
+            data_partition,
+        )?;
+        if recovery {
+            moved_recovery.push((p.offset, p_new));
+        } else {
+            moved_data.push((p.offset, p_new));
+        }
+    }
+
     // ===== Step D：把 C extend 到目标 =====
+    progress(tr!("正在扩展分区 {}: ...", letter), 88);
     journal(data_partition, "EXTEND C");
     let msg =
         DiskManager::expand_partition_lossless_checked(letter, target_size_mb, expected_target)
@@ -1252,8 +1546,175 @@ pub fn expand_c_drive(
             )
                 )
             })?;
+    // MBR volumes are bound to their drive letters in the installed Windows by (disk signature,
+    // start offset). Point the moved volume's records at its new offset so it keeps its letter.
+    let mut note = String::new();
+    if style == PartitionStyle::MBR {
+        if let lr_core::windows_storage::StableDiskIdentity::Mbr { signature } = &move_layout.disk {
+            for (old_offset, new_offset) in &moved_data {
+                match remap_offline_mbr_mount_points(
+                    data_partition,
+                    *signature,
+                    *old_offset,
+                    *new_offset,
+                ) {
+                    Ok(count) => {
+                        journal(data_partition, &format!("REMAP mounted devices: {count}"))
+                    }
+                    Err(error) => {
+                        journal(data_partition, &format!("REMAP FAILED: {error}"));
+                        log::warn!("[EXPAND-MOVE] offline MountedDevices update failed: {error}");
+                        note = tr!(
+                            "（未能更新系统里被移动分区的盘符记录；若回到 Windows 后盘符变了，可在磁盘管理里改回）"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // Windows RE records its partition by start offset in ReAgent.xml (GPT BCD entries use the
+    // partition GUID, which the recreated entry keeps).
+    if !moved_recovery.is_empty() {
+        match update_winre_location(data_partition, &moved_recovery) {
+            Ok(changed) => journal(data_partition, &format!("WINRE location updated: {changed}")),
+            Err(error) => {
+                journal(data_partition, &format!("WINRE UPDATE FAILED: {error}"));
+                log::warn!("[EXPAND-MOVE] ReAgent.xml update failed: {error}");
+                note.push_str(&tr!(
+                    "（未能更新恢复环境的位置记录；回到 Windows 后可用管理员命令提示符依次运行 reagentc /disable 和 reagentc /enable 修复）"
+                ));
+            }
+        }
+    }
     journal(data_partition, "DONE");
-    Ok(tr!("已移动后方分区 {} 并{}", n_letter, msg))
+    Ok(tr!("已移动后方分区 {} 并{}", n_letter, msg) + &note)
+}
+
+/// Rewrites the start offset(s) of a moved recovery partition in the installed system's
+/// ReAgent.xml (`offset="<bytes>"` of the WinRE location). UTF-8 and UTF-16LE files are handled.
+fn update_winre_location(system_root: &str, moves: &[(u64, u64)]) -> Result<bool> {
+    let path = Path::new(system_root)
+        .join("Windows")
+        .join("System32")
+        .join("Recovery")
+        .join("ReAgent.xml");
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let original = std::fs::read(&path)?;
+    let utf16 = original.starts_with(&[0xff, 0xfe]);
+    let mut text = if utf16 {
+        let units: Vec<u16> = original[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16(&units).map_err(|error| anyhow!("ReAgent.xml is not UTF-16: {error}"))?
+    } else {
+        String::from_utf8(original.clone())
+            .map_err(|error| anyhow!("ReAgent.xml is not UTF-8: {error}"))?
+    };
+    let mut changed = false;
+    for (old_offset, new_offset) in moves {
+        let old_value = format!("offset=\"{}\"", old_offset);
+        if text.contains(&old_value) {
+            text = text.replace(&old_value, &format!("offset=\"{}\"", new_offset));
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+    let bytes = if utf16 {
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    } else {
+        text.into_bytes()
+    };
+    let temporary = path.with_extension("xml.letrecovery");
+    std::fs::write(&temporary, &bytes)?;
+    std::fs::rename(&temporary, &path)?;
+    Ok(true)
+}
+
+/// Locks and dismounts a volume addressed by its volume GUID path (a partition without a drive
+/// letter, such as the recovery partition).
+unsafe fn lock_dismount_volume_path(volume_path: &str) -> Result<HANDLE> {
+    let path = volume_path.trim_end_matches('\\');
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = CreateFileW(
+        PCWSTR::from_raw(wide.as_ptr()),
+        GENERIC_RW,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None,
+        OPEN_EXISTING,
+        Default::default(),
+        None,
+    )
+    .map_err(|e| anyhow!("{}", tr!("打开卷 {} 失败: {}", path, e)))?;
+    if handle == INVALID_HANDLE_VALUE {
+        bail!("{}", tr!("打开卷 {} 得到无效句柄", path));
+    }
+    let mut returned: u32 = 0;
+    for (control, failure) in [
+        (FSCTL_LOCK_VOLUME, tr!("锁定卷 {} 失败（可能有句柄占用）", path)),
+        (FSCTL_DISMOUNT_VOLUME, tr!("卸载卷 {} 失败", path)),
+    ] {
+        if DeviceIoControl(handle, control, None, 0, None, 0, Some(&mut returned), None).is_err() {
+            let _ = CloseHandle(handle);
+            bail!("{}", failure);
+        }
+    }
+    Ok(handle)
+}
+
+/// MBR volumes are tied to their drive letters in the installed Windows by (disk signature, start
+/// offset) values under HKLM\SYSTEM\MountedDevices. After a move the offset differs and Windows
+/// would give the moved volume another letter on its next boot. GPT volumes are tied by partition
+/// GUID, which the recreated entry preserves, so they need nothing.
+fn remap_offline_mbr_mount_points(
+    system_root: &str,
+    signature: u32,
+    old_offset: u64,
+    new_offset: u64,
+) -> Result<usize> {
+    use lr_core::registry::OfflineRegistry;
+    const HIVE_NAME: &str = "LR_EXPAND_SYSTEM";
+    let hive = Path::new(system_root)
+        .join("Windows")
+        .join("System32")
+        .join("config")
+        .join("SYSTEM");
+    if !hive.is_file() {
+        return Ok(0);
+    }
+    let mut old_value = signature.to_le_bytes().to_vec();
+    old_value.extend_from_slice(&old_offset.to_le_bytes());
+    let mut new_value = signature.to_le_bytes().to_vec();
+    new_value.extend_from_slice(&new_offset.to_le_bytes());
+    // A hive left loaded by an interrupted earlier run would make the load fail.
+    let _ = OfflineRegistry::unload_hive(HIVE_NAME);
+    OfflineRegistry::load_hive(HIVE_NAME, &hive.to_string_lossy())?;
+    let key = format!("HKLM\\{}\\MountedDevices", HIVE_NAME);
+    let result = (|| -> Result<usize> {
+        let mut changed = 0;
+        for name in OfflineRegistry::enumerate_value_names(&key)? {
+            let Ok(data) = OfflineRegistry::query_binary(&key, &name) else {
+                continue;
+            };
+            if data == old_value {
+                OfflineRegistry::set_binary(&key, &name, &new_value)?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    })();
+    let unloaded = OfflineRegistry::unload_hive(HIVE_NAME);
+    let changed = result?;
+    unloaded?;
+    Ok(changed)
 }
 
 /// 从目标分区左侧紧邻的普通数据分区转移容量。
@@ -1562,6 +2023,7 @@ mod tests {
             mbr_type: None,
             mbr_active: false,
             gpt_metadata: None,
+            gpt_type: None,
         }
     }
 

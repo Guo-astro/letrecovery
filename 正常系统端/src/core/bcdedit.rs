@@ -136,8 +136,53 @@ impl BootManager {
     }
 
     fn esp_on_same_disk(&self, windows_partition: &str) -> Result<(u32, u32, u64)> {
-        self.optional_esp_on_same_disk(windows_partition)?
-            .ok_or_else(|| anyhow::anyhow!("{}", tr!("未找到 ESP 分区")))
+        if let Some(esp) = self.optional_esp_on_same_disk(windows_partition)? {
+            return Ok(esp);
+        }
+        // Installing to a second disk without an ESP (for example a new SSD next to the disk that
+        // already boots Windows) is common. Use an existing full-size ESP on another disk instead
+        // of leaving the applied system unbootable. Windows ESPs are at least 100 MiB; smaller EFI
+        // partitions such as Ventoy's 32-MiB VTOYEFI belong to boot media and are skipped.
+        const MIN_FALLBACK_ESP_BYTES: u64 = 100 * 1024 * 1024;
+        let target_letter = windows_partition
+            .trim_end_matches(':')
+            .trim_end_matches('\\')
+            .chars()
+            .next()
+            .map(|letter| letter.to_ascii_uppercase());
+        let disks = super::quick_partition::get_physical_disks();
+        let target_disk = disks
+            .iter()
+            .find(|disk| {
+                disk.partitions.iter().any(|partition| {
+                    partition
+                        .drive_letter
+                        .is_some_and(|letter| Some(letter.to_ascii_uppercase()) == target_letter)
+                })
+            })
+            .map(|disk| disk.disk_number);
+        let fallback = disks
+            .iter()
+            .filter(|disk| Some(disk.disk_number) != target_disk)
+            .find_map(|disk| {
+                disk.partitions
+                    .iter()
+                    .find(|partition| {
+                        partition.is_esp && partition.size_bytes >= MIN_FALLBACK_ESP_BYTES
+                    })
+                    .map(|esp| (disk.disk_number, esp.partition_number, esp.offset_bytes))
+            });
+        match fallback {
+            Some((disk_number, partition_number, offset_bytes)) => {
+                log::warn!(
+                    "[BOOT] 目标分区所在磁盘没有 ESP，改用磁盘 {} 上已有的 ESP（分区 {}）写入引导",
+                    disk_number,
+                    partition_number
+                );
+                Ok((disk_number, partition_number, offset_bytes))
+            }
+            None => Err(anyhow::anyhow!("{}", tr!("未找到 ESP 分区"))),
+        }
     }
 
     fn mount_known_esp(

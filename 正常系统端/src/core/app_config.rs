@@ -37,6 +37,9 @@ pub struct AppConfig {
     #[serde(default = "default_automatic_feedback_mode")]
     pub automatic_feedback_mode: String,
 
+    /// 将当前正常端可用网络交接给支持网络运行时的 PE；默认关闭。
+    #[serde(default)]
+    pub pe_network_enabled: bool,
 
     /// 日志保留天数（默认7天）
     #[serde(default = "default_log_retention_days")]
@@ -79,6 +82,13 @@ pub struct AppConfig {
     /// 「系统安装」页选项偏好（记住上次勾选状态，下次启动自动恢复）。
     #[serde(default)]
     pub install_prefs: crate::core::ui_state::InstallPrefs,
+
+    /// 分散暂存：为 true 时经 PE 安装不再尝试缩卷新建数据分区（不调用 VDS 与存储管理 API），
+    /// 直接使用已有分区。已有某个分区能装下全部文件时只用它；否则把镜像、驱动等按需分散到
+    /// 多个已有分区。缺省为 false：先按原逻辑选择或新建数据分区，只有缩卷建分区失败或无处可放时
+    /// 才自动改用分散暂存。
+    #[serde(default)]
+    pub scattered_staging_enabled: bool,
 }
 
 /// 日志默认启用
@@ -124,6 +134,7 @@ impl Default for AppConfig {
             easy_mode_settings_tip_dismissed: false,
             log_enabled: true, // 日志默认启用
             automatic_feedback_mode: default_automatic_feedback_mode(),
+            pe_network_enabled: false,
             log_retention_days: 7,           // 默认保留7天
             language: String::from("zh-CN"), // 默认简体中文
             pe_cache: crate::download::config::PeCache::default(),
@@ -134,6 +145,7 @@ impl Default for AppConfig {
             allow_insecure_http_downloads: false,
             download_threads: default_download_threads(),
             install_prefs: crate::core::ui_state::InstallPrefs::default(),
+            scattered_staging_enabled: false,
         }
     }
 }
@@ -294,9 +306,19 @@ impl AppConfig {
         let _ = self.save();
     }
 
-    pub fn automatic_feedback_enabled(&self) -> bool { self.automatic_feedback_mode != "disabled" }
+    pub fn automatic_feedback_enabled(&self) -> bool {
+        self.automatic_feedback_mode != "disabled"
+    }
+
+    pub fn pe_network_enabled(&self) -> bool {
+        self.pe_network_enabled
+    }
     pub fn set_automatic_feedback_enabled(&mut self, enabled: bool) {
-        self.automatic_feedback_mode = if enabled { default_automatic_feedback_mode() } else { "disabled".to_string() };
+        self.automatic_feedback_mode = if enabled {
+            default_automatic_feedback_mode()
+        } else {
+            "disabled".to_string()
+        };
     }
 
     pub fn set_log_enabled(&mut self, enabled: bool) {
@@ -368,7 +390,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn automatic_feedback_mode_accepts_only_three_states() {
         let absent: AppConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(absent.normalized().automatic_feedback_mode, "normal_and_pe");
@@ -381,6 +402,14 @@ mod tests {
         let normal: AppConfig =
             serde_json::from_str(r#"{"automatic_feedback_mode":"normal"}"#).unwrap();
         assert_eq!(normal.normalized().automatic_feedback_mode, "normal");
+    }
+
+    #[test]
+    fn pe_network_is_off_by_default_and_round_trips() {
+        let absent: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(!absent.pe_network_enabled);
+        let enabled: AppConfig = serde_json::from_str(r#"{"pe_network_enabled":true}"#).unwrap();
+        assert!(enabled.pe_network_enabled);
     }
 
     fn download_threads_are_normalized_to_supported_tiers() {

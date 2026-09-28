@@ -135,16 +135,33 @@ fn classify_evidence(
             OfflineImageAccountMode::PreserveExistingAccounts,
             format!("SAM contains {ordinary_local_account_count} user-owned local account(s)"),
         )
-    } else if state.as_deref().is_some_and(is_resealed_to_oobe) && accounts.is_some() {
-        (
-            OfflineImageAccountMode::FreshDeployable,
+    } else if state.as_deref().is_some_and(is_resealed_to_oobe) {
+        // Microsoft's generalized install images are resealed to OOBE. SAM inventory is only
+        // supporting evidence: new builds have produced SAM hives that the WinPE readers reject,
+        // and refusing unattended setup there leaves consumer OOBE demanding a network and a
+        // Microsoft account. Existing accounts are never modified by the unattended path.
+        let diagnostic = if accounts.is_some() {
             "ImageState is resealed to OOBE and verified SAM inventory contains no user-owned local account"
-                .to_string(),
-        )
+                .to_string()
+        } else {
+            format!(
+                "ImageState is resealed to OOBE; SAM inventory unavailable ({}), treated as a deployable image for compatibility",
+                account_error.as_deref().unwrap_or("unknown error")
+            )
+        };
+        (OfflineImageAccountMode::FreshDeployable, diagnostic)
     } else if state.as_deref().is_some_and(is_complete_installation) {
         (
             OfflineImageAccountMode::PreserveExistingAccounts,
             "ImageState is IMAGE_STATE_COMPLETE".to_string(),
+        )
+    } else if state.as_deref().is_none_or(|value| value.trim().is_empty()) && accounts.is_some() {
+        (
+            OfflineImageAccountMode::FreshDeployable,
+            format!(
+                "ImageState unavailable ({}); verified SAM inventory contains no user-owned local account",
+                state_error.as_deref().unwrap_or("empty value")
+            ),
         )
     } else {
         let mut evidence = Vec::new();
@@ -218,17 +235,18 @@ mod tests {
     }
 
     #[test]
-    fn microsoft_oobe_resealed_state_requires_successful_sam_inventory() {
+    fn microsoft_oobe_resealed_state_stays_deployable_without_sam_inventory() {
         // Exact ImageState observed in Microsoft's 28000.2113 zh-CN Client Pro ISO supplied for
         // this regression. Microsoft documents this state as generalized and ready to continue to
-        // OOBE. The image-state evidence is valid, but this policy still requires a successful SAM
-        // inventory before enabling account and unattended mutations.
+        // OOBE. SAM inventory is supporting evidence only: an unreadable SAM must not turn a stock
+        // image into an interactive consumer OOBE that demands a network and Microsoft account.
         let inspection = classify_evidence(
             Ok("IMAGE_STATE_GENERALIZE_RESEAL_TO_OOBE".to_string()),
             Err(anyhow::anyhow!("offline SAM inventory unavailable")),
             false,
         );
-        assert_eq!(inspection.mode, OfflineImageAccountMode::Indeterminate);
+        assert_eq!(inspection.mode, OfflineImageAccountMode::FreshDeployable);
+        assert!(inspection.allows_new_install_unattended());
         assert!(inspection.diagnostic.contains("SAM inventory unavailable"));
     }
 
@@ -305,6 +323,16 @@ mod tests {
         );
         assert_eq!(inspection.mode, OfflineImageAccountMode::Indeterminate);
         assert!(!inspection.allows_new_install_unattended());
+    }
+
+    #[test]
+    fn missing_image_state_with_clean_sam_inventory_is_deployable() {
+        let inspection = classify_evidence(
+            Err(anyhow::anyhow!("missing state")),
+            Ok(vec![account("000001F4", "Administrator")]),
+            false,
+        );
+        assert_eq!(inspection.mode, OfflineImageAccountMode::FreshDeployable);
     }
 
     #[test]

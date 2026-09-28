@@ -83,6 +83,8 @@ function Invoke-BoundedDism {
         # Do not use Start-Process -Wait. Microsoft documents that it follows the entire process
         # tree; waiting only for this fixed DISM process keeps this optional hook bounded.
         $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -PassThru -WindowStyle Hidden
+        # Windows PowerShell 5.1 reports ExitCode only for a Process object that owns its handle.
+        try { $null = $process.Handle } catch {}
         if (-not $process.WaitForExit([int]$remainingMilliseconds)) {
             try {
                 if (-not $process.HasExited) {

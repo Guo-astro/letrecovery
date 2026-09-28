@@ -62,7 +62,23 @@ pub unsafe fn measure_text(
     if text.is_empty() {
         return TextSize::default();
     }
-    let dc = GetDC(hwnd);
+    let _profile = super::redraw::profile_scope("测量文字");
+    // Layout runs on every resize step and page switch and asks for the same captions again and
+    // again. Each former call opened a display DC for the window (GetDC), selected the font and
+    // measured. The result depends only on the font description, the text and the wrap width, so
+    // it is measured once in a private memory DC and remembered for the rest of the session.
+    let key = MeasureKey {
+        font: font_identity(font),
+        maximum_width: maximum_width.map(|value| value.max(0)),
+        text: text.to_owned(),
+    };
+    if let Some(size) = MEASURE_CACHE.with(|cache| cache.borrow().get(&key).copied()) {
+        return size;
+    }
+    let (dc, owned_window_dc) = match measure_dc() {
+        Some(dc) => (dc, false),
+        None => (GetDC(hwnd), true),
+    };
     if dc.is_invalid() {
         return TextSize::default();
     }
@@ -77,13 +93,166 @@ pub unsafe fn measure_text(
     } else {
         DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX
     };
-    let _ = DrawTextW(dc, &mut wide, &mut bounds, flags);
+    let measured = DrawTextW(dc, &mut wide, &mut bounds, flags) != 0;
     let _ = SelectObject(dc, old_font);
-    let _ = ReleaseDC(hwnd, dc);
-    TextSize {
+    if owned_window_dc {
+        let _ = ReleaseDC(hwnd, dc);
+    }
+    let size = TextSize {
         width: (bounds.right - bounds.left).max(0),
         height: (bounds.bottom - bounds.top).max(0),
+    };
+    if measured {
+        MEASURE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() >= MEASURE_CACHE_LIMIT {
+                cache.clear();
+            }
+            cache.insert(key, size);
+        });
     }
+    size
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MeasureKey {
+    font: u64,
+    maximum_width: Option<i32>,
+    text: String,
+}
+
+const MEASURE_CACHE_LIMIT: usize = 4096;
+
+thread_local! {
+    static MEASURE_CACHE: std::cell::RefCell<std::collections::HashMap<MeasureKey, TextSize>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static MEASURE_DC: std::cell::Cell<Option<windows::Win32::Graphics::Gdi::HDC>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A screen-compatible memory DC kept for text measurement on the UI thread. Measuring there is
+/// identical to measuring on a window DC (same device, same pixel-height font) without asking the
+/// window manager for a display DC every time.
+unsafe fn measure_dc() -> Option<windows::Win32::Graphics::Gdi::HDC> {
+    MEASURE_DC.with(|cell| {
+        if let Some(dc) = cell.get() {
+            return Some(dc);
+        }
+        let dc = windows::Win32::Graphics::Gdi::CreateCompatibleDC(
+            windows::Win32::Graphics::Gdi::HDC::default(),
+        );
+        if dc.is_invalid() {
+            return None;
+        }
+        cell.set(Some(dc));
+        Some(dc)
+    })
+}
+
+/// Identifies a font by its full description rather than its handle: fonts are recreated on DPI
+/// and language changes, and GDI may hand a released handle value to a different font later.
+unsafe fn font_identity(font: HFONT) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut description = windows::Win32::Graphics::Gdi::LOGFONTW::default();
+    let copied = windows::Win32::Graphics::Gdi::GetObjectW(
+        font,
+        std::mem::size_of::<windows::Win32::Graphics::Gdi::LOGFONTW>() as i32,
+        Some((&mut description as *mut windows::Win32::Graphics::Gdi::LOGFONTW).cast()),
+    );
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    if copied > 0 {
+        description.lfHeight.hash(&mut hasher);
+        description.lfWidth.hash(&mut hasher);
+        description.lfEscapement.hash(&mut hasher);
+        description.lfOrientation.hash(&mut hasher);
+        description.lfWeight.hash(&mut hasher);
+        description.lfItalic.hash(&mut hasher);
+        description.lfUnderline.hash(&mut hasher);
+        description.lfStrikeOut.hash(&mut hasher);
+        description.lfCharSet.0.hash(&mut hasher);
+        description.lfQuality.0.hash(&mut hasher);
+        description.lfFaceName.hash(&mut hasher);
+    } else {
+        // Stock or invalid font: its handle is stable for the whole session.
+        (font.0 as usize).hash(&mut hasher);
+        u8::MAX.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// A capacity given in MB, for display: below 1 GB in whole MB (a 16 MB MSR partition used to read
+/// "0.0 GB"), from 1 GB on in GB with one decimal.
+pub fn format_capacity_mb(value_mb: u64) -> String {
+    if value_mb < 1024 {
+        format!("{value_mb} MB")
+    } else {
+        format!("{:.1} GB", value_mb as f64 / 1024.0)
+    }
+}
+
+/// The same for a capacity given in GB.
+pub fn format_capacity_gb(value_gb: f64) -> String {
+    let value_gb = value_gb.max(0.0);
+    if value_gb < 1.0 {
+        format!("{:.0} MB", value_gb * 1024.0)
+    } else {
+        format!("{value_gb:.1} GB")
+    }
+}
+
+/// The caption of a control and its font, measured: what a button, label or check box needs.
+pub unsafe fn control_text_width(control: HWND) -> i32 {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW, SendMessageW};
+    let length = GetWindowTextLengthW(control).max(0) as usize;
+    if length == 0 {
+        return 0;
+    }
+    let mut buffer = vec![0u16; length + 1];
+    let copied = GetWindowTextW(control, &mut buffer).max(0) as usize;
+    let text = String::from_utf16_lossy(&buffer[..copied]).replace('&', "");
+    let font = SendMessageW(control, 0x0031, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+    measure_text(control, HFONT(font.0 as *mut _), &text, None).width
+}
+
+/// Height the caption of `control` needs when wrapped at `width`.
+pub unsafe fn control_wrapped_height(control: HWND, width: i32) -> i32 {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW, SendMessageW};
+    let length = GetWindowTextLengthW(control).max(0) as usize;
+    if length == 0 || width <= 0 {
+        return 0;
+    }
+    let mut buffer = vec![0u16; length + 1];
+    let copied = GetWindowTextW(control, &mut buffer).max(0) as usize;
+    let text = String::from_utf16_lossy(&buffer[..copied]);
+    let font = SendMessageW(control, 0x0031, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+    measure_text(control, HFONT(font.0 as *mut _), &text, Some(width)).height
+}
+
+/// Width a closed drop-down needs for its longest item: the text, its margins and the chevron.
+pub unsafe fn combo_fitted_width(combo: HWND, dpi: u32, minimum: i32) -> i32 {
+    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    let font = HFONT(SendMessageW(combo, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
+    let count = SendMessageW(combo, 0x0146, WPARAM(0), LPARAM(0)).0.clamp(0, 256) as usize;
+    let mut widest = 0;
+    for index in 0..count {
+        let length = SendMessageW(combo, 0x0149, WPARAM(index), LPARAM(0)).0;
+        if length <= 0 {
+            continue;
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let copied = SendMessageW(combo, 0x0148, WPARAM(index), LPARAM(buffer.as_mut_ptr() as isize))
+            .0
+            .clamp(0, length) as usize;
+        let text = String::from_utf16_lossy(&buffer[..copied]);
+        widest = widest.max(measure_text(combo, font, &text, None).width);
+    }
+    (widest + scale(38, dpi)).max(minimum)
+}
+
+/// Width a push button needs for its own caption (caption plus the usual inner margins).
+pub unsafe fn fitted_button_width(button: HWND, dpi: u32, minimum: i32) -> i32 {
+    (control_text_width(button) + scale(24, dpi)).max(minimum)
 }
 
 pub unsafe fn measured_button_width(

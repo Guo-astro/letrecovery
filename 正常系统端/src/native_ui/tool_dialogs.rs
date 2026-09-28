@@ -19,7 +19,7 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetDlgItem, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, MoveWindow,
-    SendMessageW, SetWindowTextW, ShowWindow, BS_OWNERDRAW, BS_PUSHBUTTON, ES_AUTOHSCROLL,
+    SendMessageW, ShowWindow, BS_OWNERDRAW, BS_PUSHBUTTON, ES_AUTOHSCROLL,
     ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, SW_HIDE, SW_SHOW, WM_SETFONT, WS_BORDER, WS_TABSTOP,
     WS_VSCROLL,
 };
@@ -135,7 +135,7 @@ impl NativeToolDialog {
         let dpi = GetDpiForWindow(shell.hwnd()).max(96);
         let face = wide("Microsoft YaHei");
         let font = CreateFontW(
-            -scale(14, dpi),
+            -scale(12, dpi),
             0,
             0,
             0,
@@ -873,12 +873,11 @@ unsafe fn create_controls(
     kind: ToolDialogKind,
 ) -> windows::core::Result<ToolControls> {
     let mut controls = ToolControls::default();
-    let report_style = ES_MULTILINE
-        | ES_AUTOVSCROLL
-        | ES_READONLY
-        | WS_BORDER.0 as i32
-        | WS_VSCROLL.0 as i32
-        | WS_TABSTOP.0 as i32;
+    // No WS_BORDER on an Edit: USER32 turns it into an internal "flat border" flag at creation,
+    // removes the style bit and then draws that border inside the text area on every paint. It can
+    // never be taken away afterwards, which left a square box inside the rounded frame.
+    let report_style =
+        ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL.0 as i32 | WS_TABSTOP.0 as i32;
     // Single-line edits intentionally start borderless. `NativeControlKind::Field` applies the
     // Windows 11 property-page WS_EX_CLIENTEDGE + CFD/DarkMode_CFD combination before display.
     let edit_style = ES_AUTOHSCROLL | WS_TABSTOP.0 as i32;
@@ -1194,8 +1193,8 @@ unsafe fn move_control(control: HWND, x: i32, y: i32, width: i32, height: i32) {
 
 unsafe fn set_text(control: HWND, value: &str) {
     if !control.is_invalid() {
-        let value = wide(value);
-        let _ = SetWindowTextW(control, PCWSTR(value.as_ptr()));
+        // Only changed text is sent; the tool timer refreshes these labels every 100 ms.
+        crate::native_ui::redraw::set_window_text_if_changed(control, value);
     }
 }
 

@@ -86,6 +86,8 @@ LetRecovery 是具有管理员权限的 Windows 系统安装、备份和磁盘�
 
 - 正常系统端的 ViaPE 安装和 ViaPE 备份必须在当前会话收集 Windows 已持有的 48 位 RecoveryPassword，并通过同一份 LRBL1 受认证私有启动 WIM 载荷透传给 PE；没有密钥时可按既有 best-effort 语义记录有界 warning，但不得因所谓“安全”删除、禁用或绕过这条透传能力。
 - PE 必须使用 manifest 绑定的恢复密码，通过共享 `lr_core::fveapi::FveApi::open_volume` 与 `FveVolumeHandle::unlock_with_recovery_key` 解锁，不得依赖精简 PE 可能缺失的 `manage-bde.exe`；严禁调用 `manage-bde -off`、删除或暂停保护器，严禁把解锁透传改成解密。该约束同时适用于 Install、Backup、Maintenance，后续修改必须保留三端调用链、测试和文档。
+- 正常系统端直接安装遇到 `EncryptedUnlocked` 目标时必须直接继续；能否读取 RecoveryPassword 不得成为写入前提，更不得触发全卷解密。锁定卷的文件系统空间查询可能合法失败，库存和 BitLocker 管理界面此时必须优先使用共享 IOCTL 边界返回的实际 volume extent 作为总容量；可用空间仍未知时显示占位符，禁止伪装为 `0.0 GB` 或把该卷从安装库存静默丢弃。镜像释放后必须先完成引导，再判定启动存储驱动覆盖；完整 INF 集已被标准 DISM 接受时立即停止验证，旧 WinPE 导出到真实 INF 但因缺少 `DismApi.dll` 无法生成拓扑清单时仍须尝试全部 INF，清单缺失本身不得制造致命启动路径；非启动存储驱动导入失败和驱动暂存清理失败只能记录 warning。
+- PE 中运行正常端时，若有效镜像路径与用户选定目标分区属于同一盘符卷，必须在安装按钮/启动意图阶段拒绝，避免首次格式化或覆盖时把唯一镜像源一起删除；从完整 Windows 运行正常端不启用这条 UI 门禁。正式 PE 的失败终态必须保留界面和日志，自动关机只允许显式编译的 `ci-automation` 一次性虚拟机测试构建使用，不能由普通认证配置触发。
 
 ## 不可违反的安全规则
 
@@ -283,9 +285,9 @@ PCA2023 离线资源必须从已维护的微软官方介质或动态更新包制
 通常需要同时检查：
 
 - `正常系统端/src/core/advanced_options.rs` 与 `正常系统端/src/core/ui_state.rs`：输入、默认状态、序列化兼容和离线应用边界；
-- `正常系统端/src/core/install_config.rs`（扩展入口）：传递给 PE 的配置结构和向后兼容默认值；CLI 的可丢弃虚拟机终态策略必须作为布尔字段进入同一 LRHC1/HMAC 认证配置，不得使用公开 marker、环境变量或未认证 PE 参数旁路；
+- `正常系统端/src/core/install_config.rs`（扩展入口）：传递给 PE 的配置结构和向后兼容默认值；CLI 的可丢弃虚拟机终态策略必须作为布尔字段进入同一 LRHC1/HMAC 认证配置，不得使用公开 marker、环境变量或未认证 PE 参数旁路；PE 网络运行时开关与自动反馈阶段策略同样只进入认证 Install 载荷，默认关闭网络且不得把 Wi-Fi 密钥写入公开数据卷；
 - `正常系统端/src/core/native_install_controller.rs`、`native_install_executor.rs` 与 `native_install_backend.rs`：正常端安装意图、执行状态机和生产后端；安装意图必须把挂载光驱中的有效镜像路径与其原始 ISO backing 路径分别传递，Direct 必须在任何目标写入和格式化前完成镜像校验并检查两者及全部后续输入，即使关闭格式化也不得跳过；每个后续目标写阶段都必须按磁盘号、偏移和长度重新解析盘符；
-- `PE端/src/core/config.rs`（扩展入口）：PE 配置解析；
+- `PE端/src/core/config.rs`（扩展入口）：PE 配置解析；读取认证的 PE 网络运行时与自动反馈策略，缺失旧字段时保持安全默认值并将联网失败作为可选诊断警告；
 - `PE端/src/ui/advanced_options.rs` 或 `PE端/src/app.rs`：离线应用；
 - `assets/release/lang/en-US.json`：英文翻译；
 - 本文档：职责或文件变化说明。
@@ -324,6 +326,10 @@ PCA2023 离线资源必须从已维护的微软官方介质或动态更新包制
 - `lr-core/src/lib.rs`：共享库根模块，声明并导出两端共用能力。
 - `lr-core/src/bounded_failure_summary.rs`：批量诊断失败的纯逻辑有界摘要与增量收集器；完整统计总数，只保留并格式化调用方请求且受硬上限约束的少量样例，逐样例按 UTF-8 字节边界截断并把换行、NUL 和其它控制字符收敛为单行，同时显式报告剩余数。PE 逐 INF 与可选 CAB 导入只允许记录一条该摘要，禁止在内层隔离器与外层工作流重复逐包打印或为生成日志把全部错误保留在内存；摘要不得改变标准 DISM 的真实结果、可选包隔离或启动存储驱动最终回读语义。
 - `lr-core/src/data_staging.rs`：ViaPE 数据暂存盘的纯选择策略与 `StagingPayloadBudget`；调用端必须先精确累计镜像全部 span/XP 树、OEM 驱动、PCA、版本化用户驱动、UefiSeven 和本次已实际下载的预装软件，再由本模块只加一次固定 2 GiB 操作余量并返回现有卷、目标卷缩分区或不可用计划。不得再叠加按镜像比例、系统卷比例或固定容量的隐藏保留；SSD/HDD、内外置和物理磁盘关系只影响候选排序，不改变容量公式。模块不探测磁盘也不执行写操作；`shrink_is_safe` 只能由调用端在核对文件系统、介质和稳定 BitLocker 状态后设置。
+- `lr-core/src/inf_class.rs`：解析 Windows INF 的 Class/ClassGuid 元数据并将已知设备类映射为稳定分类；不验证包签名，也不以类别本身判定启动关键性。
+- `lr-core/src/reg_file.rs`：为挂载的离线 hive 转换 `.reg` 导出中的受支持根键；保留编码、值数据和换行字节，只改写指定的离线 hive 前缀，不执行注册表导入。
+- `lr-core/src/windows_build.rs`：两端共享的 Windows build-number 策略；已验证范围外的新客户端 build 采用保守兼容路径并继续安装，不依赖未经验证的内部行为。
+- `lr-core/src/hash.rs`：共享文件 SHA-256 与流式摘要工具，调用方负责持有和验证源文件身份。
 - `lr-core/src/software_install.rs`：预装软件选择的两端共享数据契约、URL-safe 配置编码、文件名/URL/数量/长度约束和静默安装命令解析；只允许下载文件本身或 `msiexec.exe` 作为参数化子进程，`{installer}` 必须唯一且作为完整参数出现，禁止把服务器命令交给 shell。VMware Tools 使用服务端 `vm_tools=true` 身份，但仍走同一受检安装包契约。
 - `lr-core/src/install_handoff.rs`：安装配置兼容语法与固定 volume-locator marker 的精确字节格式；data/target marker 内容只能是严格 64 位小写十六进制 token，同名异内容只返回“不匹配”，不得升级成错误。
 - `lr-core/src/personal_files.rs`：不格式化分区重装时的个人文件保留与旧系统快速删除事务。预检只接受离线目标每个普通本地 profile 的 `Desktop`、`Documents`、`Downloads`、`Pictures`、`Music`、`Videos`，遇到重解析、EFS、offline 或 recall-on-access 数据时必须在任何移动前停止；六类目录用同卷 `MoveFileExW(MOVEFILE_WRITE_THROUGH)` 搬入本次 SessionId 唯一根，全部成功前的失败逆序搬回，回退不完整不得声称可逆。进入不可逆边界后只删除固定旧 Windows 顶层 allowlist，目录枚举使用 `FindFirstFileExW(FindExInfoBasic/FIND_FIRST_EX_LARGE_FETCH)`，删除优先 `FileDispositionInfoEx` 并为 Win7 回退 `FileDispositionInfo`，不得调用 shell、遍历重解析目标或把未知根目录纳入清理。首登录恢复不能把旧 SID 的 owner/DACL 随同卷 rename 或 Windows 8+ 的 `CopyFileExW` 带入新 profile：普通文件必须通过 `OpenOptions::create_new` 在当前 token 的真实 Known Folder 中创建新对象，由 Windows 在创建边界直接赋予当前账户 owner 与父目录继承 DACL，再从已经打开并回读为同一普通文件的保留源句柄流式写入、flush、`sync_all`、回读目标类型和长度，最后才删除保留源。创建或写入失败必须删除未提交目标、保留源后失败；不得为了修补复制来的 owner 而新增 `WRITE_OWNER` 门禁。重解析点只作为叶对象同卷移动，禁止为复制而跟随其目标。保留 Desktop 中 `.lnk` 优先通过 `IPersistFile::Load + IShellLinkW::GetPath(SLGP_RAWPATH)` 分类；精简 PE 缺少 Shell Link COM 注册、COM 未返回文件目标，或 COM 把原目标跟踪到非目标卷（例如 PE 的 `X:`）时，只允许按微软 MS-SHLLINK 2.3 严格、有界读取 `LinkInfo` 的本地绝对路径；COM 已明确定位到旧系统卷 `Users` 时不得由二进制回退推翻。禁止猜测 IDList、网络、环境变量、PropertyStore 或 TrackerData。PE 可能重映射离线系统盘符，因此原始目标位于绝对 `C:\` 或当前已经认证的离线目标卷、且规范化后不在该卷 `Users` 下的链接随旧系统进入不可逆阶段删除，其他盘、UNC、环境变量、相对路径、无文件目标或解析失败一律保留并计数，禁止猜测。
@@ -425,6 +431,10 @@ PCA2023 离线资源必须从已维护的微软官方介质或动态更新包制
 - `正常系统端/src/main.rs`：桌面端进程入口、权限与依赖检查、窗口显示前并行完成系统/硬件摘要及正式版分区只读预加载、安全 CLI 分派和原生 Win32 窗口启动；启动日志必须只记录 `BUILD_VERSION` 的 `vYYYY.MM.DD` 构建日期版本，并记录源系统、固件、Secure Boot、运行平台、物理磁盘与分区数，使反馈者无需手工抄写环境；PCA 固件兼容性只读探测必须与启动预加载同时开始，通过一次性接收器在 HWND 创建后接入消息循环，既不得阻塞首窗显示也不得因窗口稍后创建而重复探测；所有危险公开 CLI 必须在管理员边界之后分派，历史 `/PEINSTALL`、`--pe-install`、`/PEBACKUP`、`--pe-backup` 正常端兼容参数必须在配置加载、管理员请求和 GUI 初始化之前固定拒绝，源码不得保留另一套未受稳定身份保护的格式化、镜像释放、备份捕获、NT5 猜测或引导写实现；固定且无参数的 `--restore-windows-update` 维护入口只能由已经提权的管理员控制台单独调用，必须通过共享 WinAPI 确定当前 Windows 盘符并严格验证精确盘根、Windows 目录和 SYSTEM/SOFTWARE hive 后，才从该系统盘 `ProgramData` manifest 执行在线 compare-and-swap 恢复；该入口不得弹框或自动提权，部分恢复必须写结构化日志并以非零状态退出，`non-elevated-tests` 必须拒绝执行。网络目录由窗口异步加载并回传错误，正常端不再声明或链接 egui 模块，`non-elevated-tests` 下使用隔离互斥锁并禁止危险 CLI 入口、联网和安装目标分区预加载；该测试 feature 专用的 `--ui-preview`/`LETRECOVERY_UI_SKIP_PRELOAD` 入口只跳过单实例和供应商 WMI/SetupAPI 只读预加载，用真实配置、原生控件和消息循环提供确定性视觉回归；同 feature 的 `--ui-progress-preview` 必须复用正式进度页切换、布局和绘制路径，固定展示非 0/100 的运行中安装状态，不创建控制器或 worker；`--ui-pe-maintenance-preview` 必须直接打开工具箱及正式 PE 维护准备对话框，只运行动画计时器，不进入 PE/BCD/BitLocker/重启控制器；release 中不得存在这些入口。
 - `正常系统端/src/win7_import_compat.rs`：正常端 x64 Windows 7-11 通用产物的进程加载兼容边界；在 EXE 内提供 SDK 依赖所引用的 `__imp_CoTaskMemFree` 导入槽并动态转发到 Windows 7-11 均存在的 `ole32.dll!CoTaskMemFree`，防止现代 SDK 把单个调用重定向为 Windows 7 不存在的 `combase.dll` 硬依赖；不得扩展为伪造系统 DLL、吞掉释放或影响独立的 Windows 10/11 PE 构建。
 - `正常系统端/src/native_ui/mod.rs`：正常端原生 Win32 UI 模块边界和窗口运行入口。
+- `正常系统端/src/native_ui/combo_popup.rs`：自绘只读 ComboBox 弹出列表；将完整 32-bit 表面交给 DWM/GDI 合成，保持应用选项、键盘和无障碍状态的现有数据边界。
+- `正常系统端/src/native_ui/context_menu.rs`：编辑框右键菜单，按读写和密码字段提供受限编辑命令及快捷键，不暴露原生菜单中的阅读顺序、Unicode 控制字符或 IME 命令。
+- `正常系统端/src/native_ui/syscolor_hook.rs`：仅对当前进程 Common Controls 导入的系统选区颜色查询作主题映射；不调用 `SetSysColors`，不改变系统级颜色。
+- `正常系统端/src/native_ui/ui_audit.rs`：通过显式 `LETRECOVERY_UI_AUDIT=1` 入口逐页测量当前语言可见控件文本并记录溢出诊断；不参与正式安装执行。
 - `正常系统端/src/native_ui/redraw.rs`：主窗口和工具对话框共用的合成重绘事务；页面切换只暂停当前可见顶层根窗口，冻结期沿用既有子控件显隐和布局逻辑，恢复时用带 `RDW_ERASE|RDW_ALLCHILDREN` 的异步 `RedrawWindow` 排队一个完整客户帧，避免逐子 HWND 的 `WM_SETREDRAW` 产生空重定向表面，也避免点击处理同步等待整树绘制；连续 `WM_SIZE` 的纯几何布局同样只在全部 `MoveWindow(..., repaint=false)` 完成后排队一个不带 `RDW_UPDATENOW`/`RDW_FRAME` 的完整客户区子树帧，使 USER32 合并尺寸突发；主题、语言和首次显示等必须立即稳定的事务仍使用同步完整树发布。主窗口禁止使用 `WS_EX_COMPOSITED`。
 - `正常系统端/src/native_ui/controls.rs`：原生子控件创建、UTF-16 字符串、库存下拉框空选择哨兵与无偏移索引校验、按 Inno DFM 的 23px 高/75px 最小宽基线缩放的 DPI 尺寸，以及按钮、分隔线和进度条的明暗/悬停/按下/禁用/单焦点边框状态绘制；ComboBox 保持 Common Controls 6.0 的库存字符串、键盘、无障碍和原生弹层语义，不得全局强加 `CBS_OWNERDRAWFIXED` 或在每个弹出项重绘时同步读取文本和分配缓冲；所有自绘按钮在共用子类中用 `TrackMouseEvent(TME_LEAVE)` 跟踪悬停，只局部重绘自身并复用 normal/hot/pressed/disabled 调色板，跟踪失败、取消模式、隐藏复用和禁用时立即清除热态，不因焦点增加双边框；按钮、长任务进度条及闭合字段/列表外框使用限域抗锯齿绘制，圆弧厚度必须随 DPI 与直边同步，重复重绘使用绝对调色板颜色以避免颗粒、断线和逐帧变暗；单行编辑框从创建期保留 `WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL` 和 `WS_EX_NOPARENTNOTIFY`，移除宿主版本会复活的 `WS_BORDER`/`WS_EX_CLIENTEDGE`，文本、光标、选择、IME 与无障碍仍完全由原生 Edit 负责；布局子类按当前字体 `tmHeight` 和 DPI 把真实 Edit 垂直居中到 23px 字段行，由同一父窗口下无 ID、无通知的同级 STATIC 保持完整字段几何，禁止父级包装 HWND 改变通知路由或造成嵌套 Edit 宽度坍塌；ListView 的固定圆角外框同样由无 ID、无通知的同父 STATIC 承载，使用空心 HRGN 保留真实列表的表体与滚动条命中区，并由布局子类同步可见性、位置、尺寸、启用、DPI 和相对 Z 序，真实报告缩入外框但不改变通知和滚动语义；外层闭合字段视觉与 ComboBox 共享确定性 Win11 圆角框，闭合 ComboBox 箭头必须使用子像素覆盖率 BGRA 图元；直接创建的安装镜像和高级选项字段也必须接入，不得用 `EM_SETRECT`、`WM_NCCALCSIZE` 或自绘文字伪造居中；进度条保持深色轨道、统一 Inno 绿色与 5px 内克制圆角，并在同一 BGRA 像素表面按覆盖率合成背景、轨道和填充；最外抗锯齿层必须与轨道同色以匹配 PE 的完整 10px 胶囊，不得另画会吃掉上下可见厚度的独立描边，填充圆角外部不得以矩形轨道色回贴并留下黑块。
 - 正常端工具箱的 PE 维护准备对话框必须直接复用 PE 端 Cloud-MGR `ProgressRing` 的 16×16、半径 7、1.5px 圆头线宽、两秒线性关键帧和解析覆盖率绘制；浅色前景固定 `#005FB8`，深色前景固定 PE 同款 `#4CC2FF`，不得误用正常端深色按钮的低对比 `accent_fill`，不得回退为 Unicode 半圆字符。弹窗使用 500×220 紧凑壳、48px 内容预算、16px 圈与 10px 状态间距，动画使用独立约 16ms UI 定时器且不改变 PE/BCD/BitLocker/重启控制器语义。
@@ -479,6 +489,7 @@ PCA2023 离线资源必须从已维护的微软官方介质或动态更新包制
   硬件库存更新时，必须在同一窗口消息内完成整批删除和插入，再执行一次包含非客户区与子窗口的同步 `RedrawWindow`；不得对子 ListView 使用会由 `DefWindowProc` 切换 `WS_VISIBLE` 的 `WM_SETREDRAW`，否则 DWM 可能发布暂时缺少真实 Header 子窗的重定向帧。禁止按行、按列或用定时器逐项发布中间帧。
 - `正常系统端/src/native_ui/pages/progress.rs`：原生长任务标题、说明、双层进度、运行/取消/成功/失败状态和稳定命令栏；内容区使用紧凑的上部工作流排布，双层进度条与 PE 端保持同一 10 logical-pixel 高度及半高胶囊圆角并随 DPI 缩放。只更新实际变化的文本、整数百分比、命令状态和进度区域，运行与完成保持同一 Inno 绿色；运行期或终态状态文字必须按当前字体、可用命令宽度和 DPI 向上扩展，不能用固定单行高度裁掉错误详情，也不能覆盖进度条或按钮；长任务使用完整客户区且不得透出普通页面的导航分隔线，下载无后续动作时显示本地化返回按钮而不暴露内部枚举，终态只生成重启、打开下载文件或返回等显式后续意图，不自行执行系统操作。
 - `正常系统端/src/core/mod.rs`：正常端核心模块声明。
+- `正常系统端/src/core/scattered_staging.rs`：为 PE 安装构造不新建数据分区的分散暂存计划；排除目标、X:、网络/光驱/可移动和内存卷，优先单卷存放，容量不足时按原始字节切分镜像并规划有界复制，不执行格式化或原始磁盘写入。
 - `正常系统端/src/core/app_config.rs`：`config.json` 用户偏好、语言、日志、外观和默认选项的读取保存；所有写入必须在共享进程锁内通过原子替换完成，普通偏好保存必须重新读取并保留在线目录异步写入的最新 PE 缓存，PE 缓存更新只能替换自身字段并保留最新用户偏好，禁止由窗口持有的旧配置快照造成字段丢失；已移除的正常端全局高级模式字段只为旧配置反序列化兼容，加载时必须固定关闭且保存时不再写回，独立 `automation_export_enabled` 与 `pe_maintenance_entry_enabled` 均默认为 false，后者只控制正常端工具箱的手动 PE 维护入口；旧 DiskPart 开关必须清空，但仍受支持的安装高级选项继续保存普通偏好，密码、当前用户名和 Wi-Fi 瞬态材料不得持久化；当前会话用户名探测必须复用共享本地账户策略，PE 中的 SYSTEM/TrustedInstaller 等服务身份不得成为安装用户名；下载线程字段向后兼容旧配置并在加载与保存入口归一到 8/16/32 三档，旧配置保持原有 16 连接默认值。
   已删除的 `mica_enabled` 只作为 serde 默认的未知旧字段被忽略；加载并再次保存配置后自然移除，不得恢复外观入口或 DWM 全客户区材质逻辑。
 - `正常系统端/src/core/automation_export.rs`：把已经由安装/备份页面捕获的当前意图映射为 `schema_version=1` CLI 配置，在 EXE 相邻 `cli` 目录发布受保护 JSON 与使用自身目录相对定位的 CMD；只生成和回读文件，不执行安装、备份、提权或磁盘操作。高级选项映射必须显式覆盖全部当前字段，包括当前运行的个人文件保留选择；关闭的路径型选项不得把陈旧路径带入配置；CMD 文件名、子命令与 EXE 文件名必须拒绝 shell 元字符并保留子进程退出码。

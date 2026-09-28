@@ -65,7 +65,7 @@ impl NativeNetworkResetDialog {
         let dpi = GetDpiForWindow(shell.hwnd()).max(96);
         let face = wide("Microsoft YaHei");
         let font = CreateFontW(
-            -scale(14, dpi),
+            -scale(12, dpi),
             0,
             0,
             0,

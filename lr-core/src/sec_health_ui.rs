@@ -37,10 +37,34 @@ pub const SEC_HEALTH_UI_IDENTITIES: &[CuratedAppxIdentity] = &[
 /// one more bounded retry before deleting the staging directory.
 const ONLINE_REMOVAL_SCRIPT: &str = r#"[CmdletBinding()]
 param(
-    [switch]$SuppressCurrentSecurityUpdate
+    [switch]$SuppressCurrentSecurityUpdate,
+    [switch]$LetRecoveryWorker
 )
 
 $ErrorActionPreference = 'Stop'
+if (-not $LetRecoveryWorker) {
+    # Windows Setup waits for RunSynchronous commands without any timeout. AppX servicing on a new
+    # or damaged image can block indefinitely and would leave Setup on its wait screen forever.
+    # Run the real work in a bounded child PowerShell and always let Windows Setup continue.
+    $workerTimeoutMilliseconds = if ($SuppressCurrentSecurityUpdate) { 170000 } else { 900000 }
+    try {
+        $workerPowerShell = [System.IO.Path]::Combine($env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+        $workerArguments = @('-NoP', '-NonI', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath), '-LetRecoveryWorker')
+        if ($SuppressCurrentSecurityUpdate) { $workerArguments += '-SuppressCurrentSecurityUpdate' }
+        $worker = Start-Process -FilePath $workerPowerShell -ArgumentList $workerArguments -WindowStyle Hidden -PassThru
+        try { $null = $worker.Handle } catch {}
+        if (-not $worker.WaitForExit($workerTimeoutMilliseconds)) {
+            try { $worker.Kill() } catch {}
+            [Console]::Error.WriteLine(('LETRECOVERY_SEC_HEALTH_UI_WARNING code=bounded_worker_timeout timeout_ms={0}' -f $workerTimeoutMilliseconds))
+        }
+    } catch {
+        try {
+            [Console]::Error.WriteLine(('LETRECOVERY_SEC_HEALTH_UI_WARNING code=bounded_worker_failed exception_type={0} hresult={1}' -f $_.Exception.GetType().FullName, $_.Exception.HResult))
+        } catch {
+        }
+    }
+    exit 0
+}
 $result = [ordered]@{
     schema = 'LetRecovery.SecHealthUIRemoval.v1'
     status = 'warning'

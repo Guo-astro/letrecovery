@@ -21,6 +21,15 @@ pub struct ExpandCHandoffRequest {
     pub strict_analysis_snapshot: bool,
     pub borrow_from_left: bool,
     pub donor_target_size_mb: u64,
+    /// The target lies beyond the adjacent unallocated space: the partition behind C: is moved
+    /// right (and shrunk first when needed) in WinPE before C: is extended.
+    pub requires_partition_move: bool,
+    /// Identity of that partition as confirmed by the user; WinPE refuses any other layout.
+    pub expected_donor_partition_number: u32,
+    pub expected_donor_offset_bytes: u64,
+    pub expected_donor_size_bytes: u64,
+    /// Partitions between the target and the donor that move along (number, offset, size).
+    pub expected_moved_partitions: Vec<(u32, u64, u64)>,
     pub minimum_free_mb: u64,
     pub wim_engine: u8,
     pub pe: OnlinePE,
@@ -37,17 +46,27 @@ pub enum ExpandCWorkerMessage {
 pub enum ExpandCStartError {
     #[error("开发测试构建禁止准备真实扩容或 PE 启动环境")]
     DisabledInDevelopment,
-    #[error("当前版本只支持使用目标卷后方已有连续未分配空间的纯扩展；分区收缩、供体转移和原始块移动尚未开放")]
+    #[error("这个扩容方案不受支持：只能使用相邻未分配空间，或移动紧挨在后面的一个已确认的 NTFS 数据分区")]
     UnsupportedRawMove,
     #[error("无法启动扩容准备线程: {0}")]
     Spawn(String),
 }
 
-fn require_supported_pure_extend(request: &ExpandCHandoffRequest) -> Result<(), ExpandCStartError> {
-    if request.borrow_from_left
-        || request.donor_target_size_mb != 0
-        || request.analyzed_no_move_max_mb <= request.analyzed_current_size_mb
-        || request.target_size_mb > request.analyzed_no_move_max_mb
+/// Plans this entry point executes: a plain extension into adjacent unallocated space, or a
+/// right move of the one data partition behind the target whose identity the user confirmed.
+/// Left-donor divider transfers belong to the partition map workflow and are refused here.
+fn require_supported_plan(request: &ExpandCHandoffRequest) -> Result<(), ExpandCStartError> {
+    if request.borrow_from_left || request.donor_target_size_mb != 0 {
+        return Err(ExpandCStartError::UnsupportedRawMove);
+    }
+    let beyond_adjacent = request.analyzed_no_move_max_mb <= request.analyzed_current_size_mb
+        || request.target_size_mb > request.analyzed_no_move_max_mb;
+    if beyond_adjacent
+        && (!request.requires_partition_move
+            || request.expected_donor_partition_number == 0
+            || request.expected_donor_offset_bytes == 0
+            || request.expected_donor_size_bytes == 0
+            || request.target_size_mb > request.analyzed_max_size_mb)
     {
         return Err(ExpandCStartError::UnsupportedRawMove);
     }
@@ -58,7 +77,7 @@ fn require_supported_pure_extend(request: &ExpandCHandoffRequest) -> Result<(), 
 pub fn start_expand_c_handoff(
     request: ExpandCHandoffRequest,
 ) -> Result<Receiver<ExpandCWorkerMessage>, ExpandCStartError> {
-    require_supported_pure_extend(&request)?;
+    require_supported_plan(&request)?;
     Err(ExpandCStartError::DisabledInDevelopment)
 }
 
@@ -66,7 +85,7 @@ pub fn start_expand_c_handoff(
 pub fn start_expand_c_handoff(
     request: ExpandCHandoffRequest,
 ) -> Result<Receiver<ExpandCWorkerMessage>, ExpandCStartError> {
-    require_supported_pure_extend(&request)?;
+    require_supported_plan(&request)?;
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("letrecovery-native-expand-c".to_owned())
@@ -87,7 +106,7 @@ fn run_handoff(
     use crate::core::install_config::{ConfigFileManager, ExpandConfig};
     use lr_core::cached_artifact::CachedArtifactStatus;
 
-    require_supported_pure_extend(request).map_err(|error| error.to_string())?;
+    require_supported_plan(request).map_err(|error| error.to_string())?;
     let target_partition = request.target_partition.to_ascii_uppercase();
     let _ = sender.send(ExpandCWorkerMessage::Progress(crate::tr!(
         "正在重新确认分区 {}: 布局...",
@@ -95,9 +114,10 @@ fn run_handoff(
     )));
     let fresh = super::native_expand_c_controller::analyze_expand_partition(target_partition)
         .map_err(|error| error.to_string())?;
+    // The adjacent space is exact layout. The move maximum also depends on the donor's free space,
+    // which changes whenever a file is written there, so the donor is pinned by identity below.
     let strict_snapshot_changed = request.strict_analysis_snapshot
-        && (fresh.max_size_mb != request.analyzed_max_size_mb
-            || fresh.no_move_max_mb != request.analyzed_no_move_max_mb);
+        && fresh.no_move_max_mb != request.analyzed_no_move_max_mb;
     let target_identity_changed = request
         .expected_disk
         .as_ref()
@@ -106,7 +126,6 @@ fn run_handoff(
             .expected_partition_number
             .is_some_and(|expected| fresh.partition_number != expected);
     if !fresh.found
-        || fresh.no_move_max_mb <= fresh.current_size_mb
         || fresh.current_size_mb != request.analyzed_current_size_mb
         || strict_snapshot_changed
         || target_identity_changed
@@ -119,7 +138,32 @@ fn run_handoff(
     let minimum = fresh
         .current_size_mb
         .max(fresh.used_mb.saturating_add(request.minimum_free_mb));
-    if request.target_size_mb < minimum || request.target_size_mb > fresh.no_move_max_mb {
+    let moving = request.target_size_mb > fresh.no_move_max_mb;
+    let donor = if moving {
+        let donor = fresh
+            .move_options
+            .iter()
+            .find(|donor| {
+                request.requires_partition_move
+                    && donor.partition_number == request.expected_donor_partition_number
+                    && donor.offset_bytes == request.expected_donor_offset_bytes
+                    && donor.size_bytes == request.expected_donor_size_bytes
+                    && donor.moved_identity() == request.expected_moved_partitions
+            })
+            .ok_or_else(|| {
+                crate::tr!(
+                    "分区 {}: 后方分区的布局已变化，请重新分析后再试。",
+                    target_partition
+                )
+            })?;
+        Some(donor.clone())
+    } else {
+        None
+    };
+    let maximum = donor
+        .as_ref()
+        .map_or(fresh.no_move_max_mb, |donor| donor.reach_mb);
+    if request.target_size_mb < minimum || request.target_size_mb > maximum {
         return Err(crate::tr!("目标大小已不在当前安全范围内，请重新分析。"));
     }
     let disk = fresh.disk.as_ref().ok_or_else(|| {
@@ -163,9 +207,12 @@ fn run_handoff(
         expected_partition_number: target_fingerprint.partition_number,
         expected_partition_offset_bytes: target_fingerprint.offset_bytes,
         expected_partition_size_bytes: target_fingerprint.size_bytes,
-        expected_donor_partition_number: 0,
-        expected_donor_offset_bytes: 0,
-        expected_donor_size_bytes: 0,
+        expected_donor_partition_number: donor.as_ref().map_or(0, |donor| donor.partition_number),
+        expected_donor_offset_bytes: donor.as_ref().map_or(0, |donor| donor.offset_bytes),
+        expected_donor_size_bytes: donor.as_ref().map_or(0, |donor| donor.size_bytes),
+        expected_moved_partitions: donor
+            .as_ref()
+            .map_or_else(Vec::new, |donor| donor.moved_identity()),
     };
     let target = format!("{}:", target_partition);
     let auth_key = lr_core::handoff_auth::SessionAuthKey::generate()
@@ -242,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_move_requests_are_rejected_before_any_worker_or_handoff() {
+    fn unpinned_or_left_moves_are_rejected_before_any_worker_or_handoff() {
         let base = ExpandCHandoffRequest {
             target_partition: 'C',
             expected_disk: None,
@@ -255,6 +302,11 @@ mod tests {
             strict_analysis_snapshot: true,
             borrow_from_left: false,
             donor_target_size_mb: 0,
+            requires_partition_move: false,
+            expected_donor_partition_number: 0,
+            expected_donor_offset_bytes: 0,
+            expected_donor_size_bytes: 0,
+            expected_moved_partitions: Vec::new(),
             minimum_free_mb: 1,
             wim_engine: 0,
             pe: OnlinePE {
@@ -265,26 +317,36 @@ mod tests {
                 sha256: Some("00".repeat(32)),
             },
         };
-        assert!(require_supported_pure_extend(&base).is_ok());
+        assert!(require_supported_plan(&base).is_ok());
 
         let mut right_move = base.clone();
         right_move.target_size_mb = 121;
         assert!(matches!(
-            require_supported_pure_extend(&right_move),
+            require_supported_plan(&right_move),
+            Err(ExpandCStartError::UnsupportedRawMove)
+        ));
+        right_move.requires_partition_move = true;
+        right_move.expected_donor_partition_number = 3;
+        right_move.expected_donor_offset_bytes = 1 << 30;
+        right_move.expected_donor_size_bytes = 1 << 30;
+        assert!(require_supported_plan(&right_move).is_ok());
+        right_move.target_size_mb = 161;
+        assert!(matches!(
+            require_supported_plan(&right_move),
             Err(ExpandCStartError::UnsupportedRawMove)
         ));
 
         let mut left_donor = base.clone();
         left_donor.borrow_from_left = true;
         assert!(matches!(
-            require_supported_pure_extend(&left_donor),
+            require_supported_plan(&left_donor),
             Err(ExpandCStartError::UnsupportedRawMove)
         ));
 
         let mut donor_transfer = base;
         donor_transfer.donor_target_size_mb = 80;
         assert!(matches!(
-            require_supported_pure_extend(&donor_transfer),
+            require_supported_plan(&donor_transfer),
             Err(ExpandCStartError::UnsupportedRawMove)
         ));
     }
@@ -304,6 +366,11 @@ mod tests {
             strict_analysis_snapshot: true,
             borrow_from_left: false,
             donor_target_size_mb: 0,
+            requires_partition_move: false,
+            expected_donor_partition_number: 0,
+            expected_donor_offset_bytes: 0,
+            expected_donor_size_bytes: 0,
+            expected_moved_partitions: Vec::new(),
             minimum_free_mb: 1024,
             wim_engine: 0,
             pe: OnlinePE {
@@ -352,6 +419,7 @@ mod tests {
                 expected_donor_partition_number: 0,
                 expected_donor_offset_bytes: 0,
                 expected_donor_size_bytes: 0,
+                expected_moved_partitions: Vec::new(),
             },
             &lr_core::handoff_auth::SessionAuthKey::from_bytes([0x5a; 32]).unwrap(),
         )

@@ -295,7 +295,7 @@ impl DownloadPage {
             parent,
             w!("EDIT"),
             "",
-            WS_BORDER.0 as i32 | WS_TABSTOP.0 as i32 | ES_AUTOHSCROLL,
+            WS_TABSTOP.0 as i32 | ES_AUTOHSCROLL,
             ID_SAVE_PATH,
         )?;
         let browse = child(
@@ -523,7 +523,31 @@ impl DownloadPage {
             vertical.list_height,
             false,
         );
-        self.update_column_widths(resource_width, dpi);
+        // Column widths use the lists' final client rectangles: run them once the batched moves
+        // have been applied (inside the same layout commit). The page outlives the layout call.
+        let page: *const Self = self;
+        crate::native_ui::controls::after_layout_commit(move || unsafe {
+            (*page).update_column_widths(resource_width, dpi);
+            (*page).update_category_column_width();
+        });
+        // The lists move with MoveWindow(.., false), which repaints nothing, not even the part of
+        // the page they uncover. Switching to the software tab left the old list pixels in the
+        // gap between the two lists (a dark vertical bar), and page switches never repainted it.
+        if let Ok(parent) = windows::Win32::UI::WindowsAndMessaging::GetParent(self.resources) {
+            let area = RECT {
+                left: rect.x,
+                top: vertical.list_y,
+                right: rect.x + width,
+                bottom: vertical.list_y + vertical.list_height,
+            };
+            let _ = windows::Win32::Graphics::Gdi::RedrawWindow(
+                parent,
+                Some(&area),
+                None,
+                windows::Win32::Graphics::Gdi::RDW_INVALIDATE
+                    | windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN,
+            );
+        }
 
         let label_width = (measure_text(
             self.save_path_label,
@@ -534,7 +558,8 @@ impl DownloadPage {
         .width
             + s(8))
         .clamp(s(72).min(width), (width / 3).max(s(72).min(width)));
-        let browse_width = s(82).min(width / 4);
+        let browse_width =
+            crate::native_ui::layout::fitted_button_width(self.browse, dpi, s(82)).min(width / 3);
         let _ = MoveWindow(
             self.save_path_label,
             rect.x,

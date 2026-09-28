@@ -39,67 +39,119 @@ fn capability_text_contains(value: &[u8], capability: &str) -> bool {
     })
 }
 
-/// Return whether this exact, already authenticated PE WIM advertises support for the optional
-/// source-verification receipt. Absence is deliberately a compatibility fallback, not an error:
-/// old/custom WIMs must continue receiving the legacy config and verify the image in PE.
-pub(crate) fn supports_source_image_verification_receipt(pe_path: &Path) -> bool {
+const SCATTERED_STAGING_CAPABILITY: &str = "scattered-staging-v1";
+
+/// Read the capability list shipped inside an already authenticated PE WIM.
+fn read_pe_capabilities(pe_path: &Path) -> Result<Vec<u8>> {
     if !pe_path
         .extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("wim"))
     {
-        return false;
+        anyhow::bail!("PE image is not a WIM file");
     }
-    let result = (|| -> Result<bool> {
-        let path = pe_path
-            .to_str()
-            .context("authenticated PE WIM path is not valid Unicode")?;
-        let verifier = lr_core::wimlib::Wimlib::new().map_err(anyhow::Error::msg)?;
-        let opened = verifier.open_wim(path).map_err(anyhow::Error::msg)?;
-        let info = opened
-            .get_info()
-            .context("read authenticated PE WIM boot index for capability detection")?;
-        if info.boot_index == 0 || info.boot_index > info.image_count {
-            anyhow::bail!(
-                "authenticated PE WIM has invalid boot index {} for {} images",
-                info.boot_index,
-                info.image_count
-            );
-        }
-        drop(opened);
-        let extraction = lr_core::scoped_temp_file::ScopedTempDir::create_in(
-            &std::env::temp_dir(),
-            "pe-capability",
-        )?;
-        lr_core::wimlib::WimlibManager::new()
-            .map_err(anyhow::Error::msg)?
-            .extract_paths(
-                path,
-                info.boot_index,
-                extraction.path().to_string_lossy().as_ref(),
-                &[HANDOFF_CAPABILITIES_WIM_PATH],
-            )
-            .map_err(anyhow::Error::msg)?;
-        let bytes = lr_core::scoped_temp_file::read_bounded_plain_file(
-            &extraction
-                .path()
-                .join("Program Files")
-                .join("LetRecoveryPE")
-                .join("handoff-capabilities.txt"),
-            4096,
-        )?;
-        Ok(capability_text_contains(
-            &bytes,
-            SOURCE_IMAGE_VERIFIED_CAPABILITY,
-        ))
-    })();
-    match result {
-        Ok(supported) => supported,
+    let path = pe_path
+        .to_str()
+        .context("authenticated PE WIM path is not valid Unicode")?;
+    let verifier = lr_core::wimlib::Wimlib::new().map_err(anyhow::Error::msg)?;
+    let opened = verifier.open_wim(path).map_err(anyhow::Error::msg)?;
+    let info = opened
+        .get_info()
+        .context("read authenticated PE WIM boot index for capability detection")?;
+    if info.boot_index == 0 || info.boot_index > info.image_count {
+        anyhow::bail!(
+            "authenticated PE WIM has invalid boot index {} for {} images",
+            info.boot_index,
+            info.image_count
+        );
+    }
+    drop(opened);
+    let extraction = lr_core::scoped_temp_file::ScopedTempDir::create_in(
+        &std::env::temp_dir(),
+        "pe-capability",
+    )?;
+    lr_core::wimlib::WimlibManager::new()
+        .map_err(anyhow::Error::msg)?
+        .extract_paths(
+            path,
+            info.boot_index,
+            extraction.path().to_string_lossy().as_ref(),
+            &[HANDOFF_CAPABILITIES_WIM_PATH],
+        )
+        .map_err(anyhow::Error::msg)?;
+    let bytes = lr_core::scoped_temp_file::read_bounded_plain_file(
+        &extraction
+            .path()
+            .join("Program Files")
+            .join("LetRecoveryPE")
+            .join("handoff-capabilities.txt"),
+        4096,
+    )?;
+    Ok(bytes.to_vec())
+}
+
+/// Return whether this exact, already authenticated PE WIM advertises support for the optional
+/// source-verification receipt. Absence is deliberately a compatibility fallback, not an error:
+/// old/custom WIMs must continue receiving the legacy config and verify the image in PE.
+pub(crate) fn supports_source_image_verification_receipt(pe_path: &Path) -> bool {
+    match read_pe_capabilities(pe_path) {
+        Ok(bytes) => capability_text_contains(&bytes, SOURCE_IMAGE_VERIFIED_CAPABILITY),
         Err(error) => {
             log::info!(
                 "[PE] source verification receipt capability absent or unreadable; using legacy PE verification: {error:#}"
             );
             false
+        }
+    }
+}
+
+/// Whether the PE helper inside this WIM declares that it can read scattered staging
+/// (files on several existing volumes and raw image chunks).
+pub(crate) fn supports_scattered_staging(pe_path: &Path) -> bool {
+    read_pe_capabilities(pe_path)
+        .is_ok_and(|bytes| capability_text_contains(&bytes, SCATTERED_STAGING_CAPABILITY))
+}
+
+/// Root identity recorded in the LRPE4 journal. WinPE treats it as diagnostics only, so a
+/// filtered storage stack (hardware-ID spoofer) falls back to volume-level evidence instead of
+/// blocking the PE handoff.
+fn persistent_pe_root_identity(
+    system_drive: char,
+) -> Result<lr_core::install_handoff::CanonicalInstallTargetV2> {
+    let stable = lr_core::windows_storage::stable_volume_identity(system_drive)
+        .context("capture persistent PE root volume identity")?;
+    let strict = lr_core::windows_storage::disk_layout_snapshot(stable.extent.disk_number)
+        .map_err(anyhow::Error::from)
+        .and_then(|snapshot| {
+            lr_core::install_handoff::CanonicalInstallTargetV2::from_snapshot(
+                &snapshot,
+                stable.extent.offset_bytes,
+                stable.extent.extent_length_bytes,
+            )
+        });
+    match strict {
+        Ok(identity) => Ok(identity),
+        Err(error) => {
+            log::warn!(
+                "[PE] 系统盘分区表指纹不可用（{error:#}），PE 日志记录改用卷级诊断身份"
+            );
+            let (style, gpt_partition_id) = match stable.partition {
+                lr_core::windows_storage::StablePartitionIdentity::Gpt { partition_id } => (
+                    lr_core::install_handoff::CanonicalTargetStyle::Gpt,
+                    Some(partition_id),
+                ),
+                lr_core::windows_storage::StablePartitionIdentity::Mbr { .. } => {
+                    (lr_core::install_handoff::CanonicalTargetStyle::Mbr, None)
+                }
+            };
+            Ok(lr_core::install_handoff::CanonicalInstallTargetV2 {
+                layout_digest: [0; 32],
+                device_id_hash: None,
+                partition_offset_bytes: stable.extent.offset_bytes,
+                partition_length_bytes: stable.extent.extent_length_bytes,
+                style,
+                gpt_partition_id,
+            })
         }
     }
 }
@@ -391,6 +443,177 @@ fn verify_secure_directory_acl(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Reset the persistent PE directory to owner Administrators and the protected
+/// "SYSTEM + Administrators full control" DACL. Inherited ACEs of existing children are
+/// re-propagated by `SetNamedSecurityInfoW`. SeRestore/SeTakeOwnership are enabled first so a
+/// foreign owner can be replaced too.
+#[cfg(windows)]
+fn repair_secure_directory_acl(path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LocalFree, BOOL, ERROR_SUCCESS, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, ACL, DACL_SECURITY_INFORMATION,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        PSID,
+    };
+
+    struct Descriptor(PSECURITY_DESCRIPTOR);
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = LocalFree(HLOCAL(self.0 .0));
+                }
+            }
+        }
+    }
+
+    for privilege in ["SeRestorePrivilege", "SeTakeOwnershipPrivilege"] {
+        if let Err(error) = super::system_utils::enable_privilege(privilege) {
+            log::debug!("[PE] enable {privilege} for PE directory repair failed: {error:#}");
+        }
+    }
+    const SDDL: &str = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+    let sddl = SDDL.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+        .context("build protected PE directory security descriptor for repair")?;
+    }
+    let descriptor = Descriptor(descriptor);
+    let mut owner = PSID::default();
+    let mut owner_defaulted = BOOL(0);
+    let mut dacl_present = BOOL(0);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut dacl_defaulted = BOOL(0);
+    unsafe {
+        GetSecurityDescriptorOwner(descriptor.0, &mut owner, &mut owner_defaulted)
+            .context("read owner from protected PE directory descriptor")?;
+        GetSecurityDescriptorDacl(
+            descriptor.0,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        )
+        .context("read DACL from protected PE directory descriptor")?;
+    }
+    if !dacl_present.as_bool() || dacl.is_null() {
+        anyhow::bail!("protected PE directory descriptor has no DACL");
+    }
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
+            PSID::default(),
+            Some(dacl as *const ACL),
+            None,
+        )
+    };
+    drop(descriptor);
+    if result != ERROR_SUCCESS {
+        anyhow::bail!(
+            "reset persistent PE directory owner/DACL failed with Win32 error {}",
+            result.0
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn repair_secure_directory_acl(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// `{prefix}-{pid}-{id}.{ext}` names produced by `ScopedTempFile`; returns the owner pid.
+fn scoped_temp_owner_pid(name: &str) -> Option<u32> {
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    let (rest, id) = stem.rsplit_once('-')?;
+    id.parse::<u64>().ok()?;
+    let (_, pid) = rest.rsplit_once('-')?;
+    pid.parse::<u32>().ok()
+}
+
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return false;
+        };
+        let mut code = 0_u32;
+        let running = GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE;
+        let _ = CloseHandle(handle);
+        running
+    }
+}
+
+#[cfg(not(windows))]
+fn process_is_running(_pid: u32) -> bool {
+    false
+}
+
+/// Protected handoff temp files (`handoff-bitlocker-*`, `handoff-administrator-*`, ...) exist
+/// only while one process injects them into the PE WIM. A copy left by a crashed or killed
+/// process can hold BitLocker recovery passwords or account secrets: overwrite and delete it.
+fn purge_stale_handoff_secrets(directory: &Path) {
+    use std::io::Write;
+    let current = std::process::id();
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.to_ascii_lowercase().starts_with("handoff-") {
+            continue;
+        }
+        let Some(pid) = scoped_temp_owner_pid(&name) else {
+            continue;
+        };
+        if pid == current || process_is_running(pid) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata_is_reparse_point(&metadata) {
+            continue;
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&path) {
+            let zeros = vec![0_u8; metadata.len().min(1024 * 1024) as usize];
+            let _ = file.write_all(&zeros);
+            let _ = file.sync_all();
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => log::info!("[PE] 已清除异常退出遗留的交接临时文件: {name}"),
+            Err(error) => log::warn!("[PE] 清除遗留交接临时文件 {name} 失败: {error}"),
+        }
+    }
+}
+
 fn secure_pe_directory() -> Result<SecurePeDirectory> {
     let path = persistent_pe_directory_path()?;
     let root = path
@@ -411,22 +634,47 @@ fn secure_pe_directory() -> Result<SecurePeDirectory> {
         anyhow::bail!("persistent PE directory is a reparse point or not a directory");
     }
     if let Err(untrusted) = verify_secure_directory_acl(&path) {
-        let empty = std::fs::read_dir(&path)
-            .context("inspect untrusted persistent PE directory")?
-            .next()
-            .is_none();
-        if created || !empty {
-            return Err(untrusted);
+        // Typical cause: the folder was opened in Explorer without elevation and "Continue" was
+        // clicked, which permanently grants the user's own SID full control. Restore the exact
+        // protected owner/DACL in place, so existing journals and payloads stay usable instead
+        // of blocking every later PE start until the user deletes the folder by hand.
+        log::warn!(
+            "[PE] 持久 PE 目录 {} 的所有者/权限被改动过（常见原因：在资源管理器中点过“继续”获取该文件夹的访问权限），正在自动恢复为仅 SYSTEM 与 Administrators: {untrusted:#}",
+            path.display()
+        );
+        let repaired = repair_secure_directory_acl(&path);
+        match verify_secure_directory_acl(&path) {
+            Ok(()) => match repaired {
+                Ok(()) => log::info!("[PE] 持久 PE 目录权限已自动恢复"),
+                Err(error) => log::warn!(
+                    "[PE] 持久 PE 目录本身的权限已恢复，但部分子项未能同步: {error:#}"
+                ),
+            },
+            Err(still_untrusted) => {
+                let empty = std::fs::read_dir(&path)
+                    .context("inspect untrusted persistent PE directory")?
+                    .next()
+                    .is_none();
+                if created || !empty {
+                    let repair_detail = match repaired {
+                        Ok(()) => "owner/DACL reset reported success".to_owned(),
+                        Err(error) => format!("{error:#}"),
+                    };
+                    return Err(still_untrusted.context(format!(
+                        "automatic owner/DACL repair did not make the directory trusted ({repair_detail}); original state: {untrusted:#}"
+                    )));
+                }
+                drop(lock);
+                std::fs::remove_dir(&path).context("remove empty untrusted PE directory")?;
+                created = create_secure_directory_atomic(&path)?;
+                if !created {
+                    anyhow::bail!("persistent PE directory was recreated by another process");
+                }
+                lock = open_directory_without_delete_share(&path)
+                    .context("reopen atomically protected PE directory")?;
+                verify_secure_directory_acl(&path)?;
+            }
         }
-        drop(lock);
-        std::fs::remove_dir(&path).context("remove empty untrusted PE directory")?;
-        created = create_secure_directory_atomic(&path)?;
-        if !created {
-            anyhow::bail!("persistent PE directory was recreated by another process");
-        }
-        lock = open_directory_without_delete_share(&path)
-            .context("reopen atomically protected PE directory")?;
-        verify_secure_directory_acl(&path)?;
     }
     let metadata = lock
         .metadata()
@@ -434,6 +682,7 @@ fn secure_pe_directory() -> Result<SecurePeDirectory> {
     if !metadata.is_dir() || metadata_is_reparse_point(&metadata) {
         anyhow::bail!("persistent PE directory changed during ACL protection");
     }
+    purge_stale_handoff_secrets(&path);
     Ok(SecurePeDirectory { path, _lock: lock })
 }
 
@@ -1719,18 +1968,7 @@ impl PeManager {
             root_identity: if authenticated_handoff.is_some() {
                 let system_drive = lr_core::windows_storage::current_windows_drive_letter()
                     .context("resolve running Windows volume before PE handoff")?;
-                let stable = lr_core::windows_storage::stable_volume_identity(system_drive)
-                    .context("capture persistent PE root volume identity")?;
-                let snapshot =
-                    lr_core::windows_storage::disk_layout_snapshot(stable.extent.disk_number)
-                        .context("capture persistent PE root disk layout")?;
-                Some(
-                    lr_core::install_handoff::CanonicalInstallTargetV2::from_snapshot(
-                        &snapshot,
-                        stable.extent.offset_bytes,
-                        stable.extent.extent_length_bytes,
-                    )?,
-                )
+                Some(persistent_pe_root_identity(system_drive)?)
             } else {
                 None
             },
@@ -2356,6 +2594,21 @@ mod cache_policy_tests {
     const RAMDISK_GUID: &str = "{11111111-1111-1111-1111-111111111111}";
     const LOADER_GUID: &str = "{22222222-2222-2222-2222-222222222222}";
     const TEST_PERSISTENT_PE_DIR: &str = "C:\\LetRecovery_PE";
+
+    #[test]
+    fn stale_handoff_temp_names_expose_only_their_owner_pid() {
+        assert_eq!(
+            super::scoped_temp_owner_pid("handoff-bitlocker-3984-17.txt"),
+            Some(3984)
+        );
+        assert_eq!(
+            super::scoped_temp_owner_pid("handoff-administrator-12-0.txt"),
+            Some(12)
+        );
+        assert_eq!(super::scoped_temp_owner_pid("handoff-bitlocker.txt"), None);
+        assert_eq!(super::scoped_temp_owner_pid("pe_active.txt"), None);
+        assert_eq!(super::scoped_temp_owner_pid("handoff-x-abc-1.txt"), None);
+    }
 
     #[test]
     fn handoff_capability_parser_requires_an_exact_line() {

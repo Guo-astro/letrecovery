@@ -199,6 +199,15 @@ impl AdvancedOptions {
         )
     }
 
+    fn target_build(target_partition: &str) -> Option<u32> {
+        let ntdll = Path::new(target_partition)
+            .join("Windows")
+            .join("System32")
+            .join("ntdll.dll");
+        crate::core::system_utils::get_file_version(&ntdll)
+            .map(|(_, _, build, _)| u32::from(build))
+    }
+
     fn target_is_windows_11(target_partition: &str) -> bool {
         let ntdll = Path::new(target_partition)
             .join("Windows")
@@ -334,6 +343,7 @@ impl AdvancedOptions {
             hive_cleanup.0.push("pc-default");
         }
 
+        let target_build = Self::target_build(target_partition);
         if Self::target_is_windows_11(target_partition) {
             match lr_core::windows11_shell::apply_offline_defaults("pc-soft") {
                 Ok(report) => log::info!(
@@ -370,17 +380,23 @@ impl AdvancedOptions {
 
         // 1. 移除快捷方式小箭头
         if self.remove_shortcut_arrow {
-            self.apply_remove_shortcut_arrow()?;
+            if let Err(error) = self.apply_remove_shortcut_arrow() {
+                log::warn!("[ADVANCED] 移除快捷方式小箭头未完全应用，安装继续: {error:#}");
+            }
         }
 
         // 2. Win11恢复经典右键菜单
         if self.restore_classic_context_menu {
-            self.apply_restore_classic_context_menu(default_loaded)?;
+            if let Err(error) = self.apply_restore_classic_context_menu(default_loaded) {
+                log::warn!("[ADVANCED] 恢复经典右键菜单未完全应用，安装继续: {error:#}");
+            }
         }
 
         // 3. OOBE绕过强制联网
         if self.bypass_nro {
-            self.apply_bypass_nro()?;
+            if let Err(error) = self.apply_bypass_nro(target_build) {
+                log::warn!("[ADVANCED] 设置OOBE绕过联网未完全应用，安装继续: {error:#}");
+            }
         }
 
         // 4. 按目标系统家族移除 Windows Update 活动组件。
@@ -426,12 +442,16 @@ impl AdvancedOptions {
 
         // 7. 禁用UAC
         if self.disable_uac {
-            self.apply_disable_uac()?;
+            if let Err(error) = self.apply_disable_uac() {
+                log::warn!("[ADVANCED] 禁用UAC未完全应用，安装继续: {error:#}");
+            }
         }
 
         // 8. 禁用自动设备加密 (BitLocker)
         if self.disable_device_encryption {
-            self.apply_disable_device_encryption()?;
+            if let Err(error) = self.apply_disable_device_encryption() {
+                log::warn!("[ADVANCED] 禁用自动设备加密未完全应用，安装继续: {error:#}");
+            }
         }
 
         // 9. Curated AppX servicing is deferred until every externally loaded offline hive has
@@ -439,53 +459,67 @@ impl AdvancedOptions {
         // WiFi 迁移：只暂存已验证可迁移的 profile XML。内置无人值守文件会在首登时
         // 通过共享 finalizer 隐藏导入、检查退出码，并在所有收尾工作成功后删除脚本目录。
         if self.migrate_wifi && !self.wifi_profile_xml.is_empty() {
-            self.apply_migrate_wifi(target_partition)?;
+            if let Err(error) = self.apply_migrate_wifi(target_partition) {
+                log::warn!("[ADVANCED] 暂存 WiFi 迁移配置未完全应用，安装继续: {error:#}");
+            }
         }
 
         // ============ 自定义脚本 ============
 
         // 10. 系统部署中运行脚本
         if self.run_script_during_deploy && !self.deploy_script_path.is_empty() {
-            self.apply_run_script_during_deploy(&scripts_dir)?;
+            if let Err(error) = self.apply_run_script_during_deploy(&scripts_dir) {
+                log::warn!("[ADVANCED] 部署脚本未能应用，安装继续: {error:#}");
+            }
         }
 
         // 11. 首次登录运行脚本
         if self.run_script_first_login && !self.first_login_script_path.is_empty() {
-            self.apply_run_script_first_login(&scripts_dir)?;
+            if let Err(error) = self.apply_run_script_first_login(&scripts_dir) {
+                log::warn!("[ADVANCED] 首次登录脚本未能应用，安装继续: {error:#}");
+            }
         }
 
         // ============ 自定义内容 ============
 
         // 12. 导入自定义驱动 - 使用 DISM 实际安装
         if self.import_custom_drivers && !self.custom_drivers_path.is_empty() {
-            self.apply_import_custom_drivers(
+            if let Err(error) = self.apply_import_custom_drivers(
                 target_partition,
                 default_loaded,
                 &software_hive,
                 &system_hive,
                 &default_hive,
-            )?;
+            ) {
+                log::warn!("[ADVANCED] 自定义驱动未能导入，安装继续: {error:#}");
+            }
         }
 
         // 13. 导入磁盘控制器驱动（Win10/Win11 x64）
         if self.import_storage_controller_drivers {
-            self.apply_import_storage_controller_drivers(
+            if let Err(error) = self.apply_import_storage_controller_drivers(
                 target_partition,
                 default_loaded,
                 &software_hive,
                 &system_hive,
                 &default_hive,
-            )?;
+            ) {
+                log::warn!("[ADVANCED] 存储控制器驱动未能导入，安装继续: {error:#}");
+            }
         }
 
         // 14. 导入注册表文件 - 实际导入到离线注册表
         if self.import_registry_file && !self.registry_file_path.is_empty() {
-            self.apply_import_registry_file(&scripts_dir)?;
+            if let Err(error) = self.apply_import_registry_file(&scripts_dir) {
+                log::warn!("[ADVANCED] 注册表文件未能应用，安装继续: {error:#}");
+            }
         }
 
         // 15. 导入自定义文件
         if self.import_custom_files && !self.custom_files_path.is_empty() {
-            self.apply_import_custom_files(target_partition)?;
+            if let Err(error) = self.apply_import_custom_files(target_partition) {
+                log::warn!("[ADVANCED] 自定义文件未能应用，安装继续: {error:#}");
+            }
         }
 
         // 16. 自定义用户名 - 写入标记文件供无人值守使用
@@ -603,7 +637,14 @@ impl AdvancedOptions {
     }
 
     /// 3. OOBE绕过强制联网
-    fn apply_bypass_nro(&self) -> anyhow::Result<()> {
+    fn apply_bypass_nro(&self, target_build: Option<u32>) -> anyhow::Result<()> {
+        if !lr_core::windows_build::should_write_bypass_nro(target_build) {
+            log::warn!(
+                "[ADVANCED] 目标系统 build={:?} 已移除 BypassNRO 通道，跳过写入以免 OOBE 卡在“请稍等”；本地账户仍由无人值守 UserAccounts 创建",
+                target_build
+            );
+            return Ok(());
+        }
         log::info!("[ADVANCED] 设置OOBE绕过联网");
         OfflineRegistry::set_dword(
             "HKLM\\pc-soft\\Microsoft\\Windows\\CurrentVersion\\OOBE",
@@ -673,12 +714,9 @@ impl AdvancedOptions {
         )?;
         // 禁用 MBAM (Microsoft BitLocker Administration and Monitoring)
         OfflineRegistry::set_dword("HKLM\\pc-soft\\Policies\\Microsoft\\FVE", "OSRecovery", 0)?;
-        // 禁用设备加密
-        OfflineRegistry::set_dword(
-            "HKLM\\pc-sys\\ControlSet001\\Services\\BDESVC",
-            "Start",
-            4, // Disabled
-        )?;
+        // BDESVC keeps its inbox start type. PreventDeviceEncryption is the documented switch for
+        // automatic device encryption; disabling the service adds no protection but breaks
+        // unlocking BitLocker data/USB drives and the BitLocker UI after installation.
         Ok(())
     }
 
@@ -935,10 +973,12 @@ impl AdvancedOptions {
         log::info!("[ADVANCED] 导入注册表文件: {}", self.registry_file_path);
 
         // 读取原始 .reg 文件
-        let reg_content = std::fs::read_to_string(&self.registry_file_path)?;
+        // Regedit exports are UTF-16LE; read bytes instead of assuming UTF-8.
+        let reg_bytes = std::fs::read(&self.registry_file_path)?;
+        let converted_bytes = lr_core::reg_file::convert_reg_file_for_offline_hives(&reg_bytes);
         // 转换路径：HKEY_LOCAL_MACHINE\SOFTWARE -> HKLM\pc-soft
         // 转换路径：HKEY_LOCAL_MACHINE\SYSTEM -> HKLM\pc-sys
-        let converted = Self::convert_reg_file_for_offline(&reg_content);
+        // Key prefixes were rewritten above without touching value data or the file encoding.
 
         // `create_new` prevents concurrent installations from overwriting the
         // same import file; the guard cleans up on every return path.
@@ -946,7 +986,7 @@ impl AdvancedOptions {
             std::path::Path::new(scripts_dir),
             "lr-reg-import",
             "reg",
-            converted.as_bytes(),
+            &converted_bytes,
         )?;
         OfflineRegistry::import_reg_file(&temp_reg.to_string_lossy())?;
         log::info!("[ADVANCED] 注册表文件导入成功");

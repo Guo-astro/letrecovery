@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
-    CloseThemeData, DrawThemeTextEx, OpenThemeData, SetWindowTheme, DRAWITEMSTRUCT, DTTOPTS,
+    DrawThemeTextEx, OpenThemeData, SetWindowTheme, DRAWITEMSTRUCT, DTTOPTS,
     DTT_COMPOSITED, DTT_TEXTCOLOR, ODA_FOCUS, ODS_DISABLED, ODS_FOCUS, ODS_HOTLIGHT, ODS_SELECTED,
     WM_MOUSELEAVE,
 };
@@ -75,6 +75,38 @@ pub(crate) struct LayoutBatchGuard {
     owns_batch: bool,
 }
 
+thread_local! {
+    static AFTER_LAYOUT_COMMIT: RefCell<Vec<Box<dyn FnOnce()>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `work` right after the current layout batch has moved its windows, still inside the
+/// commit (so the non-client repaints it causes are deferred to the step's single paint pass).
+/// Column widths belong here: they depend on the report's new size, and changing them before
+/// the report moved made it recalculate (and redraw its scrollbars) with the old size first.
+/// Without an open batch the work runs immediately.
+pub(crate) fn after_layout_commit(work: impl FnOnce() + 'static) {
+    let batching = LAYOUT_REQUESTS.with(|cell| cell.borrow().is_some());
+    if batching {
+        AFTER_LAYOUT_COMMIT.with(|queue| queue.borrow_mut().push(Box::new(work)));
+    } else {
+        work();
+    }
+}
+
+unsafe fn is_drop_down_combo(hwnd: HWND) -> bool {
+    let mut class = [0u16; 16];
+    let length = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class).max(0) as usize;
+    String::from_utf16_lossy(&class[..length]).eq_ignore_ascii_case("ComboBox")
+        && matches!(GetWindowLongPtrW(hwnd, GWL_STYLE) & 0x0003, 0x0002 | 0x0003)
+}
+
+unsafe fn class_name_is_static(class_name: PCWSTR) -> bool {
+    class_name
+        .to_string()
+        .map(|name| name.eq_ignore_ascii_case("STATIC"))
+        .unwrap_or(false)
+}
+
 pub(crate) fn begin_layout_batch() -> LayoutBatchGuard {
     let owns_batch = LAYOUT_REQUESTS.with(|cell| {
         let mut state = cell.borrow_mut();
@@ -97,9 +129,49 @@ impl Drop for LayoutBatchGuard {
 }
 
 unsafe fn publish_layout_batch() {
+    let _profile = super::redraw::profile_scope("排版/提交全部移动");
+    let commit = super::redraw::mark_layout_commit();
     let Some(requests) = LAYOUT_REQUESTS.with(|cell| cell.borrow_mut().take()) else {
         return;
     };
+    // A report and its rounded frame move in the same deferred batch: the frame takes the
+    // requested rectangle and the report its inset rectangle. Letting the report's layout hook
+    // move the frame with a nested SetWindowPos made every report move a second, separate
+    // window transaction (with its own non-client paint) inside the batch.
+    let mut expanded = Vec::with_capacity(requests.len() + 4);
+    let mut framed_lists = Vec::new();
+    for request in requests {
+        match list_view_frame(request.hwnd) {
+            Some(frame) => {
+                let dpi = GetDpiForWindow(request.hwnd).max(96);
+                let inner = list_view_inner_bounds(request.width, request.height, dpi);
+                expanded.push(LayoutRequest {
+                    hwnd: frame,
+                    x: request.x,
+                    y: request.y,
+                    width: request.width,
+                    height: request.height,
+                    old_width: None,
+                    old_height: None,
+                });
+                expanded.push(LayoutRequest {
+                    x: request.x + inner.x,
+                    y: request.y + inner.y,
+                    width: inner.width,
+                    height: inner.height,
+                    ..request
+                });
+                let _ = SetPropW(
+                    request.hwnd,
+                    LIST_VIEW_INTERNAL_LAYOUT_PROPERTY,
+                    HANDLE(1 as *mut _),
+                );
+                framed_lists.push((request.hwnd, frame, request.width, request.height, dpi));
+            }
+            None => expanded.push(request),
+        }
+    }
+    let requests = expanded;
     let mut groups: Vec<(HWND, Vec<LayoutRequest>)> = Vec::new();
     let mut ungrouped = Vec::new();
     for request in requests {
@@ -121,6 +193,20 @@ unsafe fn publish_layout_batch() {
         let deferred = (|| -> windows::core::Result<()> {
             let mut batch = BeginDeferWindowPos(group.len() as i32)?;
             for request in &group {
+                // A control whose size changes repaints itself completely (no copied pixels: a
+                // partial copy would keep its old right/bottom edge). A control that only moves
+                // keeps its pixels - USER32 copies them to the new place - so a resize step only
+                // repaints what actually changed instead of every control of the window. Fields
+                // clip their siblings (WS_CLIPSIBLINGS), so the copied pixels are their own.
+                let resized = request.old_width != Some(request.width)
+                    || request.old_height != Some(request.height);
+                let flags = if resized {
+                    SWP_NOACTIVATE
+                        | SWP_NOZORDER
+                        | windows::Win32::UI::WindowsAndMessaging::SWP_NOCOPYBITS
+                } else {
+                    SWP_NOACTIVATE | SWP_NOZORDER
+                };
                 batch = DeferWindowPos(
                     batch,
                     request.hwnd,
@@ -129,7 +215,7 @@ unsafe fn publish_layout_batch() {
                     request.y,
                     request.width,
                     request.height,
-                    SWP_NOACTIVATE | SWP_NOZORDER,
+                    flags,
                 )?;
             }
             EndDeferWindowPos(batch)
@@ -139,29 +225,37 @@ unsafe fn publish_layout_batch() {
             // Replaying the final desired rectangles is safe even if EndDeferWindowPos itself
             // returned an indeterminate error because these operations are idempotent.
             for request in &group {
-                let _ = Win32MoveWindow(
-                    request.hwnd,
-                    request.x,
-                    request.y,
-                    request.width,
-                    request.height,
-                    false,
-                );
-                invalidate_resized_layout_child(*request);
+                move_without_stale_pixels(*request);
             }
         }
     }
     for request in ungrouped {
-        let _ = Win32MoveWindow(
-            request.hwnd,
-            request.x,
-            request.y,
-            request.width,
-            request.height,
-            false,
-        );
-        invalidate_resized_layout_child(request);
+        move_without_stale_pixels(request);
     }
+    for (list, frame, width, height, dpi) in framed_lists {
+        let _ = RemovePropW(list, LIST_VIEW_INTERNAL_LAYOUT_PROPERTY);
+        update_list_view_frame_region(frame, width, height, dpi);
+    }
+    let pending = AFTER_LAYOUT_COMMIT.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
+    for work in pending {
+        work();
+    }
+    drop(commit);
+    super::redraw::flush_deferred_frame_paints();
+}
+
+/// Moves a layout child and repaints it completely (no copied pixels), together with the part of
+/// the parent it uncovers.
+unsafe fn move_without_stale_pixels(request: LayoutRequest) {
+    let _ = SetWindowPos(
+        request.hwnd,
+        HWND::default(),
+        request.x,
+        request.y,
+        request.width,
+        request.height,
+        SWP_NOACTIVATE | SWP_NOZORDER | windows::Win32::UI::WindowsAndMessaging::SWP_NOCOPYBITS,
+    );
 }
 
 unsafe fn invalidate_resized_layout_child(request: LayoutRequest) {
@@ -185,13 +279,18 @@ pub(crate) unsafe fn move_layout_window(
 ) -> windows::core::Result<()> {
     // Preserve the ordinary MoveWindow contract for dialog and one-shot call sites that
     // explicitly request an immediate repaint. Live layout always passes `false`.
-    if repaint {
-        return Win32MoveWindow(hwnd, x, y, width, height, true);
-    }
+
     let mut before = RECT::default();
     let had_geometry = GetWindowRect(hwnd, &mut before).is_ok();
     let old_width = had_geometry.then_some(before.right.saturating_sub(before.left));
     let old_height = had_geometry.then_some(before.bottom.saturating_sub(before.top));
+    // A drop-down combo is laid out with its list height, but its window always keeps the closed
+    // field height. Requesting the list height every time made every combo resize itself twice
+    // on every layout pass (and every resize step) although nothing changed.
+    let height = match old_height {
+        Some(current) if current > 0 && is_drop_down_combo(hwnd) => current,
+        _ => height,
+    };
     let old_position = if had_geometry {
         let parent = GetParent(hwnd).ok();
         let mut point = POINT {
@@ -206,6 +305,11 @@ pub(crate) unsafe fn move_layout_window(
     };
     if old_position == Some((x, y)) && old_width == Some(width) && old_height == Some(height) {
         return Ok(());
+    }
+    // Callers that ask for an immediate repaint still get it, but only when the geometry changes:
+    // re-sending an unchanged rectangle repainted every control on every layout pass.
+    if repaint {
+        return Win32MoveWindow(hwnd, x, y, width, height, true);
     }
     let queued = LAYOUT_REQUESTS.with(|cell| {
         let mut state = cell.borrow_mut();
@@ -233,7 +337,15 @@ pub(crate) unsafe fn move_layout_window(
     if queued {
         return Ok(());
     }
-    Win32MoveWindow(hwnd, x, y, width, height, false)?;
+    SetWindowPos(
+        hwnd,
+        HWND::default(),
+        x,
+        y,
+        width,
+        height,
+        SWP_NOACTIVATE | SWP_NOZORDER | windows::Win32::UI::WindowsAndMessaging::SWP_NOCOPYBITS,
+    )?;
     invalidate_resized_layout_child(LayoutRequest {
         hwnd,
         x,
@@ -581,10 +693,11 @@ unsafe fn draw_button_surface(
     visual: ButtonSurfaceVisual,
     context: ButtonRenderContext,
 ) {
-    fill_round_rect_antialiased(
+    fill_round_rect_antialiased_with_border(
         dc,
         rect,
         context.metrics.corner_radius,
+        1,
         visual.fill,
         visual.border,
         context.background,
@@ -633,7 +746,23 @@ pub(crate) unsafe fn draw_composited_native_text(
     flags: DRAW_TEXT_FORMAT,
     color: COLORREF,
 ) -> bool {
-    let theme = OpenThemeData(HWND::default(), w!("WINDOW"));
+    // Opening theme data is far more expensive than drawing one caption, and every owner-drawn
+    // button asked for it on each paint. The handle only supplies the text renderer (colour comes
+    // from DTT_TEXTCOLOR, font from the DC), so one handle serves the whole session.
+    thread_local! {
+        static WINDOW_TEXT_THEME: std::cell::Cell<Option<windows::Win32::UI::Controls::HTHEME>> =
+            const { std::cell::Cell::new(None) };
+    }
+    let theme = WINDOW_TEXT_THEME.with(|cell| match cell.get() {
+        Some(theme) => theme,
+        None => {
+            let theme = OpenThemeData(HWND::default(), w!("WINDOW"));
+            if !theme.is_invalid() {
+                cell.set(Some(theme));
+            }
+            theme
+        }
+    });
     if theme.is_invalid() {
         return false;
     }
@@ -643,9 +772,103 @@ pub(crate) unsafe fn draw_composited_native_text(
         crText: color,
         ..Default::default()
     };
-    let drawn = DrawThemeTextEx(theme, dc, 0, 0, text, flags, rect, Some(&options)).is_ok();
-    let _ = CloseThemeData(theme);
-    drawn
+    DrawThemeTextEx(theme, dc, 0, 0, text, flags, rect, Some(&options)).is_ok()
+}
+
+struct BlendSurface {
+    dc: HDC,
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    previous: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    bits: *mut u8,
+    width: i32,
+    height: i32,
+}
+
+thread_local! {
+    static BLEND_SURFACE: RefCell<Option<BlendSurface>> = const { RefCell::new(None) };
+}
+
+/// Glyphs (check marks, radio dots, chevrons, list check boxes) are blended many times per paint.
+/// Each blend used to create and destroy a memory DC and a DIB section; one grow-only surface is
+/// reused instead. GdiFlush first: an AlphaBlend from the previous glyph may still be queued in
+/// the GDI batch and must read the old pixels.
+unsafe fn alpha_blend_through_cached_surface(
+    dc: HDC,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    pixels: &[u8],
+) -> Option<bool> {
+    const MAX_EXTENT: i32 = 512;
+    if width > MAX_EXTENT || height > MAX_EXTENT {
+        return None;
+    }
+    BLEND_SURFACE.with(|cell| {
+        let mut slot = cell.try_borrow_mut().ok()?;
+        if slot
+            .as_ref()
+            .map_or(true, |surface| surface.width < width || surface.height < height)
+        {
+            let (grow_width, grow_height) = slot
+                .as_ref()
+                .map_or((0, 0), |surface| (surface.width, surface.height));
+            if let Some(old) = slot.take() {
+                let _ = SelectObject(old.dc, old.previous);
+                let _ = DeleteObject(old.bitmap);
+                let _ = DeleteDC(old.dc);
+            }
+            let surface_width = width.max(grow_width).max(64);
+            let surface_height = height.max(grow_height).max(64);
+            let surface_dc = CreateCompatibleDC(HDC::default());
+            if surface_dc.is_invalid() {
+                return None;
+            }
+            let info = top_down_bgra_bitmap_info(surface_width, surface_height);
+            let mut bits = std::ptr::null_mut::<c_void>();
+            let bitmap = match CreateDIBSection(
+                surface_dc,
+                &info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                HANDLE::default(),
+                0,
+            ) {
+                Ok(bitmap) if !bitmap.is_invalid() && !bits.is_null() => bitmap,
+                _ => {
+                    let _ = DeleteDC(surface_dc);
+                    return None;
+                }
+            };
+            let previous = SelectObject(surface_dc, bitmap);
+            *slot = Some(BlendSurface {
+                dc: surface_dc,
+                bitmap,
+                previous,
+                bits: bits.cast(),
+                width: surface_width,
+                height: surface_height,
+            });
+        }
+        let surface = slot.as_ref()?;
+        let _ = GdiFlush();
+        let row_bytes = width as usize * 4;
+        let stride = surface.width as usize * 4;
+        for row in 0..height as usize {
+            std::ptr::copy_nonoverlapping(
+                pixels.as_ptr().add(row * row_bytes),
+                surface.bits.add(row * stride),
+                row_bytes,
+            );
+        }
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        Some(AlphaBlend(dc, x, y, width, height, surface.dc, 0, 0, width, height, blend).as_bool())
+    })
 }
 
 /// Publishes an already premultiplied top-down BGRA surface over a classic child-window DC.
@@ -660,6 +883,9 @@ pub(crate) unsafe fn alpha_blend_premultiplied_bgra(
 ) -> bool {
     if width <= 0 || height <= 0 || pixels.len() != width as usize * height as usize * 4 {
         return false;
+    }
+    if let Some(done) = alpha_blend_through_cached_surface(dc, x, y, width, height, pixels) {
+        return done;
     }
     let buffer_dc = CreateCompatibleDC(dc);
     if buffer_dc.is_invalid() {
@@ -1198,26 +1424,111 @@ pub(crate) unsafe fn fill_round_rect_antialiased(
     border: COLORREF,
     background: COLORREF,
 ) {
-    if !try_fill_round_rect_antialiased(dc, rect, radius, fill, border, background) {
-        fill_round_rect(dc, rect, radius, fill, border);
-    }
+    fill_round_rect_antialiased_with_border(dc, rect, radius, 1, fill, border, background);
 }
 
-unsafe fn try_fill_round_rect_antialiased(
+/// Same surface with an explicit outline width in device pixels. Buttons and navigation items
+/// use the field outline width (one logical pixel, scaled), so their edges are exactly as thick
+/// as the rounded frame of combo boxes and text fields at every DPI.
+pub(crate) unsafe fn fill_round_rect_antialiased_with_border(
     dc: HDC,
     rect: RECT,
     radius: i32,
+    border_width: i32,
     fill: COLORREF,
     border: COLORREF,
     background: COLORREF,
-) -> bool {
-    try_fill_round_rect_opaque_gdi(dc, rect, radius, fill, border, background)
+) {
+    if !try_fill_round_rect_opaque_gdi(dc, rect, radius, border_width.max(1), fill, border, background)
+    {
+        fill_round_rect(dc, rect, radius, fill, border);
+    }
 }
 
 unsafe fn try_fill_round_rect_opaque_gdi(
     dc: HDC,
     rect: RECT,
     radius: i32,
+    border_width: i32,
+    fill: COLORREF,
+    border: COLORREF,
+    background: COLORREF,
+) -> bool {
+    let width = (rect.right - rect.left).max(0);
+    let height = (rect.bottom - rect.top).max(0);
+    if width == 0 || height == 0 {
+        return false;
+    }
+    let key = RoundRectKey {
+        width,
+        height,
+        radius,
+        border_width,
+        fill: fill.0,
+        border: border.0,
+        background: background.0,
+    };
+    if live_resize_active() && !round_rect_is_cached(key) {
+        fill_round_rect_fast(dc, rect, radius, border_width, fill, border, background);
+        return true;
+    }
+    if let Some(done) = blit_cached_round_rect(dc, rect.left, rect.top, key) {
+        return done;
+    }
+    render_round_rect_supersampled(dc, rect, radius, border_width, fill, border, background)
+}
+
+thread_local! {
+    static LIVE_RESIZE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Set while a window of this thread is inside its move/size loop. Controls that stretch with the
+/// window (the tool grid, full-width buttons) get a new size on every step; their surfaces are then
+/// drawn with the fast analytic painter instead of being supersampled and cached for sizes that
+/// are gone a moment later. The final repaint after the drag uses the exact renderer again.
+pub(crate) fn set_live_resize(active: bool) {
+    LIVE_RESIZE.with(|flag| flag.set(active));
+}
+
+pub(crate) fn live_resize_active() -> bool {
+    LIVE_RESIZE.with(|flag| flag.get())
+}
+
+/// Antialiased rounded surface in O(radius^2): one solid fill, straight 1 px outline edges and four
+/// corner patches from the cached coverage table (the same algorithm as every field frame).
+unsafe fn fill_round_rect_fast(
+    dc: HDC,
+    rect: RECT,
+    radius: i32,
+    border_width: i32,
+    fill: COLORREF,
+    border: COLORREF,
+    background: COLORREF,
+) {
+    let width = (rect.right - rect.left).max(0);
+    let height = (rect.bottom - rect.top).max(0);
+    let radius = radius.max(1).min((width / 2).max(1)).min((height / 2).max(1));
+    fill_solid_rect(dc, &rect, fill);
+    draw_antialiased_control_frame(
+        dc,
+        rect,
+        RoundedControlFrameGeometry {
+            radius,
+            arc_band: radius,
+            side_band: border_width.max(1),
+        },
+        fill,
+        border,
+        background,
+    );
+}
+
+/// The original renderer: a 4x supersampled GDI RoundRect reduced with HALFTONE StretchBlt.
+unsafe fn render_round_rect_supersampled(
+    dc: HDC,
+    rect: RECT,
+    radius: i32,
+    border_width: i32,
     fill: COLORREF,
     border: COLORREF,
     background: COLORREF,
@@ -1234,11 +1545,17 @@ unsafe fn try_fill_round_rect_opaque_gdi(
     if memory_dc.is_invalid() {
         return false;
     }
-    let bitmap = CreateCompatibleBitmap(dc, high_width, high_height);
-    if bitmap.is_invalid() {
-        let _ = DeleteDC(memory_dc);
-        return false;
-    }
+    // A 32-bit DIB rather than CreateCompatibleBitmap: the caller's DC may itself be a memory DC,
+    // whose "compatible" bitmap would be monochrome.
+    let info = top_down_bgra_bitmap_info(high_width, high_height);
+    let mut bits = std::ptr::null_mut::<c_void>();
+    let bitmap = match CreateDIBSection(memory_dc, &info, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0) {
+        Ok(bitmap) if !bitmap.is_invalid() => bitmap,
+        _ => {
+            let _ = DeleteDC(memory_dc);
+            return false;
+        }
+    };
     let old_bitmap = SelectObject(memory_dc, bitmap);
     let high_rect = RECT {
         left: 0,
@@ -1246,10 +1563,16 @@ unsafe fn try_fill_round_rect_opaque_gdi(
         right: high_width,
         bottom: high_height,
     };
-    let background_brush = CreateSolidBrush(background);
-    let _ = FillRect(memory_dc, &high_rect, background_brush);
-    let _ = DeleteObject(background_brush);
-    draw_high_resolution_round_rect(memory_dc, high_rect, radius, fill, border, SCALE);
+    fill_solid_rect(memory_dc, &high_rect, background);
+    draw_high_resolution_round_rect(
+        memory_dc,
+        high_rect,
+        radius,
+        fill,
+        border,
+        SCALE,
+        border_width.max(1),
+    );
     let _ = SetStretchBltMode(dc, HALFTONE);
     let copied = StretchBlt(
         dc,
@@ -1271,6 +1594,159 @@ unsafe fn try_fill_round_rect_opaque_gdi(
     copied
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RoundRectKey {
+    width: i32,
+    height: i32,
+    radius: i32,
+    border_width: i32,
+    fill: u32,
+    border: u32,
+    background: u32,
+}
+
+struct CachedRoundRect {
+    key: RoundRectKey,
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    last_use: u64,
+}
+
+struct RoundRectCache {
+    dc: HDC,
+    default_bitmap: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    entries: Vec<CachedRoundRect>,
+    clock: u64,
+}
+
+thread_local! {
+    static ROUND_RECT_CACHE: RefCell<Option<RoundRectCache>> = const { RefCell::new(None) };
+}
+
+/// Buttons, navigation items and cards are drawn from a handful of sizes and colour states.
+const ROUND_RECT_CACHE_ENTRIES: usize = 64;
+/// Very large surfaces are rendered directly instead of being kept (about 2 MB at most each).
+const ROUND_RECT_CACHE_MAX_PIXELS: i64 = 512 * 1024;
+
+/// Every owner-drawn button, navigation item and card renders its antialiased rounded surface
+/// at four times its size and shrinks it with a HALFTONE StretchBlt, about 2 ms per control on
+/// the logged machine. That was most of the paint time of a page switch (12 to 30 controls) and
+/// of every live-resize step. The result depends only on size, radius and colours, so it is
+/// rendered once per combination and afterwards copied with a plain BitBlt, pixel for pixel
+/// identical to the first rendering. Pure GDI, no GPU involved.
+unsafe fn blit_cached_round_rect(dc: HDC, x: i32, y: i32, key: RoundRectKey) -> Option<bool> {
+    if i64::from(key.width) * i64::from(key.height) > ROUND_RECT_CACHE_MAX_PIXELS {
+        return None;
+    }
+    ROUND_RECT_CACHE.with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            return None;
+        };
+        if slot.is_none() {
+            let cache_dc = CreateCompatibleDC(HDC::default());
+            if cache_dc.is_invalid() {
+                return None;
+            }
+            // Remember the DC's stock bitmap so cached bitmaps can always be deselected.
+            let placeholder = CreateCompatibleBitmap(cache_dc, 1, 1);
+            if placeholder.is_invalid() {
+                let _ = DeleteDC(cache_dc);
+                return None;
+            }
+            let default_bitmap = SelectObject(cache_dc, placeholder);
+            let _ = SelectObject(cache_dc, default_bitmap);
+            let _ = DeleteObject(placeholder);
+            *slot = Some(RoundRectCache {
+                dc: cache_dc,
+                default_bitmap,
+                entries: Vec::new(),
+                clock: 0,
+            });
+        }
+        let cache = slot.as_mut()?;
+        cache.clock += 1;
+        let clock = cache.clock;
+        let index = match cache.entries.iter().position(|entry| entry.key == key) {
+            Some(index) => index,
+            None => {
+                let bitmap = render_round_rect_bitmap(key)?;
+                if cache.entries.len() >= ROUND_RECT_CACHE_ENTRIES {
+                    if let Some((oldest, _)) = cache
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, entry)| entry.last_use)
+                    {
+                        let evicted = cache.entries.swap_remove(oldest);
+                        let _ = DeleteObject(evicted.bitmap);
+                    }
+                }
+                cache.entries.push(CachedRoundRect {
+                    key,
+                    bitmap,
+                    last_use: clock,
+                });
+                cache.entries.len() - 1
+            }
+        };
+        cache.entries[index].last_use = clock;
+        let previous = SelectObject(cache.dc, cache.entries[index].bitmap);
+        let copied = BitBlt(dc, x, y, key.width, key.height, cache.dc, 0, 0, SRCCOPY).is_ok();
+        let _ = SelectObject(cache.dc, previous);
+        let _ = SelectObject(cache.dc, cache.default_bitmap);
+        Some(copied)
+    })
+}
+
+fn round_rect_is_cached(key: RoundRectKey) -> bool {
+    ROUND_RECT_CACHE.with(|cell| {
+        cell.try_borrow().is_ok_and(|slot| {
+            slot.as_ref()
+                .is_some_and(|cache| cache.entries.iter().any(|entry| entry.key == key))
+        })
+    })
+}
+
+/// Renders one surface with the original supersampled renderer into its own 32-bit bitmap.
+unsafe fn render_round_rect_bitmap(key: RoundRectKey) -> Option<windows::Win32::Graphics::Gdi::HBITMAP> {
+    let render_dc = CreateCompatibleDC(HDC::default());
+    if render_dc.is_invalid() {
+        return None;
+    }
+    let info = top_down_bgra_bitmap_info(key.width, key.height);
+    let mut bits = std::ptr::null_mut::<c_void>();
+    let bitmap = match CreateDIBSection(render_dc, &info, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0) {
+        Ok(bitmap) if !bitmap.is_invalid() => bitmap,
+        _ => {
+            let _ = DeleteDC(render_dc);
+            return None;
+        }
+    };
+    let previous = SelectObject(render_dc, bitmap);
+    let rendered = render_round_rect_supersampled(
+        render_dc,
+        RECT {
+            left: 0,
+            top: 0,
+            right: key.width,
+            bottom: key.height,
+        },
+        key.radius,
+        key.border_width,
+        COLORREF(key.fill),
+        COLORREF(key.border),
+        COLORREF(key.background),
+    );
+    let _ = GdiFlush();
+    let _ = SelectObject(render_dc, previous);
+    let _ = DeleteDC(render_dc);
+    if rendered {
+        Some(bitmap)
+    } else {
+        let _ = DeleteObject(bitmap);
+        None
+    }
+}
+
 unsafe fn draw_high_resolution_round_rect(
     dc: HDC,
     rect: RECT,
@@ -1278,12 +1754,14 @@ unsafe fn draw_high_resolution_round_rect(
     fill: COLORREF,
     border: COLORREF,
     scale: i32,
+    border_width: i32,
 ) {
     let brush = CreateSolidBrush(fill);
-    let pen = CreatePen(PEN_STYLE(0), scale, border);
+    let pen_width = scale * border_width.max(1);
+    let pen = CreatePen(PEN_STYLE(0), pen_width, border);
     let old_brush = SelectObject(dc, brush);
     let old_pen = SelectObject(dc, pen);
-    let pen_inset = scale / 2;
+    let pen_inset = pen_width / 2;
     let diameter = radius.max(0).saturating_mul(2).saturating_mul(scale);
     let _ = RoundRect(
         dc,
@@ -1441,12 +1919,23 @@ unsafe fn draw_antialiased_control_frame_impl(
         border,
     );
 
-    for (origin_x, origin_y, flip_x, flip_y) in [
-        (rect.left, rect.top, false, false),
-        (rect.right - radius, rect.top, true, false),
-        (rect.left, rect.bottom - radius, false, true),
-        (rect.right - radius, rect.bottom - radius, true, true),
-    ] {
+    let corners = [
+        ((rect.left, rect.top), (false, false)),
+        ((rect.right - radius, rect.top), (true, false)),
+        ((rect.left, rect.bottom - radius), (false, true)),
+        ((rect.right - radius, rect.bottom - radius), (true, true)),
+    ];
+    if paint_antialiased_frame_corners_blended(
+        dc,
+        (radius, side),
+        &corners,
+        vertical_interiors,
+        border,
+        exterior,
+    ) {
+        return;
+    }
+    for ((origin_x, origin_y), (flip_x, flip_y)) in corners {
         let interior = vertical_frame_corner_interior(vertical_interiors, (flip_x, flip_y));
         paint_antialiased_frame_corner(
             dc,
@@ -1458,6 +1947,207 @@ unsafe fn draw_antialiased_control_frame_impl(
             exterior,
         );
     }
+}
+
+/// Supersampled coverage (inner, outer) of every pixel of one unflipped frame corner. The frame
+/// geometry depends only on DPI, so each (radius, border) pair is computed once per session.
+fn frame_corner_coverage(radius: i32, border_width: i32) -> std::rc::Rc<Vec<(u32, u32)>> {
+    thread_local! {
+        static COVERAGE: RefCell<Vec<((i32, i32), std::rc::Rc<Vec<(u32, u32)>>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+    const SAMPLES: i32 = 8;
+    let key = (radius, border_width);
+    if let Some(found) = COVERAGE.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(candidate, _)| *candidate == key)
+            .map(|(_, coverage)| coverage.clone())
+    }) {
+        return found;
+    }
+    let outer_radius = radius as f64;
+    let inner_radius = (radius - border_width.max(1)).max(0) as f64;
+    let mut coverage = Vec::with_capacity((radius.max(0) * radius.max(0)) as usize);
+    for y in 0..radius {
+        for x in 0..radius {
+            let mut outer = 0u32;
+            let mut inner = 0u32;
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    let px = x as f64 + (sx as f64 + 0.5) / SAMPLES as f64;
+                    let py = y as f64 + (sy as f64 + 0.5) / SAMPLES as f64;
+                    let dx = outer_radius - px;
+                    let dy = outer_radius - py;
+                    let distance = dx * dx + dy * dy;
+                    outer += u32::from(distance <= outer_radius * outer_radius);
+                    inner += u32::from(distance <= inner_radius * inner_radius);
+                }
+            }
+            coverage.push((inner, outer));
+        }
+    }
+    let coverage = std::rc::Rc::new(coverage);
+    COVERAGE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 16 {
+            cache.clear();
+        }
+        cache.push((key, coverage.clone()));
+    });
+    coverage
+}
+
+struct CornerPatchSurface {
+    dc: HDC,
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    previous: windows::Win32::Graphics::Gdi::HGDIOBJ,
+    bits: *mut u8,
+    width: i32,
+    height: i32,
+}
+
+thread_local! {
+    static CORNER_PATCH_SURFACE: RefCell<Option<CornerPatchSurface>> = const { RefCell::new(None) };
+}
+
+/// Draws the four antialiased corners with four AlphaBlend calls from one cached premultiplied
+/// patch. Pixels that must keep the underlying content (fully interior samples) have alpha 0 and
+/// every other pixel alpha 255, so each screen pixel is written exactly once with its final
+/// colour, exactly as the per-pixel path did, but without one GDI call per pixel.
+unsafe fn paint_antialiased_frame_corners_blended(
+    dc: HDC,
+    geometry: (i32, i32),
+    corners: &[((i32, i32), (bool, bool)); 4],
+    vertical_interiors: (COLORREF, COLORREF),
+    border: COLORREF,
+    exterior: CornerExterior,
+) -> bool {
+    const SAMPLE_COUNT: u32 = 64;
+    let (radius, border_width) = geometry;
+    if radius <= 0 {
+        return true;
+    }
+    let coverage = frame_corner_coverage(radius, border_width);
+    if coverage.len() != (radius * radius) as usize {
+        return false;
+    }
+    CORNER_PATCH_SURFACE.with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            return false;
+        };
+        let needed_width = radius * 4;
+        if slot
+            .as_ref()
+            .map_or(true, |surface| surface.width < needed_width || surface.height < radius)
+        {
+            if let Some(old) = slot.take() {
+                let _ = SelectObject(old.dc, old.previous);
+                let _ = DeleteObject(old.bitmap);
+                let _ = DeleteDC(old.dc);
+            }
+            let width = needed_width.max(64);
+            let height = radius.max(16);
+            let patch_dc = CreateCompatibleDC(HDC::default());
+            if patch_dc.is_invalid() {
+                return false;
+            }
+            let info = top_down_bgra_bitmap_info(width, height);
+            let mut bits = std::ptr::null_mut::<c_void>();
+            let Ok(bitmap) = CreateDIBSection(
+                patch_dc,
+                &info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                HANDLE::default(),
+                0,
+            ) else {
+                let _ = DeleteDC(patch_dc);
+                return false;
+            };
+            if bitmap.is_invalid() || bits.is_null() {
+                let _ = DeleteDC(patch_dc);
+                return false;
+            }
+            let previous = SelectObject(patch_dc, bitmap);
+            *slot = Some(CornerPatchSurface {
+                dc: patch_dc,
+                bitmap,
+                previous,
+                bits: bits.cast(),
+                width,
+                height,
+            });
+        }
+        let Some(surface) = slot.as_ref() else {
+            return false;
+        };
+        // A previous AlphaBlend from this patch may still be queued in the GDI batch.
+        let _ = GdiFlush();
+        let stride = surface.width as usize * 4;
+        for (corner_index, (_, flip)) in corners.iter().enumerate() {
+            let interior = vertical_frame_corner_interior(vertical_interiors, *flip);
+            for y in 0..radius {
+                for x in 0..radius {
+                    let (inner, outer) = coverage[(y * radius + x) as usize];
+                    let patch_x = corner_index as i32 * radius
+                        + if flip.0 { radius - 1 - x } else { x };
+                    let patch_y = if flip.1 { radius - 1 - y } else { y };
+                    let pixel = surface
+                        .bits
+                        .add(patch_y as usize * stride + patch_x as usize * 4);
+                    match deterministic_corner_color(
+                        interior,
+                        border,
+                        exterior,
+                        inner,
+                        outer,
+                        SAMPLE_COUNT,
+                    ) {
+                        Some(color) => {
+                            *pixel = ((color.0 >> 16) & 0xff) as u8;
+                            *pixel.add(1) = ((color.0 >> 8) & 0xff) as u8;
+                            *pixel.add(2) = (color.0 & 0xff) as u8;
+                            *pixel.add(3) = 255;
+                        }
+                        None => {
+                            *pixel = 0;
+                            *pixel.add(1) = 0;
+                            *pixel.add(2) = 0;
+                            *pixel.add(3) = 0;
+                        }
+                    }
+                }
+            }
+        }
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        for (corner_index, ((origin_x, origin_y), _)) in corners.iter().enumerate() {
+            if !AlphaBlend(
+                dc,
+                *origin_x,
+                *origin_y,
+                radius,
+                radius,
+                surface.dc,
+                corner_index as i32 * radius,
+                0,
+                radius,
+                radius,
+                blend,
+            )
+            .as_bool()
+            {
+                return false;
+            }
+        }
+        true
+    })
 }
 
 fn vertical_frame_corner_interior(
@@ -1600,7 +2290,28 @@ unsafe fn stroke_round_rect(dc: HDC, rect: RECT, radius: i32, color: COLORREF) {
     let _ = DeleteObject(pen);
 }
 
+/// Solid fill without a per-call brush object: ExtTextOut(ETO_OPAQUE) fills with the DC
+/// background colour (the classic GDI FillSolidRect). Falls back to a brush if GDI refuses.
 unsafe fn fill_solid_rect(dc: HDC, rect: &RECT, color: COLORREF) {
+    const CLR_INVALID_VALUE: u32 = 0xffff_ffff;
+    let previous = SetBkColor(dc, color);
+    if previous.0 != CLR_INVALID_VALUE {
+        let filled = windows::Win32::Graphics::Gdi::ExtTextOutW(
+            dc,
+            0,
+            0,
+            windows::Win32::Graphics::Gdi::ETO_OPAQUE,
+            Some(rect as *const RECT),
+            PCWSTR::null(),
+            0,
+            None,
+        )
+        .as_bool();
+        let _ = SetBkColor(dc, previous);
+        if filled {
+            return;
+        }
+    }
     let brush = CreateSolidBrush(color);
     let _ = FillRect(dc, rect, brush);
     let _ = DeleteObject(brush);
@@ -1652,6 +2363,9 @@ pub unsafe fn child(
         HINSTANCE::default(),
         None,
     )?;
+    if class_name_is_static(class_name) {
+        super::theme::install_static_text_subclass(hwnd);
+    }
     if is_edit {
         const ES_MULTILINE: u32 = 0x0004;
         if style as u32 & ES_MULTILINE == 0 {
@@ -1663,7 +2377,14 @@ pub unsafe fn child(
             // control centred inside whatever row height the responsive page requests.
             center_single_line_edit_in_row(hwnd);
         } else {
-            let _ = SetWindowTheme(hwnd, w!("Explorer"), PCWSTR::null());
+            // Start in the theme family of the current palette: created as "Explorer" in dark
+            // mode, the edit drew a light scrollbar until the page theme reached it.
+            let class = if super::theme::last_palette_dark() {
+                w!("DarkMode_Explorer")
+            } else {
+                w!("Explorer")
+            };
+            let _ = SetWindowTheme(hwnd, class, PCWSTR::null());
         }
     }
     // The fixed Inno reference declares TNewComboBox as a plain TComboBox. Keep USER32's normal
@@ -1758,6 +2479,17 @@ pub(crate) unsafe fn ensure_list_view_frame(list: HWND) -> Option<HWND> {
     )
     .ok()?;
     let _ = SetWindowTheme(frame, w!(""), w!(""));
+    // The frame sibling sits above the report. Without WS_CLIPSIBLINGS every report paint wrote
+    // over the frame ring, which then had to be republished after each paint (a visible flicker of
+    // the edge while hovering rows). Clipping siblings keeps the report inside the ring.
+    let list_style = GetWindowLongPtrW(list, GWL_STYLE);
+    if list_style & WS_CLIPSIBLINGS.0 as isize == 0 {
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+            list,
+            GWL_STYLE,
+            list_style | WS_CLIPSIBLINGS.0 as isize,
+        );
+    }
     if SetPropW(list, LIST_VIEW_FRAME_PROPERTY, HANDLE(frame.0)).is_err()
         || SetPropW(frame, LIST_VIEW_OWNER_PROPERTY, HANDLE(list.0)).is_err()
     {
@@ -1813,7 +2545,36 @@ unsafe fn raise_list_view_frame(frame: HWND) {
     );
 }
 
+thread_local! {
+    static FRAME_REGION_SIZES: std::cell::RefCell<Vec<(isize, i32, i32, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 unsafe fn update_list_view_frame_region(frame: HWND, width: i32, height: i32, dpi: u32) {
+    // A pure move keeps the same ring; rebuilding and re-setting it made every move of a report
+    // pay for a region change and the redraw that comes with it.
+    let key = frame.0 as isize;
+    let unchanged = FRAME_REGION_SIZES.with(|sizes| {
+        let mut sizes = sizes.borrow_mut();
+        if let Some(entry) = sizes.iter_mut().find(|entry| entry.0 == key) {
+            if (entry.1, entry.2, entry.3) == (width, height, dpi) {
+                return true;
+            }
+            *entry = (key, width, height, dpi);
+        } else {
+            if sizes.len() >= 256 {
+                sizes.remove(0);
+            }
+            sizes.push((key, width, height, dpi));
+        }
+        false
+    });
+    if unchanged {
+        let mut box_rect = RECT::default();
+        if windows::Win32::Graphics::Gdi::GetWindowRgnBox(frame, &mut box_rect).0 != 0 {
+            return;
+        }
+    }
     let Some(geometry) = list_view_frame_region_geometry(width, height, dpi) else {
         let _ = SetWindowRgn(frame, None, true);
         return;
@@ -1937,6 +2698,42 @@ struct SingleLineEditInnerBounds {
     height: i32,
 }
 
+/// The edit window is a square child sitting inside the rounded frame sibling. When the frame is
+/// only a little taller than the text, the edit's corners reached into the frame's corner arcs and
+/// covered part of the rounded outline. Pull the edit in horizontally until each corner lies
+/// inside the arc's inner radius (with one pixel of antialiasing margin).
+fn keep_clear_of_frame_arcs(
+    inner: &mut SingleLineEditInnerBounds,
+    outer_width: i32,
+    outer_height: i32,
+    dpi: u32,
+) {
+    let Some(geometry) = rounded_control_frame_geometry(outer_width, outer_height, dpi) else {
+        return;
+    };
+    let radius = geometry.radius;
+    let border = geometry.side_band.max(1);
+    let gap = inner
+        .y
+        .min(outer_height - (inner.y + inner.height))
+        .max(0);
+    if gap >= radius {
+        return;
+    }
+    let safe = radius - border - 1;
+    let distance = radius - gap;
+    let needed = if safe > 0 && distance <= safe {
+        radius - (f64::from(safe * safe - distance * distance)).sqrt().floor() as i32
+    } else {
+        radius
+    };
+    if needed > inner.x {
+        let extra = needed - inner.x;
+        inner.x = needed;
+        inner.width = (inner.width - extra * 2).max(0);
+    }
+}
+
 fn single_line_edit_inner_bounds(
     outer_width: i32,
     outer_height: i32,
@@ -1982,12 +2779,17 @@ unsafe fn single_line_edit_font_height(edit: HWND, dpi: u32) -> i32 {
     }
 }
 
-unsafe fn set_single_line_edit_margins(edit: HWND, dpi: u32) {
+/// The text starts 6 logical pixels inside the frame's outer edge, whatever the edit window's own
+/// inset is. A fixed 4 px margin on top of the arc clearance (`keep_clear_of_frame_arcs`) left a
+/// wide empty strip before the text.
+unsafe fn set_single_line_edit_margins(edit: HWND, dpi: u32, inner_x: i32) {
     const EM_SETMARGINS: u32 = 0x00d3;
     const EC_LEFTMARGIN: usize = 0x0001;
     const EC_RIGHTMARGIN: usize = 0x0002;
-    let margin = ((4i64 * i64::from(dpi.max(1)) + 48) / 96).clamp(1, i64::from(u16::MAX)) as u16;
-    let packed = u32::from(margin) | (u32::from(margin) << 16);
+    let scaled = |value: i64| ((value * i64::from(dpi.max(1)) + 48) / 96) as i32;
+    let left = (scaled(6) - inner_x.max(0)).clamp(1, i32::from(u16::MAX)) as u16;
+    let right = (scaled(6) - inner_x.max(0)).clamp(1, i32::from(u16::MAX)) as u16;
+    let packed = u32::from(left) | (u32::from(right) << 16);
     let _ = SendMessageW(
         edit,
         EM_SETMARGINS,
@@ -2106,6 +2908,8 @@ unsafe extern "system" fn list_view_layout_proc(
     _subclass_id: usize,
     _reference_data: usize,
 ) -> LRESULT {
+    let _profile = (message == WM_WINDOWPOSCHANGING)
+        .then(|| super::redraw::profile_scope("列表外框跟随移动"));
     match message {
         WM_WINDOWPOSCHANGING
             if lparam.0 != 0 && GetPropW(hwnd, LIST_VIEW_INTERNAL_LAYOUT_PROPERTY).is_invalid() =>
@@ -2134,7 +2938,15 @@ unsafe extern "system" fn list_view_layout_proc(
                     position.cy
                 };
                 let inner = list_view_inner_bounds(width, height, GetDpiForWindow(hwnd).max(96));
-                let _ = SetWindowPos(frame, HWND_TOP, x, y, width, height, SWP_NOACTIVATE);
+                let _ = SetWindowPos(
+                    frame,
+                    HWND_TOP,
+                    x,
+                    y,
+                    width,
+                    height,
+                    SWP_NOACTIVATE | windows::Win32::UI::WindowsAndMessaging::SWP_NOCOPYBITS,
+                );
                 update_list_view_frame_region(frame, width, height, GetDpiForWindow(hwnd).max(96));
                 if !position.flags.contains(SWP_NOMOVE) {
                     position.x = x + inner.x;
@@ -2208,13 +3020,14 @@ unsafe fn layout_single_line_edit(edit: HWND, outer: RECT) {
     let height = (outer.bottom - outer.top).max(0);
     let dpi = GetDpiForWindow(edit).max(96);
     let inset = ((i64::from(dpi) + 48) / 96) as i32;
-    let inner = single_line_edit_inner_bounds(
+    let mut inner = single_line_edit_inner_bounds(
         width,
         height,
         single_line_edit_font_height(edit, dpi),
         inset.max(1),
     );
-    set_single_line_edit_margins(edit, dpi);
+    keep_clear_of_frame_arcs(&mut inner, width, height, dpi);
+    set_single_line_edit_margins(edit, dpi, inner.x);
     let _ = SetWindowPos(
         frame,
         edit,
@@ -2252,6 +3065,8 @@ unsafe extern "system" fn single_line_edit_layout_proc(
     _subclass_id: usize,
     _reference_data: usize,
 ) -> LRESULT {
+    let _profile = (message == WM_WINDOWPOSCHANGING)
+        .then(|| super::redraw::profile_scope("单行编辑框外框跟随移动"));
     match message {
         WM_WINDOWPOSCHANGING
             if lparam.0 != 0
@@ -2287,13 +3102,14 @@ unsafe extern "system" fn single_line_edit_layout_proc(
                 if width > 0 && height > 0 {
                     let dpi = GetDpiForWindow(hwnd).max(96);
                     let inset = ((i64::from(dpi) + 48) / 96) as i32;
-                    let inner = single_line_edit_inner_bounds(
+                    let mut inner = single_line_edit_inner_bounds(
                         width,
                         height,
                         single_line_edit_font_height(hwnd, dpi),
                         inset.max(1),
                     );
-                    set_single_line_edit_margins(hwnd, dpi);
+                    keep_clear_of_frame_arcs(&mut inner, width, height, dpi);
+                    set_single_line_edit_margins(hwnd, dpi, inner.x);
                     let _ = SetWindowPos(
                         frame,
                         hwnd,
@@ -2301,7 +3117,7 @@ unsafe extern "system" fn single_line_edit_layout_proc(
                         outer.top,
                         width,
                         height,
-                        SWP_NOACTIVATE,
+                        SWP_NOACTIVATE | windows::Win32::UI::WindowsAndMessaging::SWP_NOCOPYBITS,
                     );
                     if !position.flags.contains(SWP_NOMOVE) {
                         position.x = outer.left + inner.x;
@@ -2484,12 +3300,15 @@ fn child_styles(is_edit: bool, _is_combo: bool, style: i32) -> (WINDOW_EX_STYLE,
         // Single-line fields share the deterministic Win11 frame used by ComboBox. A second
         // WS_BORDER/CLIENTEDGE would expose a square host-theme frame around it.
         const ES_MULTILINE: u32 = 0x0004;
+        // No Edit is ever created with WS_BORDER. A multi-line report used to get it here: USER32
+        // keeps a creation-time WS_BORDER in the Edit's own state, removes the style bit and then
+        // draws a one-pixel box inside the text area on every paint. No later style change can
+        // remove it, which was the square box inside the rounded frame. The rounded frame band is
+        // the only outline of multi-line fields.
+        control_style &= !WS_BORDER.0;
         if style as u32 & ES_MULTILINE == 0 {
             const WS_EX_NOPARENTNOTIFY_VALUE: u32 = 0x0000_0004;
-            control_style &= !WS_BORDER.0;
             extended_style |= WINDOW_EX_STYLE(WS_EX_NOPARENTNOTIFY_VALUE);
-        } else {
-            control_style |= WS_BORDER.0;
         }
     }
     (extended_style, WINDOW_STYLE(control_style))
@@ -2624,7 +3443,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_uses_shared_single_line_frame_but_keeps_multiline_report_border() {
+    fn edits_are_never_created_with_a_border_style() {
         const WS_EX_CLIENTEDGE_VALUE: u32 = 0x0000_0200;
         let (single_ex, single) = child_styles(true, false, 0);
         assert_eq!(single_ex.0 & WS_EX_CLIENTEDGE_VALUE, 0);
@@ -2635,7 +3454,9 @@ mod tests {
         let (extended, style) = child_styles(true, false, incoming);
 
         assert_eq!(extended.0 & WS_EX_CLIENTEDGE_VALUE, 0);
-        assert_ne!(style.0 & WS_BORDER.0, 0);
+        assert_eq!(style.0 & WS_BORDER.0, 0);
+        let (_, bordered) = child_styles(true, false, 0x0004 | WS_BORDER.0 as i32);
+        assert_eq!(bordered.0 & WS_BORDER.0, 0);
         assert_eq!(
             style.0 & PASSWORD_READONLY_MULTILINE,
             PASSWORD_READONLY_MULTILINE

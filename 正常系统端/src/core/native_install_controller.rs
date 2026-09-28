@@ -96,6 +96,7 @@ pub enum InstallValidationError {
     MissingImage,
     ImageNotReady,
     MissingImageVolume,
+    ImageOnTargetVolumeInPe,
     UnsupportedImageArchitecture,
     MissingTargetPartition,
     UnstableTargetIdentity,
@@ -134,6 +135,9 @@ impl std::fmt::Display for InstallValidationError {
             Self::MissingImage => crate::tr!("请选择系统镜像。"),
             Self::ImageNotReady => crate::tr!("系统镜像仍在读取，请稍候。"),
             Self::MissingImageVolume => crate::tr!("请选择要安装的镜像卷。"),
+            Self::ImageOnTargetVolumeInPe => crate::tr!(
+                "在 PE 环境中，系统镜像不能位于即将重装的目标分区；请将镜像放到其它分区、U 盘或网络位置。"
+            ),
             Self::UnsupportedImageArchitecture => crate::tr!("仅支持 x86 或 x64 系统镜像。"),
             Self::MissingTargetPartition => crate::tr!("请选择安装目标分区。"),
             Self::UnstableTargetIdentity => {
@@ -192,7 +196,7 @@ impl std::fmt::Display for InstallValidationError {
                 crate::tr!("XP 文本模式安装需要 Legacy/MBR 目标。")
             }
             Self::ViaPeUnsupportedAdvancedInputs => crate::tr!(
-                "当前 PE 交接格式不能安全传递 Wi-Fi、部署脚本、首次登录脚本、自定义驱动、注册表或自定义文件；请关闭这些选项后重试。"
+                "当前 PE 交接格式不能安全传递部署脚本、首次登录脚本、注册表或自定义文件；请关闭这些选项后重试。"
             ),
             Self::InvalidCustomInstallPlan => crate::tr!("全盘重装或双系统计划无效，请重新选择。"),
             Self::CustomInstallRequiresPe => crate::tr!("全盘重装和双系统必须从完整 Windows 进入受认证 PE 执行。"),
@@ -282,24 +286,50 @@ impl NativeInstallState {
             .target
             .as_ref()
             .ok_or(InstallValidationError::MissingTargetPartition)?;
-        let target_disk_number = target
-            .disk_number
-            .ok_or(InstallValidationError::UnstableTargetIdentity)?;
-        let target_partition_number = target
-            .partition_number
-            .ok_or(InstallValidationError::UnstableTargetIdentity)?;
-        let target_disk_size_bytes = target
-            .disk_size_bytes
-            .ok_or(InstallValidationError::UnstableTargetIdentity)?;
-        let target_partition_offset_bytes = target
-            .partition_offset_bytes
-            .ok_or(InstallValidationError::UnstableTargetIdentity)?;
-        let target_partition_size_bytes = target
-            .partition_size_bytes
-            .ok_or(InstallValidationError::UnstableTargetIdentity)?;
+        if self.is_pe_environment {
+            let image_letter =
+                lr_core::windows_storage::path_drive_letter(std::path::Path::new(&image_path));
+            let target_letter = lr_core::windows_storage::path_drive_letter(std::path::Path::new(
+                &target.partition,
+            ));
+            if image_letter
+                .zip(target_letter)
+                .is_some_and(|(image, target)| image.eq_ignore_ascii_case(&target))
+            {
+                return Err(InstallValidationError::ImageOnTargetVolumeInPe);
+            }
+        }
+        // Only the exact volume extent is mandatory. Filter drivers (hardware-ID spoofers) can
+        // hide the physical disk's capacity, number and partition index; those are diagnostics
+        // or have volume-level equivalents and must not block the installation.
         let target_stable_identity = target
             .stable_identity
             .ok_or(InstallValidationError::UnstableTargetIdentity)?;
+        let target_disk_number = target
+            .disk_number
+            .unwrap_or(target_stable_identity.extent.disk_number);
+        let target_partition_number = target.partition_number.unwrap_or(0);
+        let target_disk_size_bytes = target.disk_size_bytes.unwrap_or(0);
+        let target_partition_offset_bytes = target
+            .partition_offset_bytes
+            .unwrap_or(target_stable_identity.extent.offset_bytes);
+        let target_partition_size_bytes = target
+            .partition_size_bytes
+            .unwrap_or(target_stable_identity.extent.extent_length_bytes);
+        if target.disk_number.is_none()
+            || target.partition_number.is_none()
+            || target.disk_size_bytes.is_none()
+            || target.partition_offset_bytes.is_none()
+            || target.partition_size_bytes.is_none()
+        {
+            log::warn!(
+                "[INSTALL TARGET] {} 的部分磁盘信息不可用（disk={:?} partition={:?} disk_size={:?}），按卷的精确物理范围继续",
+                target.partition,
+                target.disk_number,
+                target.partition_number,
+                target.disk_size_bytes
+            );
+        }
         let is_xp_i386 = self.xp_i386_source.is_some();
         let is_gho = has_extension(&self.image_path, &["gho", "ghs"]);
         let required_online_cleanup = self.prefs.advanced_options.remove_uwp_apps
@@ -470,17 +500,8 @@ impl NativeInstallState {
         if mode == InstallMode::ViaPe && !self.pe_available {
             return Err(InstallValidationError::PeUnavailable);
         }
-        if mode == InstallMode::ViaPe {
-            let advanced = &self.prefs.advanced_options;
-            if advanced.run_script_during_deploy
-                || advanced.run_script_first_login
-                || advanced.import_custom_drivers
-                || advanced.import_registry_file
-                || advanced.import_custom_files
-            {
-                return Err(InstallValidationError::ViaPeUnsupportedAdvancedInputs);
-            }
-        }
+        // Deploy scripts, first-logon scripts, registry files, custom files and custom drivers all
+        // travel through the authenticated user-driver tree; PE applies each one best-effort.
 
         let volume_index = self
             .selected_image
@@ -650,10 +671,19 @@ impl StartInstallIntent {
             // Only the production staging backend may upgrade this after matching an internal
             // byte-identity receipt to the manifest identities held under the same file lock.
             source_image_verified: false,
+            image_chunked: false,
+            image_chunked_length: 0,
+            image_chunked_sha256: String::new(),
+            image_expanded_bytes: 0,
+            in_place_target_staging: false,
             is_gho: self.is_gho,
             migrate_wifi: false,
             wifi_profile_length: 0,
             wifi_profile_sha256: String::new(),
+            pe_network_enabled: crate::core::app_config::AppConfig::load().pe_network_enabled(),
+            automatic_feedback_mode: crate::core::app_config::AppConfig::load()
+                .automatic_feedback_mode()
+                .to_owned(),
             remove_shortcut_arrow: advanced.remove_shortcut_arrow,
             restore_classic_context_menu: advanced.restore_classic_context_menu,
             bypass_nro: advanced.bypass_nro,
@@ -830,6 +860,27 @@ mod tests {
     }
 
     #[test]
+    fn pe_rejects_image_on_selected_target_volume() {
+        let mut state = base_state();
+        state.is_pe_environment = true;
+        state.image_path = r"C:\sources\install.wim".into();
+        state.target.as_mut().unwrap().partition = "C:".into();
+        assert_eq!(
+            state.start_intent().unwrap_err(),
+            InstallValidationError::ImageOnTargetVolumeInPe
+        );
+    }
+
+    #[test]
+    fn normal_windows_allows_image_on_target_volume_for_direct_install() {
+        let mut state = base_state();
+        state.is_pe_environment = false;
+        state.image_path = r"C:\sources\install.wim".into();
+        state.target.as_mut().unwrap().partition = "C:".into();
+        assert!(state.start_intent().is_ok());
+    }
+
+    #[test]
     fn non_system_target_is_direct() {
         let intent = base_state().start_intent().unwrap();
         assert_eq!(intent.mode, InstallMode::Direct);
@@ -913,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn via_pe_rejects_options_that_the_handoff_cannot_preserve() {
+    fn via_pe_carries_advanced_inputs_through_the_handoff() {
         let mut state = base_state();
         let target = state.target.as_mut().unwrap();
         target.is_current_system = true;
@@ -922,10 +973,10 @@ mod tests {
         state.prefs.advanced_options.import_registry_file = true;
         state.prefs.advanced_options.registry_file_path = r"D:\settings.reg".into();
 
-        assert_eq!(
-            state.start_intent().unwrap_err(),
-            InstallValidationError::ViaPeUnsupportedAdvancedInputs
-        );
+        assert!(!matches!(
+            state.start_intent(),
+            Err(InstallValidationError::ViaPeUnsupportedAdvancedInputs)
+        ));
 
         state.prefs.advanced_options.import_registry_file = false;
         state.prefs.driver_action = DriverAction::SaveOnly;
@@ -1181,35 +1232,28 @@ mod tests {
     }
 
     #[test]
-    fn install_intent_requires_a_stable_disk_and_partition_identity() {
+    fn install_intent_requires_only_the_exact_volume_extent() {
         let mut state = base_state();
         let stable_identity = state.target.as_ref().unwrap().stable_identity;
-        state.target.as_mut().unwrap().disk_number = None;
-        assert_eq!(
-            state.start_intent().unwrap_err(),
-            InstallValidationError::UnstableTargetIdentity
-        );
-
-        state.target.as_mut().unwrap().disk_number = Some(1);
         state.target.as_mut().unwrap().stable_identity = None;
         assert_eq!(
             state.start_intent().unwrap_err(),
             InstallValidationError::UnstableTargetIdentity
         );
 
+        // Restricted storage stacks can hide these; the volume extent replaces them.
         state.target.as_mut().unwrap().stable_identity = stable_identity;
+        state.target.as_mut().unwrap().disk_number = None;
         state.target.as_mut().unwrap().partition_number = None;
-        assert_eq!(
-            state.start_intent().unwrap_err(),
-            InstallValidationError::UnstableTargetIdentity
-        );
-
-        state.target.as_mut().unwrap().partition_number = Some(2);
+        state.target.as_mut().unwrap().disk_size_bytes = None;
         state.target.as_mut().unwrap().partition_offset_bytes = None;
-        assert_eq!(
-            state.start_intent().unwrap_err(),
-            InstallValidationError::UnstableTargetIdentity
-        );
+        state.target.as_mut().unwrap().partition_size_bytes = None;
+        let intent = state.start_intent().unwrap();
+        let extent = stable_identity.unwrap().extent;
+        assert_eq!(intent.target_disk_number, extent.disk_number);
+        assert_eq!(intent.target_partition_offset_bytes, extent.offset_bytes);
+        assert_eq!(intent.target_partition_size_bytes, extent.extent_length_bytes);
+        assert_eq!(intent.target_disk_size_bytes, 0);
     }
 
     #[test]

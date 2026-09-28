@@ -106,7 +106,7 @@ impl NativeDriverTransferDialog {
         let dpi = GetDpiForWindow(shell.hwnd()).max(96);
         let face = wide("Microsoft YaHei");
         let font = CreateFontW(
-            -scale(14, dpi),
+            -scale(12, dpi),
             0,
             0,
             0,
@@ -578,11 +578,8 @@ unsafe fn is_checked(control: HWND) -> bool {
 }
 
 unsafe fn set_text(control: HWND, value: &str) {
-    let value = wide(value);
-    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
-        control,
-        windows::core::PCWSTR(value.as_ptr()),
-    );
+    // Only changed text is sent, so a progress refresh never repaints an unchanged label.
+    crate::native_ui::redraw::set_window_text_if_changed(control, value);
 }
 
 unsafe fn get_text(control: HWND) -> String {

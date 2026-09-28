@@ -11,7 +11,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateFontW, DeleteObject, HFONT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowTextLengthW, GetWindowTextW, MoveWindow, SendMessageW, SetWindowTextW,
+    GetClientRect, GetWindowTextLengthW, GetWindowTextW, MoveWindow, SendMessageW,
     BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL,
     CB_RESETCONTENT, CB_SETCURSEL, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_PASSWORD,
     ES_READONLY, LBS_EXTENDEDSEL, LBS_NOINTEGRALHEIGHT, LB_ADDSTRING, LB_GETSELCOUNT,
@@ -419,7 +419,7 @@ impl NativeMutatingToolDialog {
         let dpi = GetDpiForWindow(shell.hwnd()).max(96);
         let face = wide("Microsoft YaHei");
         let font = CreateFontW(
-            -scale(14, dpi),
+            -scale(12, dpi),
             0,
             0,
             0,
@@ -1388,13 +1388,12 @@ unsafe fn create_controls(
 ) -> windows::core::Result<MutatingControls> {
     let (first, second, option) = control_labels(kind);
     let model = control_model(kind);
-    let edit = ES_AUTOHSCROLL | WS_BORDER.0 as i32 | WS_TABSTOP.0 as i32;
-    let report_style = ES_MULTILINE
-        | ES_AUTOVSCROLL
-        | ES_READONLY
-        | WS_BORDER.0 as i32
-        | WS_VSCROLL.0 as i32
-        | WS_TABSTOP.0 as i32;
+    // No WS_BORDER on an Edit: USER32 turns it into an internal "flat border" flag at creation,
+    // removes the style bit and then draws that border inside the text area on every paint. It can
+    // never be taken away afterwards, which left a square box inside the rounded frame.
+    let edit = ES_AUTOHSCROLL | WS_TABSTOP.0 as i32;
+    let report_style =
+        ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL.0 as i32 | WS_TABSTOP.0 as i32;
     let controls = MutatingControls {
         first_label: child(parent, w!("STATIC"), &crate::tr!(first), 0, control_id(0))?,
         first_input: create_input(parent, model.first, edit, control_id(1))?,
@@ -1473,11 +1472,7 @@ unsafe fn create_items_control(
             parent,
             w!("EDIT"),
             "",
-            ES_MULTILINE
-                | ES_AUTOVSCROLL
-                | WS_BORDER.0 as i32
-                | WS_VSCROLL.0 as i32
-                | WS_TABSTOP.0 as i32,
+            ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL.0 as i32 | WS_TABSTOP.0 as i32,
             id,
         )
     } else {
@@ -1541,8 +1536,8 @@ unsafe fn move_control(control: HWND, rect: LogicalRect) {
 
 unsafe fn set_text(control: HWND, value: &str) {
     if !control.is_invalid() {
-        let value = wide(value);
-        let _ = SetWindowTextW(control, PCWSTR(value.as_ptr()));
+        // Only changed text is sent; the tool timer refreshes these labels every 100 ms.
+        crate::native_ui::redraw::set_window_text_if_changed(control, value);
     }
 }
 

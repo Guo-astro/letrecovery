@@ -64,7 +64,10 @@ pub struct PartitionDetail {
 struct PartitionGeometry {
     disk_number: u32,
     partition_number: u32,
+    // Only the (test-only) physical adjacency check reads the extent.
+    #[cfg_attr(not(test), allow(dead_code))]
     starting_offset: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     partition_length: u64,
 }
 
@@ -101,10 +104,19 @@ fn collect_canonical_candidate_snapshots<F>(
 where
     F: FnMut(u32) -> Result<lr_core::windows_storage::DiskLayoutSnapshot>,
 {
-    disk_numbers?
-        .into_iter()
-        .map(|disk_number| snapshot(disk_number).map(|layout| (disk_number, layout)))
-        .collect()
+    // A complete inventory failure still propagates. One unreadable disk (RAW disk without a
+    // device identifier, offline media, a filtered stack) can never match the authenticated
+    // target, so it is skipped instead of failing the whole handoff.
+    let mut candidates = Vec::new();
+    for disk_number in disk_numbers? {
+        match snapshot(disk_number) {
+            Ok(layout) => candidates.push((disk_number, layout)),
+            Err(error) => log::warn!(
+                "[HANDOFF] disk {disk_number} skipped for canonical target matching: {error:#}"
+            ),
+        }
+    }
+    Ok(candidates)
 }
 
 pub struct DiskManager;
@@ -682,7 +694,36 @@ impl DiskManager {
             _ => {}
         }
         let detail = Self::get_partition_style(target_partition);
+        if matches!(detail.style, PartitionStyle::MBR) && Self::mbr_target_boots_uefi(target_partition)
+        {
+            log::info!(
+                "[BOOT] 自动模式：目标 MBR 磁盘带有 EFI 系统分区且当前为 UEFI 启动，使用 UEFI"
+            );
+            return Ok(true);
+        }
         Self::resolve_install_uefi_mode_with(boot_mode, detail.style, Self::detect_uefi_mode)
+    }
+
+    /// UEFI firmware can boot an MBR disk through an EFI system partition (type 0xEF). UEFI is
+    /// chosen for an MBR target only when PE itself was started by UEFI firmware and such a
+    /// partition exists: UEFI-only firmware (no CSM) cannot start a Legacy boot sector at all.
+    fn mbr_target_boots_uefi(target_partition: &str) -> bool {
+        if !matches!(Self::detect_uefi_mode(), Ok(true)) {
+            return false;
+        }
+        let Some(letter) = target_partition.trim_end_matches([':', '\\']).chars().next() else {
+            return false;
+        };
+        let Ok(target) = lr_core::windows_storage::volume_identity(letter) else {
+            return false;
+        };
+        lr_core::windows_storage::partitions(target.disk_number)
+            .map(|partitions| {
+                partitions.iter().any(|partition| {
+                    partition.kind == lr_core::windows_storage::PartitionKind::EfiSystem
+                })
+            })
+            .unwrap_or(false)
     }
 
     fn resolve_install_uefi_mode_with<F>(
@@ -833,6 +874,7 @@ mod tests {
     fn canonical_snapshot() -> lr_core::windows_storage::DiskLayoutSnapshot {
         lr_core::windows_storage::DiskLayoutSnapshot {
             disk_size_bytes: 10_000_000,
+            disk_size_estimated: false,
             disk: lr_core::windows_storage::StableDiskIdentity::Gpt { disk_id: [1; 16] },
             device_id_hash: Some([2; 32]),
             partitions: vec![lr_core::windows_storage::DiskLayoutPartitionSnapshot {

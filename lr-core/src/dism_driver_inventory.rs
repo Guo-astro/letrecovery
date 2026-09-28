@@ -619,6 +619,7 @@ mod windows_impl {
     // DismApi.h wraps DISM's returned structures in #pragma pack(push, 1). Keep these private ABI
     // mirrors packed and read every field with read_unaligned; never create a reference to a field.
     #[repr(C, packed(1))]
+    #[allow(dead_code)] // ABI layout mirror: every field keeps the native offsets even if unread.
     struct DismSystemTime {
         year: u16,
         month: u16,
@@ -631,6 +632,7 @@ mod windows_impl {
     }
 
     #[repr(C, packed(1))]
+    #[allow(dead_code)] // ABI layout mirror: every field keeps the native offsets even if unread.
     struct DismDriverPackage {
         published_name: *const u16,
         original_file_name: *const u16,
@@ -650,6 +652,7 @@ mod windows_impl {
     }
 
     #[repr(C, packed(1))]
+    #[allow(dead_code)] // ABI layout mirror: every field keeps the native offsets even if unread.
     struct DismDriver {
         manufacturer_name: *const u16,
         hardware_description: *const u16,

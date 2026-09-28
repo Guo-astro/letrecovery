@@ -64,7 +64,15 @@ pub(crate) fn execute_expand_workflow(
             false,
         )
     } else {
-        crate::core::expand_move::expand_c_drive(letter, &config, &data_partition, expected_target)
+        crate::core::expand_move::expand_c_drive(
+            letter,
+            &config,
+            &data_partition,
+            expected_target,
+            &|status: String, progress: u8| {
+                let _ = tx.send(WorkerMessage::SetProgressStatus { progress, status });
+            },
+        )
     };
     match expand_result {
         Ok(message) => {

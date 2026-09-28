@@ -20,7 +20,7 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, MoveWindow, SendMessageW, SetWindowTextW, ShowWindow, BS_OWNERDRAW, SW_HIDE,
+    GetClientRect, MoveWindow, SendMessageW, ShowWindow, BS_OWNERDRAW, SW_HIDE,
     SW_SHOW, WM_SETFONT, WS_BORDER, WS_TABSTOP,
 };
 
@@ -250,7 +250,7 @@ impl NativeBatchFormatDialog {
         let dpi = GetDpiForWindow(shell.hwnd()).max(96);
         let face = wide("Microsoft YaHei");
         let font = CreateFontW(
-            -scale(14, dpi),
+            -scale(12, dpi),
             0,
             0,
             0,
@@ -746,12 +746,11 @@ fn batch_format_column_widths(width: i32, dpi: u32) -> [i32; 5] {
 }
 
 fn format_size(value_mb: u64) -> String {
-    format!("{:.1} GB", value_mb as f64 / 1024.0)
+    crate::native_ui::layout::format_capacity_mb(value_mb)
 }
 
 unsafe fn set_text(control: HWND, text: &str) {
-    let text = wide(text);
-    let _ = SetWindowTextW(control, PCWSTR(text.as_ptr()));
+    crate::native_ui::redraw::set_window_text_if_changed(control, text);
 }
 
 fn scale(value: i32, dpi: u32) -> i32 {

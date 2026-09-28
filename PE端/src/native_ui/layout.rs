@@ -209,6 +209,7 @@ pub(crate) struct CommandBarGeometry {
     pub back: Option<PixelRect>,
     pub details: Option<PixelRect>,
     pub close: PixelRect,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub footer: Option<PixelRect>,
 }
 

@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
     CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
-    IntersectClipRect, InvalidateRect, MapWindowPoints, RestoreDC, SaveDC, SelectClipRgn,
+    IntersectClipRect, InvalidateRect, RestoreDC, SaveDC, SelectClipRgn,
     SelectObject, SetBkMode, SetTextColor, SetWindowRgn, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX,
     DT_SINGLELINE, DT_VCENTER, HFONT, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
@@ -33,7 +33,7 @@ use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindow
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, EnumThreadWindows, GetClassNameW, GetClientRect,
     GetParent, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, MoveWindow, PostMessageW,
-    SendMessageW, SetMenuInfo, SetWindowTextW, ShowWindow, TrackPopupMenu, BM_SETCHECK,
+    SendMessageW, SetMenuInfo, ShowWindow, TrackPopupMenu, BM_SETCHECK,
     BS_AUTORADIOBUTTON, BS_OWNERDRAW, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL,
     CB_RESETCONTENT, CB_SETCURSEL, ES_AUTOHSCROLL, MENUINFO, MF_GRAYED, MF_OWNERDRAW, MF_POPUP,
     MIM_BACKGROUND, SW_HIDE, SW_SHOW, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CAPTURECHANGED,
@@ -462,7 +462,7 @@ impl NativeQuickPartitionDialog {
         let dpi = GetDpiForWindow(shell.hwnd()).max(96);
         let face = wide("Microsoft YaHei");
         let font = CreateFontW(
-            -scale(14, dpi),
+            -scale(12, dpi),
             0,
             0,
             0,
@@ -1191,62 +1191,22 @@ impl NativeQuickPartitionDialog {
         }
     }
 
-    unsafe fn layout_apply_button(&self, dpi: u32) {
-        let Some(refresh) = self.shell.command_button(DialogResult::Secondary) else {
-            return;
-        };
-        let Some(primary) = self.shell.command_button(DialogResult::Primary) else {
-            return;
-        };
-        let mut refresh_rect = RECT::default();
-        let mut primary_rect = RECT::default();
-        let _ = GetWindowRect(refresh, &mut refresh_rect);
-        let _ = GetWindowRect(primary, &mut primary_rect);
-        let mut points = [
-            POINT {
-                x: refresh_rect.left,
-                y: refresh_rect.top,
-            },
-            POINT {
-                x: refresh_rect.right,
-                y: refresh_rect.bottom,
-            },
-        ];
-        let _ = MapWindowPoints(HWND::default(), self.shell.hwnd(), &mut points);
-        let mut primary_points = [
-            POINT {
-                x: primary_rect.left,
-                y: primary_rect.top,
-            },
-            POINT {
-                x: primary_rect.right,
-                y: primary_rect.bottom,
-            },
-        ];
-        let _ = MapWindowPoints(HWND::default(), self.shell.hwnd(), &mut primary_points);
-        let gap = LayoutMetrics::for_dpi(dpi).control_gap;
-        let width = measured_button_width(
-            self.shell.hwnd(),
-            self.font,
-            &window_text(self.controls.apply_pending),
-            dpi,
-            scale(68, dpi),
-        );
-        let refresh_width = (points[1].x - points[0].x).max(1);
-        let height = (points[1].y - points[0].y).max(1);
-        let apply_x = primary_points[0].x - gap - width;
-        let refresh_x = apply_x - gap - refresh_width;
-        move_control(refresh, refresh_x, points[0].y, refresh_width, height);
-        move_control(
-            self.controls.apply_pending,
-            apply_x,
-            points[0].y,
-            width,
-            height,
-        );
+    unsafe fn layout_apply_button(&self, _dpi: u32) {
+        // The dialog lays "Apply changes" out with its own command buttons.
+        self.shell.set_extra_command_buttons(&[self.controls.apply_pending]);
     }
 
+    /// Every interaction re-renders the whole editor. Publish it as one frame: while the content
+    /// is frozen the disk list, partition rows, map, buttons and layout change together instead of
+    /// flashing through each intermediate state.
     unsafe fn render_state(&mut self) {
+        let content = self.shell.content();
+        let redraw = crate::native_ui::redraw::suspend(content);
+        self.render_state_frozen();
+        crate::native_ui::redraw::resume(content, redraw);
+    }
+
+    unsafe fn render_state_frozen(&mut self) {
         refill_disks(
             self.controls.disk,
             &self.state.disks,
@@ -1775,6 +1735,9 @@ unsafe extern "system" fn partition_map_proc(
                 model.committed_resize = None;
                 model.committed_transfer = None;
                 model.drag = Some(drag);
+                // While a divider is dragged every segment changes size on each mouse move; draw
+                // the rounded segments with the fast painter until the drag ends.
+                crate::native_ui::controls::set_live_resize(true);
                 let _ = SetCapture(hwnd);
                 let _ = InvalidateRect(hwnd, None, false);
                 return LRESULT(0);
@@ -1809,6 +1772,7 @@ unsafe extern "system" fn partition_map_proc(
         }
         WM_LBUTTONUP => {
             if let Some(drag) = model.drag.take() {
+                crate::native_ui::controls::set_live_resize(false);
                 if GetCapture() == hwnd {
                     let _ = ReleaseCapture();
                 }
@@ -1851,6 +1815,7 @@ unsafe extern "system" fn partition_map_proc(
         }
         WM_CAPTURECHANGED => {
             if model.drag.take().is_some() {
+                crate::native_ui::controls::set_live_resize(false);
                 let _ = InvalidateRect(hwnd, None, false);
             }
             DefSubclassProc(hwnd, message, wparam, lparam)
@@ -2656,29 +2621,165 @@ unsafe fn insert_columns(list: HWND) {
     }
 }
 
+/// Refills the disk list only when its entries really changed; otherwise only the selection is
+/// updated. Clearing and refilling on every click blanked the closed field for a moment and
+/// redrew it in the system highlight colour.
 unsafe fn refill_disks(combo: HWND, disks: &[PhysicalDisk], selected: Option<u32>) {
-    let _ = SendMessageW(combo, CB_RESETCONTENT, WPARAM(0), LPARAM(0));
-    for disk in disks {
-        add_combo_item(combo, &disk.display_name());
-    }
+    const CB_GETCURSEL_MESSAGE: u32 = 0x0147;
+    let items = disks.iter().map(|disk| disk.display_name()).collect::<Vec<_>>();
     let index = selected
         .and_then(|number| disks.iter().position(|disk| disk.disk_number == number))
         .map_or(NO_COMBO_SELECTION, |index| index);
+    if combo_items_match(combo, &items) {
+        let expected = if index == NO_COMBO_SELECTION { -1 } else { index as isize };
+        if SendMessageW(combo, CB_GETCURSEL_MESSAGE, WPARAM(0), LPARAM(0)).0 != expected {
+            let _ = SendMessageW(combo, CB_SETCURSEL, WPARAM(index), LPARAM(0));
+        }
+        return;
+    }
+    let _ = SendMessageW(
+        combo,
+        windows::Win32::UI::WindowsAndMessaging::WM_SETREDRAW,
+        WPARAM(0),
+        LPARAM(0),
+    );
+    let _ = SendMessageW(combo, CB_RESETCONTENT, WPARAM(0), LPARAM(0));
+    for item in &items {
+        add_combo_item(combo, item);
+    }
     let _ = SendMessageW(combo, CB_SETCURSEL, WPARAM(index), LPARAM(0));
+    let _ = SendMessageW(
+        combo,
+        windows::Win32::UI::WindowsAndMessaging::WM_SETREDRAW,
+        WPARAM(1),
+        LPARAM(0),
+    );
+    let _ = InvalidateRect(combo, None, false);
 }
 
-unsafe fn refill_partitions(list: HWND, state: &QuickPartitionDialogState) {
-    let _ = SendMessageW(list, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
-    let mut row = 0;
-    if let Some(disk) = state.selected_disk() {
-        for partition in &disk.partitions {
-            insert_row(list, row, existing_columns(partition));
-            row += 1;
-        }
+unsafe fn combo_items_match(combo: HWND, items: &[String]) -> bool {
+    const CB_GETCOUNT_MESSAGE: u32 = 0x0146;
+    const CB_GETLBTEXT_MESSAGE: u32 = 0x0148;
+    const CB_GETLBTEXTLEN_MESSAGE: u32 = 0x0149;
+    if SendMessageW(combo, CB_GETCOUNT_MESSAGE, WPARAM(0), LPARAM(0)).0 != items.len() as isize {
+        return false;
     }
-    for layout in &state.planned {
-        insert_row(list, row, planned_columns(layout));
-        row += 1;
+    items.iter().enumerate().all(|(index, item)| {
+        let length = SendMessageW(combo, CB_GETLBTEXTLEN_MESSAGE, WPARAM(index), LPARAM(0)).0;
+        if length < 0 {
+            return false;
+        }
+        let mut buffer = vec![0_u16; length as usize + 1];
+        let copied = SendMessageW(
+            combo,
+            CB_GETLBTEXT_MESSAGE,
+            WPARAM(index),
+            LPARAM(buffer.as_mut_ptr() as isize),
+        )
+        .0;
+        copied >= 0 && String::from_utf16_lossy(&buffer[..copied as usize]) == *item
+    })
+}
+
+/// Whether the report already shows exactly these rows (all six columns).
+unsafe fn list_rows_match(list: HWND, rows: &[[String; 6]]) -> bool {
+    const LVM_GETITEMCOUNT_MESSAGE: u32 = 0x1004;
+    const LVM_GETITEMTEXTW_MESSAGE: u32 = 0x1073;
+    if SendMessageW(list, LVM_GETITEMCOUNT_MESSAGE, WPARAM(0), LPARAM(0)).0 != rows.len() as isize {
+        return false;
+    }
+    let mut buffer = vec![0_u16; 512];
+    rows.iter().enumerate().all(|(row, columns)| {
+        columns.iter().enumerate().all(|(column, expected)| {
+            let mut item = LVITEMW {
+                iSubItem: column as i32,
+                pszText: PWSTR(buffer.as_mut_ptr()),
+                cchTextMax: buffer.len() as i32,
+                ..Default::default()
+            };
+            let length = SendMessageW(
+                list,
+                LVM_GETITEMTEXTW_MESSAGE,
+                WPARAM(row),
+                LPARAM((&mut item as *mut LVITEMW) as isize),
+            )
+            .0
+            .clamp(0, buffer.len() as isize - 1) as usize;
+            String::from_utf16_lossy(&buffer[..length]) == *expected
+        })
+    })
+}
+
+/// Rebuilds the partition rows only when they changed, keeping the scroll position; clicking a
+/// row or dragging the map used to delete and re-insert every row, which flickered and jumped the
+/// list back to the top.
+unsafe fn refill_partitions(list: HWND, state: &QuickPartitionDialogState) {
+    const LVM_GETTOPINDEX_MESSAGE: u32 = 0x1027;
+    const LVM_ENSUREVISIBLE_MESSAGE: u32 = 0x1013;
+    const LVM_GETNEXTITEM_MESSAGE: u32 = 0x100c;
+    const LVNI_SELECTED_FLAG: isize = 0x0002;
+    let mut rows = Vec::new();
+    if let Some(disk) = state.selected_disk() {
+        rows.extend(disk.partitions.iter().map(existing_columns));
+    }
+    rows.extend(state.planned.iter().map(planned_columns));
+    let row_count = rows.len();
+    let desired = state.selected_row.map(|selected| match selected {
+        EditorRow::Existing(index) => index,
+        EditorRow::Planned(index) => {
+            state.selected_disk().map_or(0, |disk| disk.partitions.len()) + index
+        }
+    });
+    if list_rows_match(list, &rows) {
+        let current = SendMessageW(
+            list,
+            LVM_GETNEXTITEM_MESSAGE,
+            WPARAM(usize::MAX),
+            LPARAM(LVNI_SELECTED_FLAG),
+        )
+        .0;
+        if desired.map_or(-1, |index| index as isize) == current {
+            return;
+        }
+        let mut clear = LVITEMW {
+            stateMask: windows::Win32::UI::Controls::LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED),
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            list,
+            LVM_SETITEMSTATE,
+            WPARAM(usize::MAX),
+            LPARAM((&mut clear as *mut LVITEMW) as isize),
+        );
+    } else {
+        let top = SendMessageW(list, LVM_GETTOPINDEX_MESSAGE, WPARAM(0), LPARAM(0)).0.max(0);
+        let _ = SendMessageW(
+            list,
+            windows::Win32::UI::WindowsAndMessaging::WM_SETREDRAW,
+            WPARAM(0),
+            LPARAM(0),
+        );
+        let _ = SendMessageW(list, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
+        for (row, columns) in rows.into_iter().enumerate() {
+            insert_row(list, row as i32, columns);
+        }
+        if top > 0 && row_count > 0 {
+            // Scroll to the end, then back to the former first row, so it is on top again.
+            let _ = SendMessageW(list, LVM_ENSUREVISIBLE_MESSAGE, WPARAM(row_count - 1), LPARAM(0));
+            let _ = SendMessageW(
+                list,
+                LVM_ENSUREVISIBLE_MESSAGE,
+                WPARAM((top as usize).min(row_count - 1)),
+                LPARAM(0),
+            );
+        }
+        let _ = SendMessageW(
+            list,
+            windows::Win32::UI::WindowsAndMessaging::WM_SETREDRAW,
+            WPARAM(1),
+            LPARAM(0),
+        );
+        let _ = InvalidateRect(list, None, false);
     }
     if let Some(selected) = state.selected_row {
         let existing_count = state
@@ -2735,8 +2836,17 @@ fn existing_columns(partition: &DiskPartitionInfo) -> [String; 6] {
             partition.is_msr,
             partition.is_recovery,
         ),
-        format!("{:.1} GB", partition.size_gb()),
-        format!("{:.1} / {:.1} GB", partition.used_gb(), partition.free_gb()),
+        crate::native_ui::layout::format_capacity_gb(partition.size_gb()),
+        // No file system to report on (MSR, recovery, unformatted): unknown, not "0.0 / 0.0".
+        if partition.used_gb() <= 0.0 && partition.free_gb() <= 0.0 {
+            "—".to_owned()
+        } else {
+            format!(
+                "{} / {}",
+                crate::native_ui::layout::format_capacity_gb(partition.used_gb()),
+                crate::native_ui::layout::format_capacity_gb(partition.free_gb())
+            )
+        },
         display_value(&partition.label),
         display_value(&partition.file_system),
     ]
@@ -2746,8 +2856,8 @@ fn planned_columns(layout: &PartitionLayout) -> [String; 6] {
     [
         crate::tr!("新建"),
         partition_name(layout.drive_letter, layout.is_esp, false, false),
-        format!("{:.1} GB", layout.size_gb),
-        format!("0.0 / {:.1} GB", layout.size_gb),
+        crate::native_ui::layout::format_capacity_gb(layout.size_gb),
+        "—".to_owned(),
         display_value(&layout.label),
         display_value(&layout.file_system),
     ]
@@ -2813,8 +2923,7 @@ unsafe fn window_text(control: HWND) -> String {
 }
 
 unsafe fn set_text(control: HWND, text: &str) {
-    let text = wide(text);
-    let _ = SetWindowTextW(control, PCWSTR(text.as_ptr()));
+    crate::native_ui::redraw::set_window_text_if_changed(control, text);
 }
 
 unsafe fn move_control(control: HWND, x: i32, y: i32, width: i32, height: i32) {

@@ -93,8 +93,12 @@ pub fn detect_firmware_type() -> anyhow::Result<FirmwareType> {
     }
 
     unsafe {
-        if let Some(firmware_type) = detect_with_get_firmware_type()? {
-            return Ok(firmware_type);
+        match detect_with_get_firmware_type() {
+            Ok(Some(firmware_type)) => return Ok(firmware_type),
+            Ok(None) => {}
+            Err(error) => log::warn!(
+                "[FIRMWARE] GetFirmwareType did not return a usable result ({error:#}); trying the documented fallbacks"
+            ),
         }
     }
 
@@ -107,26 +111,46 @@ pub fn detect_firmware_type() -> anyhow::Result<FirmwareType> {
         .encode_utf16()
         .chain(Some(0))
         .collect();
-    unsafe {
-        let _privilege = enable_system_environment_privilege()?;
-        SetLastError(ERROR_SUCCESS);
-        let result = GetFirmwareEnvironmentVariableW(
-            PCWSTR(empty_name.as_ptr()),
-            PCWSTR(zero_guid.as_ptr()),
-            None,
-            0,
-        );
-        if result != 0 {
-            return Ok(FirmwareType::Uefi);
+    let probe = unsafe {
+        match enable_system_environment_privilege() {
+            Ok(_privilege) => {
+                SetLastError(ERROR_SUCCESS);
+                let result = GetFirmwareEnvironmentVariableW(
+                    PCWSTR(empty_name.as_ptr()),
+                    PCWSTR(zero_guid.as_ptr()),
+                    None,
+                    0,
+                );
+                let status = GetLastError();
+                if result != 0 {
+                    Ok(FirmwareType::Uefi)
+                } else if status == ERROR_INVALID_FUNCTION {
+                    Ok(FirmwareType::Bios)
+                } else if status == ERROR_SUCCESS {
+                    Err(anyhow::anyhow!(
+                        "firmware probe returned zero without a Win32 error"
+                    ))
+                } else {
+                    Ok(FirmwareType::Uefi)
+                }
+            }
+            Err(error) => Err(error),
         }
-        let status = GetLastError();
-        if status == ERROR_INVALID_FUNCTION {
-            return Ok(FirmwareType::Bios);
+    };
+    match probe {
+        Ok(firmware_type) => Ok(firmware_type),
+        Err(probe_error) => {
+            // WinPE and current Windows publish the boot firmware type here (1 = BIOS,
+            // 2 = UEFI). It is used only when both documented API probes were inconclusive,
+            // for example on systems whose token lacks SeSystemEnvironmentPrivilege.
+            match crate::registry::OfflineRegistry::query_dword_optional(
+                "HKLM\\SYSTEM\\CurrentControlSet\\Control",
+                "PEFirmwareType",
+            ) {
+                Ok(Some(raw)) => firmware_type_from_raw(raw).map_err(|_| probe_error),
+                _ => Err(probe_error),
+            }
         }
-        if status == ERROR_SUCCESS {
-            bail!("firmware probe returned zero without a Win32 error");
-        }
-        Ok(FirmwareType::Uefi)
     }
 }
 

@@ -552,9 +552,8 @@ fn execution_context(
     } else {
         match partition.bitlocker_status {
             VolumeStatus::EncryptedLocked => BitLockerRequirement::UnlockRequired,
-            VolumeStatus::Decrypting | VolumeStatus::EncryptedUnlocked => {
-                BitLockerRequirement::AwaitDecryption
-            }
+            VolumeStatus::Decrypting => BitLockerRequirement::AwaitDecryption,
+            VolumeStatus::EncryptedUnlocked => BitLockerRequirement::Ready,
             _ => BitLockerRequirement::Ready,
         }
     };

@@ -285,10 +285,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn atomic_publish(directory: &Path, name: &str, contents: &[u8]) -> Result<PathBuf> {
-    atomic_publish_with_acl(directory, name, contents, true)
-}
-
 fn atomic_publish_diagnostic(directory: &Path, name: &str, contents: &[u8]) -> Result<PathBuf> {
     atomic_publish_with_acl(directory, name, contents, false)
 }
@@ -597,7 +593,7 @@ pub fn copy_desktop_log_to_pe(
     session_id: &str,
 ) -> Result<PathBuf> {
     let contents = read_verified_staged_desktop_log(data_directory, session_id)?;
-    atomic_publish(
+    atomic_publish_diagnostic(
         pe_program_directory,
         &format!("NormalEndpoint.{session_id}.log"),
         &contents,

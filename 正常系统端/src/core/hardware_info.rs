@@ -801,8 +801,13 @@ fn get_memory_slot_count_wmi() -> u32 {
 
     for obj in result {
         if let Some(slots) = obj.get_u32("MemoryDevices") {
-            if slots > 0 {
+            // Spoofed or corrupt SMBIOS tables report values such as 37008; no board has more
+            // than a few dozen DIMM slots.
+            if slots > 0 && slots <= 128 {
                 return slots;
+            }
+            if slots > 128 {
+                log::warn!("[HARDWARE] SMBIOS 报告的内存插槽数 {slots} 不合理，改用实际内存条数量");
             }
         }
     }
@@ -1431,6 +1436,8 @@ impl HardwareInfo {
 
         // 使用 WMI 获取内存条详细信息
         mem_info.sticks = get_memory_sticks_wmi();
+        // Spoofed/corrupt SMBIOS entries show up as 0-byte modules with garbage text.
+        mem_info.sticks.retain(|stick| stick.capacity > 0);
 
         // 使用 WMI 获取内存插槽数
         mem_info.slot_count = get_memory_slot_count_wmi();

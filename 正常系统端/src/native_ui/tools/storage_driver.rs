@@ -10,7 +10,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateFontW, DeleteObject, HFONT};
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, MoveWindow, SendMessageW, SetWindowTextW, ShowWindow, CBS_DROPDOWNLIST,
+    GetClientRect, MoveWindow, SendMessageW, ShowWindow, CBS_DROPDOWNLIST,
     CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, SW_HIDE, SW_SHOW, WM_SETFONT,
     WS_TABSTOP,
 };
@@ -223,7 +223,7 @@ impl NativeStorageDriverDialog {
         let dpi = GetDpiForWindow(shell.hwnd()).max(96);
         let face = wide("Microsoft YaHei");
         let font = CreateFontW(
-            -scale(14, dpi),
+            -scale(12, dpi),
             0,
             0,
             0,
@@ -465,8 +465,7 @@ unsafe fn add_combo_item(combo: HWND, value: &str) {
 }
 
 unsafe fn set_text(control: HWND, text: &str) {
-    let text = wide(text);
-    let _ = SetWindowTextW(control, PCWSTR(text.as_ptr()));
+    crate::native_ui::redraw::set_window_text_if_changed(control, text);
 }
 
 fn scale(value: i32, dpi: u32) -> i32 {

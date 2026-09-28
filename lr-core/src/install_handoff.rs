@@ -67,6 +67,22 @@ impl CanonicalInstallTargetV2 {
     fn portable_layout_digest(snapshot: &DiskLayoutSnapshot) -> [u8; 32] {
         let mut portable = snapshot.clone();
         portable.device_id_hash = None;
+        if portable.disk_size_estimated {
+            // The normal endpoint could not read the exact capacity (filter drivers reject the
+            // capacity IOCTLs). WinPE sees the real value, so the capacity is left out.
+            portable.disk_size_bytes = 0;
+            portable.disk_size_estimated = false;
+        }
+        disk_layout_snapshot_digest(&portable)
+    }
+
+    /// Digest without capacity. A handoff written on a machine whose capacity query was rejected
+    /// carries this form; comparing both forms keeps exact-capacity handoffs unchanged.
+    fn size_agnostic_layout_digest(snapshot: &DiskLayoutSnapshot) -> [u8; 32] {
+        let mut portable = snapshot.clone();
+        portable.device_id_hash = None;
+        portable.disk_size_bytes = 0;
+        portable.disk_size_estimated = false;
         disk_layout_snapshot_digest(&portable)
     }
 
@@ -110,15 +126,16 @@ impl CanonicalInstallTargetV2 {
 
     pub fn matches_snapshot(&self, snapshot: &DiskLayoutSnapshot) -> bool {
         if self.partition_length_bytes == 0
-            || Self::portable_layout_digest(snapshot) != self.layout_digest
+            || (Self::portable_layout_digest(snapshot) != self.layout_digest
+                && Self::size_agnostic_layout_digest(snapshot) != self.layout_digest)
         {
             return false;
         }
-        if let (Some(expected), Some(actual)) = (self.device_id_hash, snapshot.device_id_hash) {
-            if expected != actual {
-                return false;
-            }
-        }
+        // The storage device identifier is deliberately not a hard gate here: hardware-ID
+        // spoofers rewrite it in normal Windows while WinPE reports the real one. The disk GUID /
+        // signature plus every partition extent and GUID above already identify the disk; the
+        // identifier only disambiguates simultaneously attached clones (see
+        // `unique_canonical_target_match`).
         snapshot.partitions.iter().any(|partition| {
             if partition.offset_bytes != self.partition_offset_bytes
                 || partition.size_bytes != self.partition_length_bytes
@@ -182,12 +199,29 @@ pub fn unique_canonical_target_match(
     let matches = candidates
         .iter()
         .filter(|(_, snapshot)| target.matches_snapshot(snapshot))
-        .map(|(disk_number, _)| *disk_number)
         .collect::<Vec<_>>();
     match matches.as_slice() {
-        [disk_number] => Ok(*disk_number),
+        [(disk_number, _)] => Ok(*disk_number),
         [] => bail!("canonical installation target no longer matches any physical disk"),
-        _ => bail!("canonical installation target matches multiple cloned physical disks"),
+        _ => {
+            // Cloned layouts: use the device identifier only when every clone exposes one.
+            if let Some(expected) = target.device_id_hash {
+                if matches
+                    .iter()
+                    .all(|(_, snapshot)| snapshot.device_id_hash.is_some())
+                {
+                    let by_id = matches
+                        .iter()
+                        .filter(|(_, snapshot)| snapshot.device_id_hash == Some(expected))
+                        .map(|(disk_number, _)| *disk_number)
+                        .collect::<Vec<_>>();
+                    if let [disk_number] = by_id.as_slice() {
+                        return Ok(*disk_number);
+                    }
+                }
+            }
+            bail!("canonical installation target matches multiple cloned physical disks")
+        }
     }
 }
 
@@ -274,6 +308,7 @@ fn field_rule(key: &str) -> Option<(&'static str, ValueKind)> {
         | "PcaCompatPackage"
         | "PcaCompatSha256"
         | "Language"
+        | "AutomaticFeedbackMode"
         | "CustomInstallPlanJson" => ("Install", ValueKind::Text),
         "Unattended"
         | "RestoreDrivers"
@@ -287,7 +322,10 @@ fn field_rule(key: &str) -> Option<(&'static str, ValueKind)> {
         | "IsXp"
         | "IsXpI386"
         | "RunDiskpartScripts"
-        | "MigrateWifi" => ("Install", ValueKind::Bool),
+        | "MigrateWifi"
+        | "PeNetworkEnabled"
+        | "ImageChunked"
+        | "InPlaceTargetStaging" => ("Install", ValueKind::Bool),
         "DriverActionMode" => ("Install", ValueKind::U8 { max: 2 }),
         "WimEngine" => ("Install", ValueKind::U8 { max: 1 }),
         "BootMode" => ("Install", ValueKind::U8 { max: 2 }),
@@ -299,9 +337,12 @@ fn field_rule(key: &str) -> Option<(&'static str, ValueKind)> {
         "CanonicalDiskLayoutSha256" | "CanonicalStorageIdSha256" => {
             ("Install", ValueKind::Hex { bytes: 32 })
         }
-        "CanonicalPartitionOffsetBytes" | "CanonicalPartitionLengthBytes" | "WifiProfileLength" => {
-            ("Install", ValueKind::U64)
-        }
+        "CanonicalPartitionOffsetBytes"
+        | "CanonicalPartitionLengthBytes"
+        | "WifiProfileLength"
+        | "ImageChunkedLength"
+        | "ImageExpandedBytes" => ("Install", ValueKind::U64),
+        "ImageChunkedSha256" => ("Install", ValueKind::Hex { bytes: 32 }),
         "WifiProfileSha256" => ("Install", ValueKind::Hex { bytes: 32 }),
         "CanonicalDiskStyle" => ("Install", ValueKind::CanonicalStyle),
         "CanonicalGptPartitionId" => ("Install", ValueKind::CanonicalGptId),
@@ -471,6 +512,7 @@ mod tests {
     fn gpt_snapshot(disk_id: u8, partition_id: u8) -> DiskLayoutSnapshot {
         DiskLayoutSnapshot {
             disk_size_bytes: 1_000_000,
+            disk_size_estimated: false,
             disk: StableDiskIdentity::Gpt {
                 disk_id: [disk_id; 16],
             },
@@ -504,6 +546,17 @@ mod tests {
         assert!(validate_install_handoff_ini("[Unexpected]\nFormatPartition=false\n").is_err());
         assert!(validate_install_handoff_ini("[Install]\nFormatPartiton=false\n").is_err());
         assert!(validate_install_handoff_ini("[Install]\nformatpartition=false\n").is_err());
+        // Scattered staging and in-place target staging fields are part of the authenticated
+        // install contract; every value shape they can take must pass, malformed ones must not.
+        validate_install_handoff_ini(concat!(
+            "[Install]\nVolumeIndex=1\nInPlaceTargetStaging=true\nImageChunked=true\n",
+            "ImageChunkedLength=7970041646\nImageExpandedBytes=0\n",
+            "ImageChunkedSha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"
+        ))
+        .unwrap();
+        assert!(validate_install_handoff_ini("[Install]\nInPlaceTargetStaging=yes\n").is_err());
+        assert!(validate_install_handoff_ini("[Install]\nImageChunkedLength=-1\n").is_err());
+        assert!(validate_install_handoff_ini("[Install]\nImageChunkedSha256=abc\n").is_err());
         assert!(validate_install_handoff_ini("[Instal]\nFormatPartiton=false\n").is_err());
     }
 
@@ -540,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_target_uses_storage_id_when_both_environments_expose_it() {
+    fn canonical_target_uses_storage_id_only_to_separate_clones() {
         let snapshot = gpt_snapshot(1, 2);
         let target =
             CanonicalInstallTargetV2::from_snapshot(&snapshot, 1_048_576, 500_000).unwrap();
@@ -548,9 +601,31 @@ mod tests {
         unavailable_in_pe.device_id_hash = None;
         assert!(target.matches_snapshot(&unavailable_in_pe));
 
+        // A spoofed identifier in normal Windows must not hide the real disk in WinPE.
         let mut conflicting = snapshot.clone();
         conflicting.device_id_hash = Some([9; 32]);
-        assert!(!target.matches_snapshot(&conflicting));
+        assert!(target.matches_snapshot(&conflicting));
+        assert_eq!(
+            unique_canonical_target_match(&target, &[(3, conflicting.clone())]).unwrap(),
+            3
+        );
+        // Two simultaneously attached clones are separated by the identifier.
+        assert_eq!(
+            unique_canonical_target_match(&target, &[(3, conflicting), (4, snapshot)]).unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn estimated_capacity_handoff_matches_exact_capacity_in_pe() {
+        let exact = gpt_snapshot(1, 2);
+        let mut estimated = exact.clone();
+        estimated.disk_size_bytes = exact.disk_size_bytes - 4096;
+        estimated.disk_size_estimated = true;
+        let target =
+            CanonicalInstallTargetV2::from_snapshot(&estimated, 1_048_576, 500_000).unwrap();
+        assert!(target.matches_snapshot(&exact));
+        assert!(target.matches_snapshot(&estimated));
     }
 
     #[test]

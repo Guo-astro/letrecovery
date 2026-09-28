@@ -121,6 +121,7 @@ const DEVPROP_TYPE_STRING: u32 = 0x0000_0012;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // ABI layout mirror: every field keeps the native offsets even if unread.
 struct DevPropKey {
     fmtid: GUID,
     pid: u32,
@@ -139,6 +140,7 @@ type HDevInfo = *mut c_void;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // ABI layout mirror: every field keeps the native offsets even if unread.
 struct SpDevInfoData {
     cb_size: u32,
     class_guid: [u8; 16],

@@ -281,14 +281,20 @@ impl HardwareInfoPage {
             false,
         );
         let widths = hardware_column_widths(rect.width, dpi);
-        for (index, width) in widths.into_iter().enumerate() {
-            let _ = SendMessageW(
-                self.report,
-                LVM_SETCOLUMNWIDTH,
-                WPARAM(index),
-                LPARAM(width as isize),
-            );
-        }
+        // After the report has its new size, inside the same layout commit: the report then
+        // recalculates once per column change with its final size, and its scrollbar redraws
+        // are folded into the step's single paint pass.
+        let report = self.report;
+        crate::native_ui::controls::after_layout_commit(move || {
+            for (index, width) in widths.into_iter().enumerate() {
+                let _ = SendMessageW(
+                    report,
+                    LVM_SETCOLUMNWIDTH,
+                    WPARAM(index),
+                    LPARAM(width as isize),
+                );
+            }
+        });
     }
 
     pub unsafe fn show(&self, visible: bool) {
@@ -793,7 +799,12 @@ fn yes_no(value: bool) -> String {
 }
 
 fn format_gib(bytes: u64) -> String {
-    format!("{:.1} GiB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+    const MIB: f64 = 1024.0 * 1024.0;
+    if (bytes as f64) < 1024.0 * MIB {
+        format!("{:.0} MiB", bytes as f64 / MIB)
+    } else {
+        format!("{:.1} GiB", bytes as f64 / 1024.0 / MIB)
+    }
 }
 
 fn bitlocker_status_text(status: &crate::core::hardware_info::BitLockerStatus) -> String {
@@ -1072,8 +1083,12 @@ impl AboutPage {
         set_checked(self.automation_export, enabled);
     }
 
-    pub unsafe fn automatic_feedback_enabled(&self) -> bool { is_checked(self.automatic_feedback) }
-    pub unsafe fn set_automatic_feedback_enabled(&self, enabled: bool) { set_checked(self.automatic_feedback, enabled); }
+    pub unsafe fn automatic_feedback_enabled(&self) -> bool {
+        is_checked(self.automatic_feedback)
+    }
+    pub unsafe fn set_automatic_feedback_enabled(&self, enabled: bool) {
+        set_checked(self.automatic_feedback, enabled);
+    }
 
     pub unsafe fn set_logging_enabled(&self, enabled: bool) {
         set_checked(self.logging, enabled);
@@ -1142,6 +1157,7 @@ impl AboutPage {
             self.automation_export,
             &crate::tr!("显示自动化配置导出（高级）"),
         );
+        set_text(self.automatic_feedback, &crate::tr!("自动反馈错误日志"));
         set_text(self.wim_engine_label, &crate::tr!("WIM 引擎:"));
         set_text(self.download_threads_label, &crate::tr!("下载线程:"));
         set_text(
@@ -1184,7 +1200,14 @@ impl AboutPage {
         let metrics = LayoutMetrics::for_dpi(dpi);
         let field_height = metrics.field_height;
         let row_height = s(30);
-        let button_layout = about_button_layout(width, dpi);
+        let widest_button = self
+            .link_buttons
+            .iter()
+            .chain(self.action_buttons.iter())
+            .map(|button| crate::native_ui::layout::control_text_width(*button))
+            .max()
+            .unwrap_or(0);
+        let button_layout = about_button_layout(width, dpi, widest_button);
 
         let _ = MoveWindow(
             self.product_name,
@@ -1256,7 +1279,8 @@ impl AboutPage {
             width,
             dpi,
         );
-        let refresh_width = s(76).min(width / 4);
+        let refresh_width = crate::native_ui::layout::fitted_button_width(self.refresh_languages, dpi, s(76))
+            .min(width / 3);
         // Keep the selector close to its actual longest item instead of stretching it
         // across the page. The remaining space is intentionally left after Refresh.
         let language_width = (width - label_width - refresh_width - gap)
@@ -1290,25 +1314,34 @@ impl AboutPage {
         );
         let easy_y = language_y + language_row_height + gap;
         let half = (width - gap) / 2;
-        let _ = MoveWindow(self.easy_mode, settings_x, easy_y, half, s(26), false);
-        let _ = MoveWindow(
+        // Two check boxes per row when every caption fits half the width; otherwise one per row.
+        let check_boxes = [
+            self.easy_mode,
             self.logging,
-            settings_x + half + gap,
-            easy_y,
-            half,
-            s(26),
-            false,
-        );
-        let automation_y = easy_y + s(26) + gap;
-        let _ = MoveWindow(
             self.automation_export,
-            settings_x,
-            automation_y,
-            width,
-            s(26),
-            false,
-        );
-        let engine_y = automation_y + s(26) + gap;
+            self.automatic_feedback,
+        ];
+        let widest = check_boxes
+            .iter()
+            .map(|check| crate::native_ui::layout::control_text_width(*check) + s(24))
+            .max()
+            .unwrap_or(0);
+        let per_row = if widest <= half { 2 } else { 1 };
+        let check_width = if per_row == 2 { half } else { width };
+        for (index, check) in check_boxes.into_iter().enumerate() {
+            let column = index as i32 % per_row;
+            let row = index as i32 / per_row;
+            let _ = MoveWindow(
+                check,
+                settings_x + column * (half + gap),
+                easy_y + row * (s(26) + gap),
+                check_width,
+                s(26),
+                false,
+            );
+        }
+        let rows = (check_boxes.len() as i32 + per_row - 1) / per_row;
+        let engine_y = easy_y + rows * (s(26) + gap);
         let engine_width = (width - label_width).min(s(280)).max(0);
         let engine_closed_height = combo_closed_height(self.wim_engine, field_height);
         let engine_row_height = engine_closed_height.max(field_height);
@@ -1353,7 +1386,8 @@ impl AboutPage {
             false,
         );
         let help_y = download_threads_y + threads_row_height + gap;
-        let help_height = s(48);
+        let help_height =
+            crate::native_ui::layout::control_wrapped_height(self.settings_help, width).max(s(48));
         let _ = MoveWindow(
             self.settings_help,
             settings_x,
@@ -1363,7 +1397,8 @@ impl AboutPage {
             false,
         );
         let credits_y = help_y + help_height + gap;
-        let credits_height = s(44);
+        let credits_height =
+            crate::native_ui::layout::control_wrapped_height(self.credits, width).max(s(44));
         let _ = MoveWindow(
             self.credits,
             settings_x,
@@ -1425,6 +1460,7 @@ impl AboutPage {
             self.easy_mode,
             self.logging,
             self.automation_export,
+            self.automatic_feedback,
             self.refresh_languages,
         ] {
             apply_control_theme(control, palette, NativeControlKind::General);
@@ -1454,6 +1490,7 @@ impl AboutPage {
             self.easy_mode,
             self.logging,
             self.automation_export,
+            self.automatic_feedback,
             self.wim_engine_label,
             self.wim_engine,
             self.download_threads_label,
@@ -1491,10 +1528,10 @@ struct AboutButtonLayout {
     button_width: i32,
 }
 
-fn about_button_layout(width: i32, dpi: u32) -> AboutButtonLayout {
+fn about_button_layout(width: i32, dpi: u32, widest_caption: i32) -> AboutButtonLayout {
     let s = |value: i32| ((i64::from(value) * i64::from(dpi.max(1)) + 48) / 96) as i32;
     let gap = s(8);
-    let minimum = s(140);
+    let minimum = s(140).max(widest_caption + s(24));
     let columns = ((width + gap) / (minimum + gap)).clamp(1, 4);
     AboutButtonLayout {
         columns,
@@ -1557,13 +1594,13 @@ mod tests {
 
     #[test]
     fn about_buttons_share_one_compact_responsive_grid() {
-        let compact = about_button_layout(300, 96);
+        let compact = about_button_layout(300, 96, 0);
         assert_eq!(compact.columns, 2);
         assert_eq!(compact.button_width, 146);
-        let high_dpi = about_button_layout(600, 192);
+        let high_dpi = about_button_layout(600, 192, 0);
         assert_eq!(high_dpi.columns, 2);
         assert_eq!(high_dpi.button_width, 292);
-        let narrow = about_button_layout(180, 192);
+        let narrow = about_button_layout(180, 192, 0);
         assert_eq!(narrow.columns, 1);
         assert_eq!(narrow.button_width, 180);
     }

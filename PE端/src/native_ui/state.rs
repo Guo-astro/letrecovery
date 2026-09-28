@@ -30,23 +30,6 @@ impl From<Option<OperationType>> for WorkflowKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommandBarState {
-    pub back_visible: bool,
-    pub primary_enabled: bool,
-    pub cancel_enabled: bool,
-}
-
-impl Default for CommandBarState {
-    fn default() -> Self {
-        Self {
-            back_visible: false,
-            primary_enabled: true,
-            cancel_enabled: true,
-        }
-    }
-}
-
 /// Owns presentation routing separately from the workflow state.
 ///
 /// `navigate` never replaces `workflow`, which lets later PE parts migrate one complete page at a
@@ -54,7 +37,6 @@ impl Default for CommandBarState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeWindowState<W> {
     pub page: NativePage,
-    pub command_bar: CommandBarState,
     pub workflow: W,
 }
 
@@ -62,7 +44,6 @@ impl<W> NativeWindowState<W> {
     pub fn new(workflow: W) -> Self {
         Self {
             page: NativePage::Overview,
-            command_bar: CommandBarState::default(),
             workflow,
         }
     }
@@ -71,6 +52,7 @@ impl<W> NativeWindowState<W> {
         self.page = page;
     }
 
+    #[cfg(test)]
     pub fn into_workflow(self) -> W {
         self.workflow
     }

@@ -72,7 +72,15 @@ enum CompositorSlot {
 ///
 /// Returns `true` only when DirectComposition accepted the frame. A `false` result tells the
 /// caller to invalidate the ordinary `WM_PAINT` fallback instead.
+/// DirectComposition needs a Direct3D device, that is a graphics driver or WARP. The ordinary GDI
+/// path draws the same scrollbar without any graphics-driver dependency, identically on desktops
+/// and in every WinPE, so it is used everywhere.
+const DIRECT_COMPOSITION_ENABLED: bool = false;
+
 pub(crate) unsafe fn publish(hwnd: HWND, width: i32, height: i32, dpi: u32, pixels: &[u8]) -> bool {
+    if !DIRECT_COMPOSITION_ENABLED {
+        return false;
+    }
     if hwnd.0.is_null() || width <= 0 || height <= 0 {
         return false;
     }

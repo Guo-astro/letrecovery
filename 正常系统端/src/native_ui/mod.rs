@@ -3,6 +3,9 @@
 //! This module owns only presentation and user intent. Destructive operations remain in the
 //! existing typed Rust core and are never executed from a window procedure.
 
+mod combo_popup;
+mod context_menu;
+mod syscolor_hook;
 mod controls;
 pub mod dialog;
 pub mod driver_transfer_dialog;
@@ -12,6 +15,7 @@ pub mod preinstall_dialog;
 mod redraw;
 mod scrollbar_compositor;
 mod theme;
+pub(crate) mod ui_audit;
 pub mod tool_dialogs;
 pub mod tool_dialogs_mutating;
 pub mod tools;

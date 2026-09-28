@@ -18,7 +18,7 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, MoveWindow, SendMessageW, SetWindowTextW, CBS_DROPDOWNLIST, CB_ADDSTRING,
+    GetClientRect, MoveWindow, SendMessageW, CBS_DROPDOWNLIST, CB_ADDSTRING,
     CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
     WM_SETFONT, WS_BORDER, WS_TABSTOP, WS_VSCROLL,
 };
@@ -443,7 +443,7 @@ impl NativePartitionCopyDialog {
         let dpi = GetDpiForWindow(shell.hwnd()).max(96);
         let face = wide("Microsoft YaHei");
         let font = CreateFontW(
-            -scale(14, dpi),
+            -scale(12, dpi),
             0,
             0,
             0,
@@ -863,7 +863,7 @@ unsafe fn create_controls(parent: HWND) -> windows::core::Result<Controls> {
             parent,
             w!("EDIT"),
             "",
-            ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL.0 as i32 | WS_BORDER.0 as i32,
+            ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL.0 as i32,
             ID_LOG,
         )?,
     })
@@ -1036,7 +1036,7 @@ fn partition_columns(width: i32, dpi: u32) -> [i32; 5] {
 }
 
 fn format_size(value_mb: u64) -> String {
-    format!("{:.1} GB", value_mb as f64 / 1024.0)
+    crate::native_ui::layout::format_capacity_mb(value_mb)
 }
 
 fn display_label(label: &str) -> String {
@@ -1048,8 +1048,7 @@ fn display_label(label: &str) -> String {
 }
 
 unsafe fn set_text(control: HWND, text: &str) {
-    let text = wide(text);
-    let _ = SetWindowTextW(control, PCWSTR(text.as_ptr()));
+    crate::native_ui::redraw::set_window_text_if_changed(control, text);
 }
 
 unsafe fn move_control(control: HWND, x: i32, y: i32, width: i32, height: i32) {

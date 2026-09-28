@@ -323,6 +323,18 @@ impl InstallExecutionError {
             Self::Backend {
                 phase: InstallExecutionPhase::SelectDataPartition,
                 source,
+            } if source.code == "scatter_no_space" => crate::tr!(
+                "无法新建数据分区，已有分区的剩余空间也放不下全部安装文件。请释放其他分区的空间后重试；镜像不能分块时，需要有一个分区能单独放下镜像。"
+            ),
+            Self::Backend {
+                phase: InstallExecutionPhase::SelectDataPartition,
+                source,
+            } if source.code == "scatter_requires_new_pe" => crate::tr!(
+                "当前 PE 版本太旧，不支持把安装文件分散放在已有分区。请更新 PE（用新版 PE端 重新打包）后重试。"
+            ),
+            Self::Backend {
+                phase: InstallExecutionPhase::SelectDataPartition,
+                source,
             } if source.code == "no_data_partition" => crate::tr!(
                 "没有任何单个分区能容纳全部安装文件。多个分区末尾的空闲区彼此不连续，不能合并成一个普通数据分区；程序不会把磁盘转换为动态跨区卷。请释放一个分区的空间，或连接容量足够的外置磁盘。"
             ),
@@ -587,10 +599,12 @@ impl NativeInstallExecutor {
         } else {
             InstallExecutionPhase::ApplyWimImage
         });
-        phases.push(InstallExecutionPhase::ProcessDrivers);
         if intent.options.repair_boot {
             phases.push(InstallExecutionPhase::RepairBoot);
         }
+        // The image has already been applied. Complete the boot-critical result before optional
+        // driver restoration can report a terminal storage-coverage failure.
+        phases.push(InstallExecutionPhase::ProcessDrivers);
         if has_preinstalled_software {
             // On desktop Windows this copies the already downloaded installers. When this normal
             // endpoint runs inside WinPE, this is the real network download into the applied
@@ -862,6 +876,10 @@ mod tests {
             .iter()
             .position(|phase| *phase == InstallExecutionPhase::RepairBoot)
             .unwrap();
+        let drivers = plan
+            .iter()
+            .position(|phase| *phase == InstallExecutionPhase::ProcessDrivers)
+            .unwrap();
         let software = plan
             .iter()
             .position(|phase| *phase == InstallExecutionPhase::StageDirectPreinstalledSoftware)
@@ -870,10 +888,32 @@ mod tests {
             .iter()
             .position(|phase| *phase == InstallExecutionPhase::ApplyAdvancedOptions)
             .unwrap();
-        assert!(image < boot && boot < software && software < advanced);
+        assert!(image < boot && boot < drivers && drivers < software && software < advanced);
         let ranges = NativeInstallExecutor::progress_ranges(&request, &plan);
         assert!(ranges[image].end <= ranges[software].start);
         assert!(ranges[software].end > ranges[software].start);
+    }
+
+    #[test]
+    fn direct_install_completes_boot_before_driver_postprocessing() {
+        let request = intent(InstallMode::Direct);
+        let plan = NativeInstallExecutor::build_plan(&request, &direct_context()).unwrap();
+        let boot = plan
+            .iter()
+            .position(|phase| *phase == InstallExecutionPhase::RepairBoot)
+            .unwrap();
+        let drivers = plan
+            .iter()
+            .position(|phase| *phase == InstallExecutionPhase::ProcessDrivers)
+            .unwrap();
+        assert!(boot < drivers);
+    }
+
+    #[test]
+    fn ready_bitlocker_context_never_schedules_decryption() {
+        let request = intent(InstallMode::Direct);
+        let plan = NativeInstallExecutor::build_plan(&request, &direct_context()).unwrap();
+        assert!(!plan.contains(&InstallExecutionPhase::AwaitBitLockerDecryption));
     }
 
     #[test]

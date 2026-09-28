@@ -664,6 +664,22 @@ impl LockedInstallSourceSet {
 /// Prove that an engine-visible directory contains exactly the ordered WIM/ESD/SWM or GHO/GHS
 /// set authenticated by the handoff manifest.  This deliberately reuses the same strict naming
 /// and contiguity rules as `LockedInstallSourceSet`; any additional matching sibling is rejected.
+/// True when every span lives in one directory (the historical staging layout). Scattered staging
+/// stores split WIM parts on several volumes; those sets are bound only by their exact,
+/// individually locked and hashed manifest paths instead of directory enumeration.
+pub fn install_image_spans_share_directory(paths: &[PathBuf]) -> bool {
+    let mut parents = paths.iter().map(|path| {
+        std::fs::canonicalize(path)
+            .ok()
+            .and_then(|canonical| canonical.parent().map(Path::to_path_buf))
+            .or_else(|| path.parent().map(Path::to_path_buf))
+    });
+    let Some(first) = parents.next() else {
+        return true;
+    };
+    parents.all(|parent| parent == first)
+}
+
 pub fn verify_exact_install_image_span_paths(
     selected: &Path,
     expected: &[PathBuf],

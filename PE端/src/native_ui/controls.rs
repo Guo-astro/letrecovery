@@ -92,6 +92,8 @@ pub const fn step_status_has_badge(status: StepStatusIcon) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RoundedControlSpec {
     pub radius: i32,
+    /// Documented anti-aliasing factor of the rounded roles (asserted by the tests).
+    #[allow(dead_code)]
     pub supersample: u32,
 }
 
@@ -726,6 +728,8 @@ pub struct ButtonState {
     pub pressed: bool,
     pub disabled: bool,
     pub primary: bool,
+    /// Recorded for completeness; focus deliberately never changes a button's paint.
+    #[allow(dead_code)]
     pub focused: bool,
 }
 
@@ -1508,14 +1512,36 @@ unsafe fn update_combo_hot_item(hwnd: HWND, lparam: LPARAM) {
         return;
     }
     set_property_item_index(hwnd, COMBO_HOT_ITEM_PROPERTY, next);
-    let _ = InvalidateRect(hwnd, None, false);
+    // Repaint only the item that lost and the item that gained the hot state. Invalidating the
+    // whole popup on every row change redrew every visible item while the pointer moved.
+    invalidate_combo_popup_items(hwnd, &[previous, next]);
+}
+
+unsafe fn invalidate_combo_popup_items(hwnd: HWND, items: &[Option<usize>]) {
+    const LB_GETITEMRECT: u32 = 0x0198;
+    for index in items.iter().flatten() {
+        let mut rect = RECT::default();
+        if SendMessageW(
+            hwnd,
+            LB_GETITEMRECT,
+            WPARAM(*index),
+            LPARAM((&mut rect as *mut RECT) as isize),
+        )
+        .0 < 0
+        {
+            let _ = InvalidateRect(hwnd, None, false);
+            return;
+        }
+        let _ = InvalidateRect(hwnd, Some(&rect), false);
+    }
 }
 
 unsafe fn clear_combo_hot_item(hwnd: HWND) {
+    let previous = property_item_index(hwnd, COMBO_HOT_ITEM_PROPERTY);
     let changed = RemovePropW(hwnd, COMBO_HOT_ITEM_PROPERTY).is_ok_and(|value| !value.is_invalid());
     let _ = RemovePropW(hwnd, COMBO_TRACKING_PROPERTY);
     if changed {
-        let _ = InvalidateRect(hwnd, None, false);
+        invalidate_combo_popup_items(hwnd, &[previous]);
     }
 }
 

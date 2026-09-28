@@ -844,7 +844,18 @@ struct AutomationFailureShutdown {
 
 impl AutomationFailureShutdown {
     fn new(enabled: bool) -> Self {
-        Self { armed: enabled }
+        // A production PE must leave a validation or pre-write failure visible so the user can
+        // read the error and retrieve the log. Only the explicitly feature-gated disposable-VM
+        // runner may request an automatic terminal power-off.
+        #[cfg(feature = "ci-automation")]
+        {
+            Self { armed: enabled }
+        }
+        #[cfg(not(feature = "ci-automation"))]
+        {
+            let _ = enabled;
+            Self { armed: false }
+        }
     }
 
     fn disarm(&mut self) {
@@ -992,7 +1003,14 @@ fn execute_install_workflow(
                 tr!("预装软件、移除预装应用或移除 Windows 安全中心不支持 GHO/GHS 或 XP 文本模式来源。")
             }
         };
-        fail_prewrite!(message);
+        // These options only add optional first-logon work. Drop them instead of refusing the
+        // whole installation after the reboot into PE.
+        log::warn!("[PE INSTALL] {message} 已跳过这些可选项，安装继续");
+        let _ = tx.send(WorkerMessage::SetStatus(message.clone()));
+        config.remove_uwp_apps = false;
+        config.disable_windows_defender = false;
+        config.preinstalled_software_config.clear();
+        selected_preinstalled_software.clear();
     }
     let (mut target_partition, mut expected_target) = match authenticated_task.install_target() {
         Ok((partition, identity)) => (partition.to_owned(), identity),
@@ -1116,14 +1134,53 @@ fn execute_install_workflow(
             fail_prewrite!(tr!("读取认证更新包清单失败: {}", error));
         }
     };
-    let mut image_path = match authenticated_task.install_source_path() {
-        Ok(path) => path.to_string_lossy().into_owned(),
-        Err(error) => {
-            fail_prewrite!(tr!("解析认证安装源失败: {}", error));
+    // Scattered staging may store one image file as raw chunks. They are concatenated on the
+    // target after it is formatted, so every pre-write image check is deferred until then.
+    let chunked_image = config.image_chunked && !config.is_xp_i386;
+    let mut image_path = if chunked_image {
+        if !(config.format_partition
+            && matches!(
+                config.custom_install_plan,
+                lr_core::custom_install::CustomInstallPlan::ReinstallPartition
+            ))
+        {
+            fail_prewrite!(tr!(
+                "镜像以分块形式分散保存，但本次安装不格式化目标分区，无法拼回镜像。尚未写入目标分区。"
+            ));
+        }
+        let required = config
+            .image_chunked_length
+            .saturating_add(config.image_expanded_bytes)
+            .saturating_add(lr_core::data_staging::IMAGE_REASSEMBLY_HEADROOM_BYTES);
+        if expected_target.extent_length_bytes != 0
+            && expected_target.extent_length_bytes < required
+        {
+            fail_prewrite!(tr!(
+                "目标分区容量不足以拼回分散保存的镜像：需要 {} 字节，分区只有 {} 字节。尚未写入目标分区。",
+                required,
+                expected_target.extent_length_bytes
+            ));
+        }
+        if config.image_expanded_bytes == 0 {
+            log::warn!("[SCATTER] 镜像释放后大小未知，只按镜像本身大小核对目标分区容量");
+        }
+        log::info!(
+            "[SCATTER] 镜像以分块形式保存（{} 字节），格式化目标分区后拼回",
+            config.image_chunked_length
+        );
+        reassembled_image_path(&target_partition, &config.image_path)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        match authenticated_task.install_source_path() {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(error) => {
+                fail_prewrite!(tr!("解析认证安装源失败: {}", error));
+            }
         }
     };
 
-    if !std::path::Path::new(&image_path).exists() {
+    if !chunked_image && !std::path::Path::new(&image_path).exists() {
         fail_prewrite!(tr!("镜像文件不存在: {}", image_path));
     }
 
@@ -1177,6 +1234,8 @@ fn execute_install_workflow(
             fail_prewrite!(tr!("GHO 镜像预检失败: {}", error));
         }
         log::info!("[PE安装] GHO 镜像预检通过，尚未修改目标分区");
+    } else if chunked_image {
+        log::info!("[SCATTER] 分块镜像的完整性校验推迟到格式化目标分区并拼回之后");
     } else if crate::core::dism::requires_pe_image_verification(
         config.source_image_verified,
         config.is_gho,
@@ -1199,7 +1258,15 @@ fn execute_install_workflow(
             }
         });
 
-        let verify_result = Dism::new().verify_image(&image_path, Some(verify_tx));
+        let verify_spans = if config.is_xp_i386 {
+            Vec::new()
+        } else {
+            authenticated_task
+                .install_image_span_paths()
+                .unwrap_or_default()
+        };
+        let verify_result =
+            Dism::new().verify_image_with_resources(&image_path, &verify_spans, Some(verify_tx));
         let _ = verify_handle.join();
 
         if let Err(e) = verify_result {
@@ -1235,7 +1302,7 @@ fn execute_install_workflow(
 
     // PCA/EFI validation only protects a later boot write. When the user
     // explicitly disabled boot repair, neither validate nor stage boot assets.
-    let boot_preflight = if !config.repair_boot || config.is_xp_i386 {
+    let boot_preflight = if !config.repair_boot || config.is_xp_i386 || chunked_image {
         crate::core::pca_preflight::BootPreflight {
             pca_compat_package: None,
             uefiseven_source: None,
@@ -1269,9 +1336,9 @@ fn execute_install_workflow(
             }
         }
     };
-    let pca_compat_package = boot_preflight.pca_compat_package;
-    let uefiseven_source = boot_preflight.uefiseven_source;
-    let secure_boot_disable_required = boot_preflight.secure_boot_disable_required;
+    let mut pca_compat_package = boot_preflight.pca_compat_package;
+    let mut uefiseven_source = boot_preflight.uefiseven_source;
+    let mut secure_boot_disable_required = boot_preflight.secure_boot_disable_required;
 
     // Before formatting, check only deterministic tree safety. Package signature and target
     // compatibility are deliberately left to Microsoft's actual DISM import result; duplicating
@@ -1279,7 +1346,10 @@ fn execute_install_workflow(
     if config.should_import_drivers() {
         let driver_path = std::path::Path::new(&data_dir).join("drivers");
         if !driver_path.is_dir() {
-            fail_prewrite!(tr!("驱动路径不存在: {}", driver_path.display()));
+            log::warn!(
+                "驱动目录 {} 不存在；驱动包仍按认证清单中的文件导入",
+                driver_path.display()
+            );
         }
         if !preserved_driver_infs.is_empty() {
             log::info!(
@@ -1287,13 +1357,14 @@ fn execute_install_workflow(
                 preserved_driver_infs.len()
             );
         } else {
-            let error = anyhow::anyhow!("认证驱动清单中没有 INF 文件");
-            log::error!("驱动目录写盘前结构预检失败，目标分区尚未修改: {error}");
-            fail_prewrite!(tr!("驱动包预检失败: {}", error));
+            // Nothing importable was staged; continue with Windows' inbox drivers.
+            log::warn!("认证驱动清单中没有 INF 文件，本次安装跳过旧驱动导入");
+            config.restore_drivers = false;
+            config.driver_action_mode = crate::core::config::DriverActionMode::None;
         }
     }
 
-    let exact_image_spans = if config.is_xp_i386 {
+    let mut exact_image_spans = if config.is_xp_i386 || chunked_image {
         Vec::new()
     } else {
         match authenticated_task.install_image_span_paths() {
@@ -1344,10 +1415,27 @@ fn execute_install_workflow(
         }
     }
 
-    if let Err(error) = DiskManager::validate_install_target_dependencies(
+    if config.in_place_target_staging {
+        // In-place staging deliberately keeps the image inside the target's own LetRecovery_Data.
+        // The cross-volume dependency check would reject that, so only the target's physical
+        // identity is confirmed here; the staged image stays locked and the old-system deletion
+        // below never touches LetRecovery_ directories.
+        if let Err(error) =
+            DiskManager::verify_partition_volume_identity(&target_partition, expected_target)
+        {
+            fail_prewrite!(tr!(
+                "目标盘内暂存前目标分区物理身份已变化，安装已停止: {}",
+                error
+            ));
+        }
+    } else if let Err(error) = DiskManager::validate_install_target_dependencies(
         &target_partition,
         expected_target,
-        std::path::Path::new(&image_path),
+        if chunked_image {
+            std::path::Path::new(&data_dir)
+        } else {
+            std::path::Path::new(&image_path)
+        },
     ) {
         fail_prewrite!(tr!(
             "安装来源或目标分区安全检查失败，尚未写入目标: {}",
@@ -1458,7 +1546,10 @@ fn execute_install_workflow(
 
     // Step 1: 格式化分区
     let _ = tx.send(WorkerMessage::SetInstallStep(InstallStep::FormatPartition));
+    // In-place target staging keeps the payload on the target itself, so the volume is never
+    // formatted; a requested format becomes an in-place deletion of the old system instead.
     let format_target = config.format_partition
+        && !config.in_place_target_staging
         && matches!(
             &config.custom_install_plan,
             lr_core::custom_install::CustomInstallPlan::ReinstallPartition
@@ -1521,7 +1612,49 @@ fn execute_install_workflow(
     } else {
         false
     };
-    if format_target {
+    if config.in_place_target_staging && config.format_partition && !personal_files_prepared {
+        // Target-drive staging with a requested format: never format (that would erase the
+        // staged image); delete the old system in place instead. LetRecovery_ directories,
+        // including the staged data, are preserved by the deletion routine.
+        let _ = tx.send(WorkerMessage::SetStatus(tr!(
+            "正在原地删除旧系统（保留已暂存的安装文件）..."
+        )));
+        if let Err(error) =
+            DiskManager::verify_partition_volume_identity(&target_partition, expected_target)
+        {
+            let _ = tx.send(WorkerMessage::Failed(tr!(
+                "原地删除旧系统前目标分区物理身份已变化，安装已停止: {}",
+                error
+            )));
+            return;
+        }
+        log::warn!(
+            "[PE INSTALL] irreversible boundary entered: in-place old-system deletion started; old-system rollback is disabled"
+        );
+        match lr_core::personal_files::delete_old_system_in_place(std::path::Path::new(
+            &format!("{}\\", target_partition.trim_end_matches(['\\', '/'])),
+        )) {
+            Ok(report) => {
+                log::info!(
+                    "[PE INSTALL] 原地删除旧系统完成: roots={} entries={} 未能删除={}",
+                    report.deleted_roots,
+                    report.deleted_entries,
+                    report.failures.len()
+                );
+                for failure in report.failures.iter().take(8) {
+                    log::warn!("[PE INSTALL] 旧系统条目未能删除，将由镜像覆盖: {failure}");
+                }
+            }
+            Err(error) => {
+                log::error!("[PE INSTALL] 原地删除旧系统失败: {error:#}");
+                let _ = tx.send(WorkerMessage::Failed(tr!(
+                    "原地删除旧系统失败，安装已停止: {}",
+                    error
+                )));
+                return;
+            }
+        }
+    } else if format_target {
         let _ = tx.send(WorkerMessage::SetStatus(tr!("正在格式化目标分区...")));
         // Point of no return. A failed format can already have destroyed file-system metadata, so
         // no later error path is allowed to restore the old OS, old boot state, or pre-write
@@ -1559,6 +1692,89 @@ fn execute_install_workflow(
         log::info!("[PE安装] 用户已关闭格式化目标分区，跳过格式化");
     }
     let _ = tx.send(WorkerMessage::SetProgress(100));
+
+    if chunked_image {
+        let _ = tx.send(WorkerMessage::SetStatus(tr!(
+            "正在把分散保存的镜像分块拼回目标分区..."
+        )));
+        match reassemble_chunked_image(&authenticated_task, &target_partition, &config, &tx) {
+            Ok(path) => {
+                log::info!(
+                    "[SCATTER] 镜像已在目标分区拼回，长度与 SHA-256 均与认证值一致: {}",
+                    path.display()
+                );
+                image_path = path.to_string_lossy().into_owned();
+                exact_image_spans = vec![path];
+            }
+            Err(error) => {
+                log::error!("[SCATTER] 拼回镜像失败: {error:#}");
+                let _ = tx.send(WorkerMessage::Failed(tr!(
+                    "拼回分散保存的镜像失败: {}",
+                    error
+                )));
+                return;
+            }
+        }
+        if crate::core::dism::requires_pe_image_verification(
+            config.source_image_verified,
+            config.is_gho,
+            config.is_xp_i386,
+        ) {
+            let _ = tx.send(WorkerMessage::SetStatus(tr!(
+                "正在校验拼回的系统镜像完整性（可能需要几分钟）..."
+            )));
+            if let Err(error) = Dism::new().verify_image(&image_path, None) {
+                log::error!("[SCATTER] 拼回的镜像校验失败: {error}");
+                let _ = tx.send(WorkerMessage::Failed(tr!(
+                    "拼回的系统镜像校验失败，镜像可能已损坏: {}",
+                    error
+                )));
+                return;
+            }
+        } else {
+            log::info!(
+                "[SCATTER] 拼回镜像与正常端完整校验过的字节 SHA-256 一致，跳过重复校验"
+            );
+        }
+        if config.repair_boot {
+            let staged_pca_compat = match crate::core::pca_preflight::staged_config(
+                &config,
+                std::path::Path::new(&data_dir),
+            ) {
+                Ok(staged) => staged,
+                Err(error) => {
+                    let _ = tx.send(WorkerMessage::Failed(tr!(
+                        "读取启动签名兼容包配置失败: {}",
+                        error
+                    )));
+                    return;
+                }
+            };
+            match crate::core::pca_preflight::verify_before_disk_write(
+                &image_path,
+                config.volume_index,
+                config.is_gho,
+                config.is_xp,
+                config.boot_mode != 2,
+                config.boot_pca_mode,
+                staged_pca_compat.as_ref(),
+                std::path::Path::new(&data_dir),
+            ) {
+                Ok(preflight) => {
+                    pca_compat_package = preflight.pca_compat_package;
+                    uefiseven_source = preflight.uefiseven_source;
+                    secure_boot_disable_required = preflight.secure_boot_disable_required;
+                }
+                Err(error) => {
+                    let _ = tx.send(WorkerMessage::Failed(tr!(
+                        "启动签名兼容性检查失败: {}",
+                        error
+                    )));
+                    return;
+                }
+            }
+        }
+    }
 
     // Step 2: 释放镜像
     let _ = tx.send(WorkerMessage::SetInstallStep(InstallStep::ApplyImage));
@@ -1609,6 +1825,8 @@ fn execute_install_workflow(
         terminal_log.mark_target_system_available();
         let _ = tx.send(WorkerMessage::SetInstallStep(InstallStep::Cleanup));
         let mut cleanup_warning = None;
+        authenticated_task.remove_scatter_payload();
+        remove_reassembled_image(&target_partition);
         let auto_staging = match authenticated_task.into_install_cleanup_authorization() {
             Ok(authorization) => authorization,
             Err(error) => {
@@ -2069,53 +2287,52 @@ fn execute_install_workflow(
             }
         }
     } else if config.should_import_drivers() && !driver_path_exists {
-        log::error!("请求自动导入驱动，但驱动目录不存在: {}", driver_path);
-        let _ = tx.send(WorkerMessage::Failed(tr!(
-            "驱动路径不存在: {}",
-            driver_path
-        )));
-        return;
+        // Old drivers are optional. Continue with Windows' inbox drivers instead of leaving an
+        // applied image without boot files.
+        log::warn!("请求自动导入驱动，但驱动目录不存在，已跳过驱动导入: {}", driver_path);
+        completion_warnings.push(tr!("没有找到暂存的驱动，已跳过旧驱动导入"));
     } else if config.has_driver_data() {
+        // "Save drivers only" is a convenience copy for later manual installation. An empty or
+        // unavailable export must not fail an installation whose image is already applied.
         if !driver_path_exists {
-            let _ = tx.send(WorkerMessage::Failed(tr!(
-                "请求保留驱动，但暂存驱动目录不存在: {}",
-                driver_path
-            )));
-            return;
-        }
-        let destination =
+            log::warn!("请求保留驱动，但暂存驱动目录不存在，已跳过: {}", driver_path);
+            completion_warnings.push(tr!("没有找到需要保存的驱动，已跳过保存驱动"));
+        } else {
             match crate::save_only_driver_destination(&target_partition, &config.session_id) {
-                Ok(path) => path,
+                Ok(destination) => match lr_core::windows_file_copy::copy_tree_verified(
+                    std::path::Path::new(&driver_path),
+                    &destination,
+                ) {
+                    Ok(0) => {
+                        log::warn!("请求保留驱动，但暂存目录中没有可保存的文件，已跳过");
+                        let _ = tx.send(WorkerMessage::SetStatus(tr!(
+                            "没有需要保存的驱动文件，已跳过"
+                        )));
+                    }
+                    Ok(files) => {
+                        let _ = tx.send(WorkerMessage::SetStatus(tr!(
+                            "驱动已保存（{} 个文件）",
+                            files
+                        )));
+                        log::info!(
+                            "SaveOnly driver tree copied and verified: files={}, destination={}",
+                            files,
+                            destination.display()
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "SaveOnly driver preservation failed, installation continues: {error:#}"
+                        );
+                        completion_warnings.push(tr!("保存驱动失败，已跳过：{}", error));
+                    }
+                },
                 Err(error) => {
-                    let _ = tx.send(WorkerMessage::Failed(tr!("保留驱动失败: {}", error)));
-                    return;
+                    log::warn!(
+                        "SaveOnly driver destination unavailable, installation continues: {error:#}"
+                    );
+                    completion_warnings.push(tr!("保存驱动失败，已跳过：{}", error));
                 }
-            };
-        match lr_core::windows_file_copy::copy_tree_verified(
-            std::path::Path::new(&driver_path),
-            &destination,
-        ) {
-            Ok(0) => {
-                let _ = tx.send(WorkerMessage::Failed(tr!(
-                    "请求保留驱动，但暂存目录中没有可保存的文件"
-                )));
-                return;
-            }
-            Ok(files) => {
-                let _ = tx.send(WorkerMessage::SetStatus(tr!(
-                    "驱动已保存（{} 个文件）",
-                    files
-                )));
-                log::info!(
-                    "SaveOnly driver tree copied and verified: files={}, destination={}",
-                    files,
-                    destination.display()
-                );
-            }
-            Err(error) => {
-                log::error!("SaveOnly driver preservation failed: {error:#}");
-                let _ = tx.send(WorkerMessage::Failed(tr!("保留驱动失败: {}", error)));
-                return;
             }
         }
     } else {
@@ -2267,6 +2484,21 @@ fn execute_install_workflow(
     }
     let _ = tx.send(WorkerMessage::SetProgress(100));
 
+    if !config.import_storage_controller_drivers {
+        let ntdll = std::path::Path::new(&target_partition)
+            .join("Windows")
+            .join("System32")
+            .join("ntdll.dll");
+        if crate::core::system_utils::get_file_version(&ntdll)
+            .is_some_and(|(major, _, _, _)| major == 10)
+        {
+            log::info!(
+                "[DRIVER] 自动检查本机 Intel VMD/RAID 等存储控制器，匹配时注入内置存储控制器驱动"
+            );
+            config.import_storage_controller_drivers = true;
+        }
+    }
+
     // Step 6: 应用高级选项
     let _ = tx.send(WorkerMessage::SetInstallStep(
         InstallStep::ApplyAdvancedOptions,
@@ -2297,6 +2529,9 @@ fn execute_install_workflow(
         }
     }
     // 仅消费 typed task 中 exact、仍由句柄锁定的用户驱动清单。
+    for warning in apply_authenticated_advanced_inputs(&target_partition, &user_driver_artifacts) {
+        completion_warnings.push(tr!("部分自定义内容未能应用：{}", warning));
+    }
     if let Err(error) = crate::ui::advanced_options::inject_user_drivers_from_authenticated_paths(
         &target_partition,
         &user_driver_artifacts,
@@ -2311,9 +2546,12 @@ fn execute_install_workflow(
         &selected_preinstalled_software,
         &preinstalled_software_artifacts,
     ) {
-        log::error!("预装软件暂存失败: {error:#}");
-        let _ = tx.send(WorkerMessage::Failed(tr!("预装软件暂存失败: {}", error)));
-        return;
+        // Preinstalled applications are optional extras. Never turn an applied system into a failed
+        // installation because one of them could not be staged.
+        log::warn!("预装软件暂存失败，已跳过预装软件并继续安装: {error:#}");
+        selected_preinstalled_software.clear();
+        config.preinstalled_software_config.clear();
+        completion_warnings.push(tr!("预装软件未能暂存，已跳过：{}", error));
     }
     let _ = tx.send(WorkerMessage::SetProgress(100));
 
@@ -2323,10 +2561,12 @@ fn execute_install_workflow(
     if config.unattended {
         if !config.custom_unattend_file.is_empty() {
             if config.disable_windows_defender {
-                let _ = tx.send(WorkerMessage::Failed(tr!(
-                    "移除 Windows 安全中心需要使用 LetRecovery 内置无人值守配置，不能与自定义应答文件同时使用"
-                )));
-                return;
+                log::warn!(
+                    "[ADVANCED_SEC_HEALTH_UI] phase=online_hook status=skipped reason=custom_unattend_not_modified"
+                );
+                completion_warnings.push(tr!(
+                    "使用自定义应答文件时无法在首次开机移除 Windows 安全中心界面，已跳过该项"
+                ));
             }
             if config.disable_reserved_storage {
                 log::warn!(
@@ -2334,10 +2574,12 @@ fn execute_install_workflow(
                 );
             }
             if config.remove_uwp_apps {
-                let _ = tx.send(WorkerMessage::Failed(tr!(
-                    "移除预装应用需要使用 LetRecovery 内置无人值守配置，不能与自定义应答文件同时使用"
-                )));
-                return;
+                log::warn!(
+                    "[ADVANCED_APPX] phase=online_hook status=skipped reason=custom_unattend_not_modified"
+                );
+                completion_warnings.push(tr!(
+                    "使用自定义应答文件时无法在部署阶段移除预装应用，已跳过该项"
+                ));
             }
             // 用户提供了自定义无人值守文件：直接复制到目标系统（不再内置生成）
             let _ = tx.send(WorkerMessage::SetStatus(tr!(
@@ -2380,10 +2622,12 @@ fn execute_install_workflow(
     }
 
     if !config.unattended && config.disable_windows_defender {
-        let _ = tx.send(WorkerMessage::Failed(tr!(
-            "移除 Windows 安全中心需要启用无人值守安装"
-        )));
-        return;
+        log::warn!(
+            "[ADVANCED_SEC_HEALTH_UI] phase=online_hook status=skipped reason=unattended_install_disabled"
+        );
+        completion_warnings.push(tr!(
+            "未启用无人值守安装，已跳过首次开机移除 Windows 安全中心界面"
+        ));
     }
     if !config.unattended && config.disable_reserved_storage {
         log::warn!(
@@ -2391,10 +2635,10 @@ fn execute_install_workflow(
         );
     }
     if !config.unattended && config.remove_uwp_apps {
-        let _ = tx.send(WorkerMessage::Failed(tr!(
-            "移除预装应用需要启用无人值守安装"
-        )));
-        return;
+        log::warn!(
+            "[ADVANCED_APPX] phase=online_hook status=skipped reason=unattended_install_disabled"
+        );
+        completion_warnings.push(tr!("未启用无人值守安装，已跳过部署阶段移除预装应用"));
     }
 
     let _ = tx.send(WorkerMessage::SetProgress(100));
@@ -2403,15 +2647,35 @@ fn execute_install_workflow(
     // would strand an already-applied image without BCDBoot. At this point image, boot and minimum
     // offline setup have all had their normal chance to complete. Preserve staging, suppress
     // automatic boot into an unconfirmed system, and publish the actual terminal failure.
+    if critical_storage_failure.is_some() {
+        // Built-in storage-controller packages and user drivers are injected after the preserved
+        // driver import. Re-check the boot-storage requirements against the target DriverStore
+        // before declaring the installation unbootable.
+        match lr_core::driver::verify_offline_storage_driver_requirements(
+            std::path::Path::new(&target_partition),
+            std::path::Path::new(&driver_path),
+        ) {
+            Ok(requirements) => {
+                log::info!(
+                    "[DRIVER] 后续注入的存储控制器驱动已覆盖全部 {} 项启动存储需求，解除启动存储失败标记",
+                    requirements.len()
+                );
+                critical_storage_failure = None;
+            }
+            Err(error) => log::warn!("[DRIVER] 启动存储需求仍未全部覆盖: {error:#}"),
+        }
+    }
     if let Some(detail) = critical_storage_failure {
-        log::error!(
-            "[PE INSTALL] image/minimum setup and boot phase completed, but boot-storage coverage remains unconfirmed; authenticated staging is preserved: {detail}"
+        // A missing storage-controller driver (typically Intel VMD) must not fail an otherwise
+        // complete installation: switching VMD off (AHCI) in the firmware setup lets the new
+        // system boot with Windows' inbox NVMe/AHCI drivers.
+        log::warn!(
+            "[PE INSTALL] boot-storage driver coverage is unconfirmed; the installation completes with a warning: {detail}"
         );
-        let _ = tx.send(WorkerMessage::Failed(tr!(
-            "系统镜像和引导阶段已完成，但启动存储驱动覆盖无法确认；已保留驱动与诊断材料并禁止自动重启。请修正驱动后重新安装或人工检查: {}",
+        completion_warnings.push(tr!(
+            "系统已安装，但没有确认到硬盘控制器驱动（常见于 Intel VMD）。如果新系统开机蓝屏或反复进入自动修复，请进入 BIOS 关闭 VMD（改为 AHCI）后再启动：{}",
             detail
-        )));
-        return;
+        ));
     }
 
     // Step 8: 清理临时文件
@@ -2422,6 +2686,8 @@ fn execute_install_workflow(
     // Auto-staging partition deletion remains fail-closed until the move-only canonical staging
     // authorization can be transferred to the checked PhysicalDrive transaction.
     let mut cleanup_verified = true;
+    authenticated_task.remove_scatter_payload();
+    remove_reassembled_image(&target_partition);
     let auto_staging = match authenticated_task.into_install_cleanup_authorization() {
         Ok(authorization) => authorization,
         Err(error) => {
@@ -2436,6 +2702,9 @@ fn execute_install_workflow(
             None
         }
     };
+    if config.in_place_target_staging {
+        remove_in_place_payload(&public_data_dir);
+    }
     if let Some(authorization) = full_disk_staging_cleanup.take() {
         match crate::core::custom_install::cleanup_full_disk_staging(&authorization) {
             Ok(_) => {}
@@ -2571,7 +2840,14 @@ pub(crate) fn generate_unattend_xml(
     // unattended local-account install. The first-logon finalizer always owns that bounded
     // cleanup, so its native NetAPI/Profile helper must be staged for every install rather
     // than only for personal-file restore or the built-in Administrator transition.
-    lr_core::first_logon::stage_account_helper(target_partition)?;
+    if let Err(error) = lr_core::first_logon::stage_account_helper(target_partition) {
+        if temporary_oobe_account.is_some() || config.preserve_personal_files {
+            return Err(error.context("暂存首次登录账户辅助程序失败"));
+        }
+        log::warn!(
+            "[UNATTEND] 首次登录账户辅助程序暂存失败，仅跳过 defaultuser0 清理，安装继续: {error:#}"
+        );
+    }
 
     let builtin = lr_core::unattend_account::render_builtin_administrator_unattend(
         &config.builtin_administrator,
@@ -2665,18 +2941,29 @@ pub(crate) fn generate_unattend_xml(
 
     if config.disable_windows_defender {
         if !is_win10_or_11 {
-            anyhow::bail!("Windows Security UI removal requires a confirmed Windows 10/11 target");
-        } else {
-            let path = lr_core::sec_health_ui::stage_online_removal_script(target_partition)?;
-            if !lr_core::sec_health_ui::online_script_is_staged(target_partition)? {
-                anyhow::bail!("Windows Security UI removal script readback mismatch");
-            }
-            specialize_account_command
-                .push_str(&lr_core::sec_health_ui::render_specialize_command(3)?);
-            log::info!(
-                "[ADVANCED_SEC_HEALTH_UI] phase=online_hook status=staged path={:?}",
-                path
+            log::warn!(
+                "[ADVANCED_SEC_HEALTH_UI] phase=online_hook status=skipped reason=target_version_unconfirmed; installation continues"
             );
+        } else {
+            let staged = (|| -> anyhow::Result<(std::path::PathBuf, String)> {
+                let path = lr_core::sec_health_ui::stage_online_removal_script(target_partition)?;
+                if !lr_core::sec_health_ui::online_script_is_staged(target_partition)? {
+                    anyhow::bail!("Windows Security UI removal script readback mismatch");
+                }
+                Ok((path, lr_core::sec_health_ui::render_specialize_command(3)?))
+            })();
+            match staged {
+                Ok((path, command)) => {
+                    specialize_account_command.push_str(&command);
+                    log::info!(
+                        "[ADVANCED_SEC_HEALTH_UI] phase=online_hook status=staged path={:?}",
+                        path
+                    );
+                }
+                Err(error) => log::warn!(
+                    "[ADVANCED_SEC_HEALTH_UI] phase=online_hook status=skipped detail={error:#}; installation continues"
+                ),
+            }
         }
     }
 
@@ -2732,18 +3019,29 @@ pub(crate) fn generate_unattend_xml(
                 reason
             );
         } else {
-            let appx_path =
-                lr_core::offline_appx::stage_curated_online_removal_script(target_partition)?;
-            if !lr_core::offline_appx::curated_online_script_is_staged(target_partition)? {
-                anyhow::bail!("preinstalled application removal script readback mismatch");
+            let staged = (|| -> anyhow::Result<(std::path::PathBuf, String)> {
+                let appx_path =
+                    lr_core::offline_appx::stage_curated_online_removal_script(target_partition)?;
+                if !lr_core::offline_appx::curated_online_script_is_staged(target_partition)? {
+                    anyhow::bail!("preinstalled application removal script readback mismatch");
+                }
+                Ok((
+                    appx_path,
+                    lr_core::offline_appx::render_curated_specialize_command(6)?,
+                ))
+            })();
+            match staged {
+                Ok((appx_path, command)) => {
+                    specialize_account_command.push_str(&command);
+                    log::info!(
+                        "[ADVANCED_APPX] phase=online_hook status=staged path={:?}",
+                        appx_path
+                    );
+                }
+                Err(error) => log::warn!(
+                    "[ADVANCED_APPX] phase=online_hook status=skipped detail={error:#}; installation continues"
+                ),
             }
-            specialize_account_command.push_str(
-                &lr_core::offline_appx::render_curated_specialize_command(6)?,
-            );
-            log::info!(
-                "[ADVANCED_APPX] phase=online_hook status=staged path={:?}",
-                appx_path
-            );
         }
     }
 
@@ -2752,7 +3050,26 @@ pub(crate) fn generate_unattend_xml(
     // only invokes that fixed launcher, avoiding nested `cmd /s /c` quoting differences while the
     // launcher preserves failures and removes staging only after the PowerShell process exits.
     let first_logon_commands = lr_core::first_logon::render_command(1)?;
-    let deploy_specialize_command = String::new();
+    // The advanced "run script during deployment" payload is copied to LetRecovery_Scripts before
+    // this answer file is generated (see `apply_authenticated_advanced_inputs`).
+    let deploy_specialize_command = if std::path::PathBuf::from(format!(
+        "{}\\LetRecovery_Scripts\\deploy.bat",
+        target_partition.trim_end_matches('\\')
+    ))
+    .is_file()
+    {
+        lr_core::unattend_command::render_specialize_run_synchronous_command(
+            1,
+            r#"cmd /d /c if exist %SystemDrive%\LetRecovery_Scripts\deploy.bat call %SystemDrive%\LetRecovery_Scripts\deploy.bat"#,
+            "Run custom deploy script",
+        )
+        .unwrap_or_else(|error| {
+            log::warn!("[UNATTEND] 部署脚本命令生成失败，已跳过: {error:#}");
+            String::new()
+        })
+    } else {
+        String::new()
+    };
 
     // 根据系统版本生成不同的 XML 内容
     let xml_content = if is_win7 {
@@ -2779,21 +3096,12 @@ pub(crate) fn generate_unattend_xml(
         )
     } else {
         // Windows 10/11 无人值守配置（默认）
-        let international = crate::core::dism_exe::DismExe::new()?
-            .get_offline_international_settings(target_partition)?;
-        log::info!(
-            "[UNATTEND] 目标系统国际化设置: UI={}, system={}, user={}, input={}, timezone={}",
-            international.ui_language,
-            international.system_locale,
-            international.user_locale,
-            international.input_locale,
-            international.time_zone
-        );
+        let international = read_target_international_settings(target_partition);
         generate_win10_unattend_xml(
             &deploy_specialize_command,
             &first_logon_commands,
             arch_str,
-            &international,
+            international.as_ref(),
             &specialize_account_command,
             &user_accounts,
             &auto_logon,
@@ -2835,6 +3143,152 @@ fn escape_xml_text(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+/// Read the applied image's international defaults for the Windows 10/11 answer file. DISM is
+/// preferred and the shared offline-registry reader is the fallback. When neither can read the
+/// image the International-Core component is omitted: OOBE then asks for region and keyboard
+/// instead of the whole installation failing after the image was already applied.
+fn read_target_international_settings(
+    target_partition: &str,
+) -> Option<crate::core::dism_exe::OfflineInternationalSettings> {
+    let dism_result = crate::core::dism_exe::DismExe::new()
+        .and_then(|dism| dism.get_offline_international_settings(target_partition));
+    let settings = match dism_result {
+        Ok(settings) => Some(settings),
+        Err(dism_error) => {
+            log::warn!(
+                "[UNATTEND] 无法通过 DISM 读取目标系统国际化设置，改用共享离线注册表读取: {dism_error:#}"
+            );
+            match lr_core::offline_international::read_offline_international_settings(
+                target_partition,
+            ) {
+                Ok(settings) => Some(crate::core::dism_exe::OfflineInternationalSettings {
+                    ui_language: settings.ui_language,
+                    system_locale: settings.system_locale,
+                    user_locale: settings.user_locale,
+                    input_locale: settings.input_locale,
+                    time_zone: settings.time_zone,
+                }),
+                Err(registry_error) => {
+                    log::warn!(
+                        "[UNATTEND] 目标系统国际化设置不可用，无人值守省略 International-Core（OOBE 将询问区域/键盘），安装继续: {registry_error:#}"
+                    );
+                    None
+                }
+            }
+        }
+    };
+    if let Some(international) = settings.as_ref() {
+        log::info!(
+            "[UNATTEND] 目标系统国际化设置: UI={}, system={}, user={}, input={}, timezone={}",
+            international.ui_language,
+            international.system_locale,
+            international.user_locale,
+            international.input_locale,
+            international.time_zone
+        );
+    }
+    settings
+}
+
+/// Apply the deploy script, first-logon script, registry file and custom files that the normal
+/// endpoint staged below `user_drivers\__advanced`. Every item is optional: a failure is logged,
+/// returned as a completion warning, and the installation continues.
+fn apply_authenticated_advanced_inputs(
+    target_partition: &str,
+    artifacts: &[std::path::PathBuf],
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let root = std::path::PathBuf::from(format!("{}\\", target_partition.trim_end_matches('\\')));
+    let scripts = root.join("LetRecovery_Scripts");
+    let mut registry_files = Vec::new();
+    for artifact in artifacts {
+        let components = artifact
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .collect::<Vec<_>>();
+        let Some(position) = components.windows(2).position(|pair| {
+            pair[0].eq_ignore_ascii_case("user_drivers") && pair[1].eq_ignore_ascii_case("__advanced")
+        }) else {
+            continue;
+        };
+        let rest = &components[position + 2..];
+        if rest.len() < 2 {
+            continue;
+        }
+        let kind = rest[0].to_ascii_lowercase();
+        let relative = rest[1..].iter().collect::<std::path::PathBuf>();
+        let destination = match kind.as_str() {
+            "deploy_script" => scripts.join("deploy.bat"),
+            "first_login_script" => scripts.join("firstlogon.bat"),
+            "registry_import" => {
+                registry_files.push(artifact.clone());
+                continue;
+            }
+            "custom_files" => root.join(&relative),
+            _ => continue,
+        };
+        let result = destination
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::copy(artifact, &destination).map(|_| ()));
+        match result {
+            Ok(()) => log::info!("[ADVANCED INPUT] {} -> {}", kind, destination.display()),
+            Err(error) => {
+                log::warn!(
+                    "[ADVANCED INPUT] {} 复制失败，已跳过: {} ({error})",
+                    kind,
+                    destination.display()
+                );
+                warnings.push(format!("{kind}: {error}"));
+            }
+        }
+    }
+    for registry_file in registry_files {
+        if let Err(error) = import_registry_file_offline(&root, &registry_file) {
+            log::warn!("[ADVANCED INPUT] 注册表导入失败，已跳过: {error:#}");
+            warnings.push(format!("registry_import: {error:#}"));
+        }
+    }
+    warnings
+}
+
+fn import_registry_file_offline(
+    root: &std::path::Path,
+    registry_file: &std::path::Path,
+) -> anyhow::Result<()> {
+    use lr_core::registry::OfflineRegistry;
+    let converted =
+        lr_core::reg_file::convert_reg_file_for_offline_hives(&std::fs::read(registry_file)?);
+    let temporary = root
+        .join("LetRecovery_Scripts")
+        .join("lr-advanced-registry-import.reg");
+    if let Some(parent) = temporary.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&temporary, &converted)?;
+    let config = root.join("Windows").join("System32").join("config");
+    let hives = [
+        ("pc-soft", config.join("SOFTWARE")),
+        ("pc-sys", config.join("SYSTEM")),
+        ("pc-default", root.join("Users").join("Default").join("NTUSER.DAT")),
+    ];
+    let mut loaded = Vec::new();
+    for (name, hive) in &hives {
+        match OfflineRegistry::load_hive(name, &hive.to_string_lossy()) {
+            Ok(()) => loaded.push(*name),
+            Err(error) => log::warn!("[ADVANCED INPUT] 加载离线注册表 {name} 失败: {error:#}"),
+        }
+    }
+    let result = OfflineRegistry::import_reg_file(&temporary.to_string_lossy());
+    for name in loaded.into_iter().rev() {
+        if let Err(error) = OfflineRegistry::unload_hive(name) {
+            log::warn!("[ADVANCED INPUT] 卸载离线注册表 {name} 失败: {error:#}");
+        }
+    }
+    let _ = std::fs::remove_file(&temporary);
+    result
 }
 
 /// 生成 Windows 7 专用的无人值守配置
@@ -2976,16 +3430,53 @@ fn generate_win10_unattend_xml(
     deploy_specialize_command: &str,
     first_logon_commands: &str,
     arch: &str,
-    international: &crate::core::dism_exe::OfflineInternationalSettings,
+    international: Option<&crate::core::dism_exe::OfflineInternationalSettings>,
     specialize_account_command: &str,
     user_accounts: &str,
     auto_logon: &str,
 ) -> String {
-    let ui_language = escape_xml_text(&international.ui_language);
-    let system_locale = escape_xml_text(&international.system_locale);
-    let user_locale = escape_xml_text(&international.user_locale);
-    let input_locale = escape_xml_text(&international.input_locale);
-    let time_zone = escape_xml_text(&international.time_zone);
+    // Missing international data only means OOBE asks for region/keyboard. It must never turn an
+    // already applied installation into a failed one.
+    let (international_component, time_zone_element) = match international {
+        Some(international) => {
+            let ui_language = escape_xml_text(&international.ui_language);
+            let system_locale = escape_xml_text(&international.system_locale);
+            let user_locale = escape_xml_text(&international.user_locale);
+            let input_locale = escape_xml_text(&international.input_locale);
+            let time_zone = international.time_zone.trim();
+            (
+                format!(
+                    r#"<component name="Microsoft-Windows-International-Core" processorArchitecture="{arch}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <InputLocale>{input_locale}</InputLocale>
+            <SystemLocale>{system_locale}</SystemLocale>
+            <UILanguage>{ui_language}</UILanguage>
+            <UserLocale>{user_locale}</UserLocale>
+        </component>"#
+                ),
+                if time_zone.is_empty() {
+                    String::new()
+                } else {
+                    format!("<TimeZone>{}</TimeZone>", escape_xml_text(time_zone))
+                },
+            )
+        }
+        None => (String::new(), String::new()),
+    };
+    // Without any command the specialize pass is omitted instead of writing an empty
+    // RunSynchronous list.
+    let specialize_commands = format!("{deploy_specialize_command}{specialize_account_command}");
+    let specialize_settings = if specialize_commands.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<settings pass="specialize">
+        <component name="Microsoft-Windows-Deployment" processorArchitecture="{arch}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <RunSynchronous>{specialize_commands}
+            </RunSynchronous>
+        </component>
+    </settings>"#
+        )
+    };
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
@@ -2999,23 +3490,11 @@ fn generate_win10_unattend_xml(
             </UserData>
         </component>
     </settings>
-    <settings pass="specialize">
-        <component name="Microsoft-Windows-Deployment" processorArchitecture="{arch}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <RunSynchronous>
-                {deploy_specialize_command}
-                {specialize_account_command}
-            </RunSynchronous>
-        </component>
-    </settings>
+    {specialize_settings}
     <settings pass="oobeSystem">
-        <component name="Microsoft-Windows-International-Core" processorArchitecture="{arch}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <InputLocale>{input_locale}</InputLocale>
-            <SystemLocale>{system_locale}</SystemLocale>
-            <UILanguage>{ui_language}</UILanguage>
-            <UserLocale>{user_locale}</UserLocale>
-        </component>
+        {international_component}
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="{arch}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-            <TimeZone>{time_zone}</TimeZone>
+            {time_zone_element}
             <OOBE>
                 <HideEULAPage>true</HideEULAPage>
                 <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
@@ -3029,19 +3508,142 @@ fn generate_win10_unattend_xml(
             </FirstLogonCommands>
         </component>
     </settings>
-</unattend>"#,
-        arch = arch,
-        deploy_specialize_command = deploy_specialize_command,
-        first_logon_commands = first_logon_commands,
-        specialize_account_command = specialize_account_command,
-        user_accounts = user_accounts,
-        auto_logon = auto_logon,
-        input_locale = input_locale,
-        system_locale = system_locale,
-        ui_language = ui_language,
-        user_locale = user_locale,
-        time_zone = time_zone
+</unattend>"#
     )
+}
+
+
+/// Directory on the formatted target that receives an image rebuilt from scattered raw chunks.
+const REASSEMBLY_DIRECTORY: &str = "LetRecovery_Reassembly";
+
+fn reassembled_image_path(target_partition: &str, image_path: &str) -> std::path::PathBuf {
+    let file_name = std::path::Path::new(image_path)
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("install.image"));
+    std::path::PathBuf::from(format!(
+        "{}\\{}",
+        target_partition.trim_end_matches(['\\', '/']),
+        REASSEMBLY_DIRECTORY
+    ))
+    .join(file_name)
+}
+
+/// Concatenate the authenticated raw chunks in manifest order onto the formatted target and
+/// prove that the result has exactly the length and SHA-256 bound in the authenticated config.
+fn reassemble_chunked_image(
+    task: &crate::core::config::AuthenticatedOperationTask,
+    target_partition: &str,
+    config: &crate::core::config::InstallConfig,
+    tx: &Sender<WorkerMessage>,
+) -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context as _;
+
+    let chunks = task.install_image_chunk_paths()?;
+    if chunks.is_empty() {
+        anyhow::bail!("认证清单中没有镜像分块");
+    }
+    let destination = reassembled_image_path(target_partition, &config.image_path);
+    let directory = destination
+        .parent()
+        .context("拼回路径没有父目录")?
+        .to_path_buf();
+    if directory.exists() {
+        std::fs::remove_dir_all(&directory)
+            .with_context(|| format!("清理旧的拼回目录 {}", directory.display()))?;
+    }
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("创建拼回目录 {}", directory.display()))?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .with_context(|| format!("创建拼回的镜像 {}", destination.display()))?;
+    let total = config.image_chunked_length.max(1);
+    let mut last_percentage = u8::MAX;
+    let (length, sha256) = lr_core::hash::concatenate_files_and_sha256(
+        &chunks,
+        std::io::BufWriter::with_capacity(4 << 20, &file),
+        |done| {
+            let percentage = (done.saturating_mul(100) / total).min(100) as u8;
+            if percentage != last_percentage {
+                last_percentage = percentage;
+                let _ = tx.send(WorkerMessage::SetProgress(percentage));
+            }
+            Ok(())
+        },
+    )
+    .with_context(|| format!("写入拼回的镜像 {}", destination.display()))?;
+    file.sync_all().context("刷新拼回的镜像")?;
+    drop(file);
+    if length != config.image_chunked_length
+        || !sha256.eq_ignore_ascii_case(config.image_chunked_sha256.trim())
+    {
+        let _ = std::fs::remove_dir_all(&directory);
+        anyhow::bail!(
+            "拼回的镜像与认证值不一致：长度 {} / {}，SHA-256 {} / {}",
+            length,
+            config.image_chunked_length,
+            sha256,
+            config.image_chunked_sha256
+        );
+    }
+    Ok(destination)
+}
+
+/// After an in-place target staging install, the staged payload sits inside the new system's
+/// `LetRecovery_Data`. Delete every entry except the handoff log directory; failures are only
+/// logged because the new system is already complete.
+fn remove_in_place_payload(public_data_dir: &std::path::Path) {
+    let entries = match std::fs::read_dir(public_data_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            log::warn!(
+                "[SCATTER] 读取目标盘内暂存目录 {} 失败，暂存文件未清理: {error}",
+                public_data_dir.display()
+            );
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(lr_core::install_log_handoff::HANDOFF_LOG_DIRECTORY)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let result = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        match result {
+            Ok(()) => log::info!("[SCATTER] 已删除目标盘内暂存条目 {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "[SCATTER] 删除目标盘内暂存条目 {} 失败，可以在新系统中手动删除: {error}",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Remove the rebuilt image after the installation finished; failures are only logged.
+fn remove_reassembled_image(target_partition: &str) {
+    let directory = std::path::PathBuf::from(format!(
+        "{}\\{}",
+        target_partition.trim_end_matches(['\\', '/']),
+        REASSEMBLY_DIRECTORY
+    ));
+    match std::fs::remove_dir_all(&directory) {
+        Ok(()) => log::info!("[SCATTER] 已删除目标分区上拼回的镜像 {}", directory.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => log::warn!(
+            "[SCATTER] 删除拼回的镜像 {} 失败，可以在新系统中手动删除: {error}",
+            directory.display()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -3316,7 +3918,7 @@ mod workflow_session_tests {
             &deploy_specialize_command,
             &first_logon_commands,
             "amd64",
-            &international,
+            Some(&international),
             &security_ui_command,
             "<UserAccounts><AdministratorPassword><Value>test</Value><PlainText>true</PlainText></AdministratorPassword></UserAccounts>",
             "<AutoLogon><Enabled>true</Enabled><Username>Administrator</Username></AutoLogon>",
@@ -3373,7 +3975,7 @@ mod workflow_session_tests {
             &deploy_specialize_command,
             "",
             "amd64",
-            &international,
+            Some(&international),
             "",
             "<UserAccounts><AdministratorPassword><Value>test</Value><PlainText>true</PlainText></AdministratorPassword></UserAccounts>",
             "<AutoLogon><Enabled>true</Enabled><Username>Administrator</Username></AutoLogon>",

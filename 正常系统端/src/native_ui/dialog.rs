@@ -245,6 +245,9 @@ struct Handles {
 }
 
 struct DialogState {
+    /// Extra command buttons a tool places between Secondary and Primary (for example the
+    /// quick-partition "Apply changes"); laid out with the standard buttons on every layout.
+    extra_commands: std::cell::RefCell<Vec<HWND>>,
     owner: HWND,
     hwnd: HWND,
     dpi: u32,
@@ -257,6 +260,11 @@ struct DialogState {
     result: Option<DialogResult>,
     primary_closes: bool,
     secondary_closes: bool,
+    /// Set by show_modal. Only a modal confirmation hides itself when its Primary/Secondary
+    /// button closes it; a modeless tool keeps its window while the owner handles the command.
+    modal: bool,
+    /// A theme or colour change message arrived and one refresh is already queued.
+    theme_refresh_pending: bool,
     first_presentation_pending: bool,
     selected_navigation_command: Option<u16>,
 }
@@ -265,6 +273,7 @@ impl DialogState {
     fn new(owner: HWND, spec: &DialogSpec) -> Self {
         let palette = Palette::system();
         Self {
+            extra_commands: std::cell::RefCell::new(Vec::new()),
             owner,
             hwnd: HWND::default(),
             dpi: 96,
@@ -283,6 +292,8 @@ impl DialogState {
             result: None,
             primary_closes: true,
             secondary_closes: true,
+            modal: false,
+            theme_refresh_pending: false,
             first_presentation_pending: true,
             selected_navigation_command: None,
         }
@@ -431,6 +442,45 @@ impl DialogState {
                 move_to(control, rect);
             }
         }
+        // Extra commands sit left of Primary, and Secondary moves left past them. Doing this
+        // here (not afterwards in the tool) keeps them apart on every layout; before, any later
+        // shell layout put Secondary back next to Primary, on top of the extra button.
+        let extras = self.extra_commands.borrow().clone();
+        if let (false, Some(primary_rect)) = (extras.is_empty(), layout.buttons[1]) {
+            let gap = scale(10, self.dpi);
+            let mut right = primary_rect.x;
+            for extra in extras.iter().rev() {
+                let mut text = [0u16; 128];
+                let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(*extra, &mut text)
+                    .max(0) as usize;
+                let width = measured_button_width(
+                    self.hwnd,
+                    self.font,
+                    &String::from_utf16_lossy(&text[..length]),
+                    self.dpi,
+                    metrics.button_min_width,
+                );
+                right -= gap + width;
+                move_to(
+                    *extra,
+                    LogicalRect {
+                        x: right,
+                        y: primary_rect.y,
+                        width,
+                        height: primary_rect.height,
+                    },
+                );
+            }
+            if let (Some(secondary), Some(rect)) = (handles.secondary, layout.buttons[0]) {
+                move_to(
+                    secondary,
+                    LogicalRect {
+                        x: right - gap - rect.width,
+                        ..rect
+                    },
+                );
+            }
+        }
     }
 
     unsafe fn fit_content_height(&mut self, logical_content_height: i32) {
@@ -478,7 +528,18 @@ impl DialogState {
     unsafe fn choose(&mut self, result: DialogResult) {
         self.result = Some(result);
         let closes = dialog_result_closes(result, self.primary_closes, self.secondary_closes);
-        if closes {
+        // Hiding a modeless tool for a command such as Copy or Refresh made it vanish and come
+        // back (shown again by its owner a moment later): the reported white flash. Only a modal
+        // dialog, or an explicit Cancel/close, hides immediately; the owner closes a modeless tool
+        // itself when a command really ends it.
+        let hide = closes && (self.modal || result == DialogResult::Cancel);
+        super::redraw::ui_detail(|| {
+            format!(
+                "dialog {:?} choose {:?}: closes={closes} modal={} hide={hide}",
+                self.hwnd.0, result, self.modal
+            )
+        });
+        if hide {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
     }
@@ -650,6 +711,16 @@ impl DialogShell {
 
     /// Returns a shell command button so a tool can insert an additional command in the shared
     /// bottom bar without guessing its translated width or DPI-scaled position.
+    /// Registers extra command buttons (children of the dialog) laid out between Secondary and
+    /// Primary, and lays the command bar out again.
+    pub unsafe fn set_extra_command_buttons(&self, buttons: &[HWND]) {
+        let changed = *self.state.extra_commands.borrow() != buttons;
+        if changed {
+            *self.state.extra_commands.borrow_mut() = buttons.to_vec();
+        }
+        self.state.layout();
+    }
+
     pub fn command_button(&self, result: DialogResult) -> Option<HWND> {
         let handles = self.state.handles.as_ref()?;
         match result {
@@ -729,23 +800,39 @@ impl DialogShell {
         // Tool-specific controls are created after the shell. Prepare every descendant while the
         // top-level window is still hidden, so USER32 never exposes the common-control defaults
         // (white empty ListView bodies, black header/check text, or the default GUI font).
-        prepare_dialog_descendants(&self.state);
+        // Only while hidden: re-theming every child of a visible dialog after each command (copy,
+        // refresh, browse) reloaded their themes and repainted them, visible as a white flash.
+        let visible = IsWindowVisible(self.state.hwnd).as_bool();
+        let audit = !visible && super::ui_audit::enabled();
+        super::redraw::ui_detail(|| {
+            format!(
+                "dialog {:?} show_modeless visible={visible} prepare={}",
+                self.state.hwnd.0, !visible
+            )
+        });
+        if !visible {
+            prepare_dialog_descendants(&self.state);
+        }
         let first_visible_frame = self.state.first_presentation_pending;
-        let _ = ShowWindow(self.state.hwnd, SW_SHOW);
         if first_visible_frame {
-            // Paint the complete dialog once before the owner starts its asynchronous inventory.
-            // Otherwise USER32 can expose unpainted white ListView/button child surfaces until
-            // the next queued paint message, which is especially visible on tool dialogs.
-            let _ = RedrawWindow(
-                self.state.hwnd,
-                None,
-                None,
-                RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
-            );
+            // Paint the complete dialog while DWM keeps it cloaked, so its first visible frame is
+            // final instead of a white window that fills in control by control.
+            super::redraw::show_top_level_without_flash(self.state.hwnd);
             self.state.first_presentation_pending = false;
+        } else {
+            let _ = ShowWindow(self.state.hwnd, SW_SHOW);
         }
         if let Some(handles) = &self.state.handles {
             let _ = SetFocus(handles.primary);
+        }
+        if audit {
+            let title = {
+                let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(self.state.hwnd).max(0) as usize;
+                let mut buffer = vec![0u16; length + 1];
+                let copied = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(self.state.hwnd, &mut buffer).max(0) as usize;
+                String::from_utf16_lossy(&buffer[..copied])
+            };
+            super::ui_audit::audit_surface(self.state.hwnd, &format!("工具窗口/{title}"));
         }
     }
 
@@ -766,6 +853,7 @@ impl DialogShell {
 
     /// Runs the standard nested dialog loop. No business callback is executed here.
     pub unsafe fn show_modal(&mut self) -> DialogResult {
+        self.state.modal = true;
         self.show_modeless();
         if !self.state.owner.is_invalid() {
             let _ = EnableWindow(self.state.owner, false);
@@ -790,6 +878,8 @@ struct DialogDescendantTheme {
     palette: Palette,
     font: HFONT,
 }
+
+const WM_REFRESH_DIALOG_THEME: u32 = 0x8000 + 0x4d7;
 
 unsafe fn prepare_dialog_descendants(state: &DialogState) {
     let context = DialogDescendantTheme {
@@ -927,9 +1017,47 @@ unsafe extern "system" fn dialog_proc(
         }
         WM_SIZE => {
             if let Some(state) = state {
+                let trace_start = super::redraw::trace_now();
                 state.layout();
+                let layout_done = super::redraw::trace_now();
+                if IsWindowVisible(hwnd).as_bool() {
+                    // Paint the relaid-out controls inside this size step, so the content moves
+                    // with the frame while the border is dragged instead of trailing it. Only what
+                    // the move invalidated is painted: fields no longer draw over their siblings
+                    // (WS_CLIPSIBLINGS), so USER32's copied bits are always clean.
+                    let _ = RedrawWindow(
+                        hwnd,
+                        None,
+                        None,
+                        RDW_UPDATENOW | windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN,
+                    );
+                    super::redraw::trace_resize_step(hwnd, trace_start, layout_done);
+                    if super::controls::live_resize_active() {
+                        super::redraw::present_live_resize_step();
+                    }
+                }
             }
             LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_ENTERSIZEMOVE => {
+            super::controls::set_live_resize(true);
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE => {
+            super::redraw::trace_resize_finished(hwnd, "工具窗口");
+            super::controls::set_live_resize(false);
+            // One exact repaint of the final layout (surfaces drawn with the fast painter while
+            // dragging are rendered with the cached exact renderer again).
+            let _ = RedrawWindow(
+                hwnd,
+                None,
+                None,
+                RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
+            DefWindowProcW(hwnd, message, wparam, lparam)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_NCLBUTTONDOWN => {
+            super::redraw::nc_left_button_down_with_live_drag(hwnd, wparam, lparam)
         }
         WM_DPICHANGED => {
             if let Some(state) = state {
@@ -964,18 +1092,44 @@ unsafe extern "system" fn dialog_proc(
             LRESULT(0)
         }
         WM_SETTINGCHANGE | WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+            // One light/dark switch delivers a burst of these messages. Re-theming for each one
+            // froze the dialog each time (WM_SETREDRAW hides a top-level window from DWM), so the
+            // tool window vanished and came back several times. Queue a single refresh instead.
             if let Some(state) = state {
-                // Existing UxTheme handles become stale on WM_THEMECHANGED.  Freeze the complete
-                // dialog while replacing brushes and descendant theme classes so a modeless tool
-                // never shows half of each palette during an online system-theme switch.
-                let redraw = redraw::suspend(hwnd);
+                super::redraw::ui_detail(|| {
+                    format!(
+                        "dialog {:?} theme message {:#06x} (refresh already queued: {})",
+                        hwnd.0, message, state.theme_refresh_pending
+                    )
+                });
+                if !state.theme_refresh_pending
+                    && super::theme::settings_change_affects_theme(message, wparam, lparam)
+                {
+                    state.theme_refresh_pending = true;
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        hwnd,
+                        WM_REFRESH_DIALOG_THEME,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+            LRESULT(0)
+        }
+        WM_REFRESH_DIALOG_THEME => {
+            if let Some(state) = state {
+                state.theme_refresh_pending = false;
+                super::combo_popup::close_any(false);
+                // Existing UxTheme handles are stale after a theme change. Replace brushes and
+                // descendant themes under a screen cover: the window stays on screen showing its
+                // previous frame until the new one is complete (no freeze, no disappearing).
+                let transition = redraw::begin_page_transition(hwnd, "对话框切换主题");
                 state.refresh_palette();
                 state.apply_theme();
-                // Reapplying an existing subclass updates its palette reference data. Walk every
-                // live descendant in the same frozen frame so fields, ComboLBox popups, reports,
-                // choices, progress bars and sliders cannot retain their creation-time theme.
+                // Reapplying an existing subclass updates its palette reference data, so every
+                // live descendant gets the new palette in the same frame.
                 prepare_dialog_descendants(state);
-                redraw::resume(hwnd, redraw);
+                redraw::resume(hwnd, transition);
             }
             LRESULT(0)
         }
@@ -1019,7 +1173,10 @@ unsafe extern "system" fn dialog_proc(
                 if item.CtlType.0 == 5 && !state.owner.is_invalid() {
                     return SendMessageW(state.owner, message, wparam, lparam);
                 }
-                state.draw_item(item);
+                super::redraw::draw_item_buffered(item, |item| {
+                    state.draw_item(item);
+                    true
+                });
                 return LRESULT(1);
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
@@ -1027,6 +1184,22 @@ unsafe extern "system" fn dialog_proc(
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
             if let Some(state) = state {
                 let dc = HDC(wparam.0 as *mut _);
+                let control = HWND(lparam.0 as *mut _);
+                if message == WM_CTLCOLORSTATIC && is_edit_control(control) {
+                    // Read-only and disabled Edit controls ask with WM_CTLCOLORSTATIC. Keep them on
+                    // the same field surface as editable ones (as the main window does), using the
+                    // field's own caption colour; the window colour made a disabled field a
+                    // different colour from its frame.
+                    let background = state.palette.edit_brush_color_for(control);
+                    let _ = SetTextColor(dc, state.palette.edit_text_color_for(control));
+                    let _ = SetBkColor(dc, background);
+                    let brush = if background == state.palette.edit {
+                        state.brushes.edit_opaque
+                    } else {
+                        state.brushes.edit
+                    };
+                    return LRESULT(brush.0 as isize);
+                }
                 let _ = SetTextColor(dc, state.palette.text);
                 let _ = SetBkColor(dc, state.palette.window);
                 let _ = SetBkMode(dc, TRANSPARENT);
@@ -1183,6 +1356,13 @@ unsafe fn measured_button_width(
 
 const fn scale(value: i32, dpi: u32) -> i32 {
     ((value as i64 * dpi as i64 + 48) / 96) as i32
+}
+
+unsafe fn is_edit_control(control: HWND) -> bool {
+    let mut class_name = [0u16; 16];
+    let length = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(control, &mut class_name);
+    length > 0
+        && String::from_utf16_lossy(&class_name[..length as usize]).eq_ignore_ascii_case("Edit")
 }
 
 unsafe fn move_to(hwnd: HWND, rect: LogicalRect) {

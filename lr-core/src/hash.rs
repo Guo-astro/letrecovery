@@ -79,6 +79,54 @@ pub fn copy_and_sha256<R: Read, W: Write>(
     Ok((total, to_hex(&hasher.finalize())))
 }
 
+/// Incremental SHA-256 for callers that hash one stream while writing it to several places
+/// (for example raw image chunks on different volumes).
+#[derive(Clone, Default)]
+pub struct Sha256Stream(Sha256);
+
+impl Sha256Stream {
+    pub fn new() -> Self {
+        Self(Sha256::new())
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// Lowercase hexadecimal digest of every byte passed to [`Self::update`].
+    pub fn finish_hex(self) -> String {
+        to_hex(&self.0.finalize())
+    }
+}
+
+/// Concatenate `sources` in order into `writer` while calculating the SHA-256 of the complete
+/// written stream. `on_progress` receives the total number of bytes written so far and may return
+/// `ErrorKind::Interrupted` to cancel. Used to rebuild an image from scattered raw chunks.
+pub fn concatenate_files_and_sha256<W: Write>(
+    sources: &[std::path::PathBuf],
+    mut writer: W,
+    mut on_progress: impl FnMut(u64) -> std::io::Result<()>,
+) -> std::io::Result<(u64, String)> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 4 << 20];
+    let mut total = 0u64;
+    for source in sources {
+        let mut reader = File::open(source)?;
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            writer.write_all(&buffer[..count])?;
+            hasher.update(&buffer[..count]);
+            total = total.saturating_add(count as u64);
+            on_progress(total)?;
+        }
+    }
+    writer.flush()?;
+    Ok((total, to_hex(&hasher.finalize())))
+}
+
 /// 计算文件的 SHA-256（流式，回调累计已读字节数）。
 pub fn sha256_file(
     path: impl AsRef<Path>,
@@ -204,5 +252,37 @@ mod tests {
         assert!(hash_matches("ABCDEF", "ab cd ef")); // 忽略大小写/空白
         assert!(!hash_matches("abcdef", "abcde0"));
         assert!(!hash_matches("abcdef", "   ")); // 期望为空 → 不匹配
+    }
+}
+
+#[cfg(test)]
+mod concatenate_tests {
+    use super::*;
+
+    #[test]
+    fn concatenated_chunks_hash_like_the_original_stream() {
+        let directory = std::env::temp_dir().join(format!(
+            "lr-concat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let original: Vec<u8> = (0..300_000u32).map(|value| (value % 251) as u8).collect();
+        let mut sources = Vec::new();
+        for (index, part) in original.chunks(70_001).enumerate() {
+            let path = directory.join(format!("part{index}"));
+            std::fs::write(&path, part).unwrap();
+            sources.push(path);
+        }
+        let mut joined = Vec::new();
+        let (length, digest) =
+            concatenate_files_and_sha256(&sources, &mut joined, |_| Ok(())).unwrap();
+        assert_eq!(length, original.len() as u64);
+        assert_eq!(joined, original);
+        assert_eq!(digest, sha256_bytes(&original));
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

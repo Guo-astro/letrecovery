@@ -207,13 +207,60 @@ fn valid_input_locale(value: &str) -> bool {
         return valid_locale_name(value);
     };
     language.len() == 4
-        && keyboard.len() == 8
         && language
             .chars()
             .all(|character| character.is_ascii_hexdigit())
-        && keyboard
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
+        && ((keyboard.len() == 8
+            && keyboard
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()))
+            || valid_input_text_service_profile(keyboard))
+}
+
+/// `{TIP CLSID}{profile GUID}` as reported by DISM for IME-based default keyboards (for example
+/// Microsoft Pinyin on zh-CN images).
+fn valid_input_text_service_profile(value: &str) -> bool {
+    value.is_ascii()
+        && value.len() == 76
+        && is_braced_guid_literal(&value[..38])
+        && is_braced_guid_literal(&value[38..])
+}
+
+fn is_braced_guid_literal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 38
+        && bytes[0] == b'{'
+        && bytes[37] == b'}'
+        && bytes[1..37]
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => *byte == b'-',
+                _ => byte.is_ascii_hexdigit(),
+            })
+}
+
+/// A plain `LLLL:0000LLLL` keyboard is the layout-only variant of the installation language. For
+/// IME languages (zh-CN, ja-JP, ko-KR ...) using it as `InputLocale` leaves new users without the
+/// default IME, so the language tag is used instead and Windows selects that language's default
+/// input profile. Every other value is returned unchanged.
+fn prefer_language_default_input(input_locale: &str, ui_language: &str) -> String {
+    if let Some((language, keyboard)) = input_locale.split_once(':') {
+        if language.len() == 4
+            && keyboard.len() == 8
+            && keyboard.is_ascii()
+            && keyboard.starts_with("0000")
+            && keyboard[4..].eq_ignore_ascii_case(language)
+            && valid_locale_name(ui_language)
+        {
+            if let Ok(name) = locale_name_from_registry_id(language) {
+                if name.eq_ignore_ascii_case(ui_language) {
+                    return ui_language.to_string();
+                }
+            }
+        }
+    }
+    input_locale.to_string()
 }
 
 fn valid_time_zone(value: &str) -> bool {
@@ -360,23 +407,48 @@ fn read_offline_international_settings_from_registry(
         locale_name_from_registry_id(&system_language).context("转换目标系统区域设置失败")?;
 
     let international_key = default_hive.key(r"Control Panel\International");
-    let user_locale = OfflineRegistry::query_string(&international_key, "LocaleName")
-        .context("读取目标系统默认用户区域设置失败")?;
-    if !valid_locale_name(&user_locale) {
-        bail!("离线 DEFAULT 注册表返回了无效的用户区域设置: {user_locale}");
-    }
+    let user_locale = match OfflineRegistry::query_string(&international_key, "LocaleName") {
+        Ok(value) if valid_locale_name(&value) => value,
+        Ok(value) => {
+            log::warn!(
+                "[UNATTEND] 离线 DEFAULT 注册表用户区域设置无效（{value}），改用系统区域设置 {system_locale}"
+            );
+            system_locale.clone()
+        }
+        Err(error) => {
+            log::warn!(
+                "[UNATTEND] 读取目标系统默认用户区域设置失败，改用系统区域设置 {system_locale}: {error:#}"
+            );
+            system_locale.clone()
+        }
+    };
 
     let keyboard_key = default_hive.key(r"Keyboard Layout\Preload");
-    let keyboard_layout = OfflineRegistry::query_string(&keyboard_key, "1")
-        .context("读取目标系统默认键盘布局失败")?;
-    let input_locale = input_locale_from_keyboard_layout(&keyboard_layout)?;
+    let input_locale = match OfflineRegistry::query_string(&keyboard_key, "1")
+        .map_err(anyhow::Error::from)
+        .and_then(|layout| input_locale_from_keyboard_layout(&layout))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!(
+                "[UNATTEND] 读取目标系统默认键盘布局失败，改用界面语言 {ui_language} 的默认输入法: {error:#}"
+            );
+            ui_language.clone()
+        }
+    };
 
     let time_zone_key = system_hive.key(&format!(r"{control_root}\TimeZoneInformation"));
-    let time_zone = OfflineRegistry::query_string(&time_zone_key, "TimeZoneKeyName")
-        .context("读取目标系统默认时区失败")?;
-    if !valid_time_zone(&time_zone) {
-        bail!("离线 SYSTEM 注册表返回了无效的默认时区: {time_zone}");
-    }
+    let time_zone = match OfflineRegistry::query_string(&time_zone_key, "TimeZoneKeyName") {
+        Ok(value) if valid_time_zone(&value) => value,
+        Ok(value) => {
+            log::warn!("[UNATTEND] 离线 SYSTEM 注册表默认时区无效（{value}），无人值守不设置时区");
+            String::new()
+        }
+        Err(error) => {
+            log::warn!("[UNATTEND] 读取目标系统默认时区失败，无人值守不设置时区: {error:#}");
+            String::new()
+        }
+    };
 
     Ok(OfflineInternationalSettings {
         ui_language,
@@ -742,8 +814,8 @@ impl DismExe {
         let dism_result = self
             .execute_with_progress(&["/English", &image_arg, "/Get-Intl"], None)
             .and_then(|output| parse_offline_international_settings(&output));
-        match dism_result {
-            Ok(settings) => Ok(settings),
+        let settings = match dism_result {
+            Ok(settings) => settings,
             Err(dism_error) => {
                 log::warn!(
                     "[UNATTEND] DISM /Get-Intl 不可用，改用目标系统离线注册表只读回退: {:#}",
@@ -751,10 +823,8 @@ impl DismExe {
                 );
                 match read_offline_international_settings_from_registry(image_path) {
                     Ok(settings) => {
-                        log::info!(
-                            "[UNATTEND] 已从目标系统离线注册表读取并验证国际化设置"
-                        );
-                        Ok(settings)
+                        log::info!("[UNATTEND] 已从目标系统离线注册表读取国际化设置");
+                        settings
                     }
                     Err(registry_error) => bail!(
                         "无法读取目标系统国际化设置；DISM /Get-Intl 失败: {:#}; 离线注册表回退失败: {:#}",
@@ -763,7 +833,20 @@ impl DismExe {
                     ),
                 }
             }
+        };
+        let input_locale =
+            prefer_language_default_input(&settings.input_locale, &settings.ui_language);
+        if input_locale != settings.input_locale {
+            log::info!(
+                "[UNATTEND] 默认键盘 {} 只是 {} 的纯键盘布局，InputLocale 改用语言标记以保留该语言的默认输入法",
+                settings.input_locale,
+                settings.ui_language
+            );
         }
+        Ok(OfflineInternationalSettings {
+            input_locale,
+            ..settings
+        })
     }
 
     fn normalized_offline_image_argument(image_path: &str) -> Result<String> {

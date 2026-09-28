@@ -1073,10 +1073,29 @@ impl WimlibManager {
         first_part: &str,
         exact_resource_files: &[PathBuf],
     ) -> Result<(), String> {
-        crate::install_source_lock::verify_exact_install_image_span_paths(
-            Path::new(first_part),
-            exact_resource_files,
-        )?;
+        if crate::install_source_lock::install_image_spans_share_directory(exact_resource_files) {
+            crate::install_source_lock::verify_exact_install_image_span_paths(
+                Path::new(first_part),
+                exact_resource_files,
+            )?;
+        } else {
+            // Scattered staging: the parts live on different volumes, so directory enumeration
+            // cannot describe the set. The caller's list is the authenticated manifest order and
+            // wimlib itself rejects parts with a foreign GUID, wrong part number or wrong count.
+            let first = exact_resource_files
+                .first()
+                .ok_or_else(|| "split WIM apply requires at least one resource file".to_owned())?;
+            let expected = std::fs::canonicalize(first)
+                .map_err(|error| format!("canonicalize first split WIM part: {error}"))?;
+            let actual = std::fs::canonicalize(first_part)
+                .map_err(|error| format!("canonicalize selected split WIM part: {error}"))?;
+            if expected != actual {
+                return Err("the selected split WIM part is not the first authenticated part".into());
+            }
+            if let Some(missing) = exact_resource_files.iter().find(|path| !path.is_file()) {
+                return Err(format!("split WIM part is missing: {}", missing.display()));
+            }
+        }
         if exact_resource_files.len() <= 1 {
             return Ok(());
         }

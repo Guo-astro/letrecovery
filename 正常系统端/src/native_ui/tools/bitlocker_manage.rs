@@ -16,7 +16,7 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowTextLengthW, GetWindowTextW, MoveWindow, SendMessageW, SetWindowTextW,
+    GetClientRect, GetWindowTextLengthW, GetWindowTextW, MoveWindow, SendMessageW,
     ShowWindow, BS_OWNERDRAW, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT,
     CB_SETCURSEL, ES_AUTOHSCROLL, ES_PASSWORD, ES_READONLY, SW_HIDE, SW_SHOW, WM_SETFONT,
     WS_BORDER, WS_TABSTOP,
@@ -315,7 +315,7 @@ impl NativeBitLockerManageDialog {
         let dpi = GetDpiForWindow(shell.hwnd()).max(96);
         let face = wide("Microsoft YaHei");
         let font = CreateFontW(
-            -scale(14, dpi),
+            -scale(12, dpi),
             0,
             0,
             0,
@@ -874,7 +874,7 @@ unsafe fn create_controls(parent: HWND) -> windows::core::Result<Controls> {
             parent,
             w!("EDIT"),
             "",
-            ES_AUTOHSCROLL | ES_PASSWORD | WS_BORDER.0 as i32 | WS_TABSTOP.0 as i32,
+            ES_AUTOHSCROLL | ES_PASSWORD | WS_TABSTOP.0 as i32,
             ID_CREDENTIAL,
         )?,
         warning: child(parent, w!("STATIC"), "", 0, 0)?,
@@ -889,7 +889,7 @@ unsafe fn create_controls(parent: HWND) -> windows::core::Result<Controls> {
             parent,
             w!("EDIT"),
             "",
-            ES_AUTOHSCROLL | ES_READONLY | WS_BORDER.0 as i32,
+            ES_AUTOHSCROLL | ES_READONLY,
             ID_RECOVERY_VALUE,
         )?,
         export_recovery: button(&crate::tr!("导出到文件"), ID_EXPORT_RECOVERY)?,
@@ -1092,7 +1092,10 @@ fn volume_columns(width: i32, dpi: u32) -> [i32; 5] {
 }
 
 fn format_size(value_mb: u64) -> String {
-    format!("{:.1} GB", value_mb as f64 / 1024.0)
+    if value_mb == 0 {
+        return "—".into();
+    }
+    crate::native_ui::layout::format_capacity_mb(value_mb)
 }
 
 fn display_label(value: &str) -> String {
@@ -1111,8 +1114,7 @@ unsafe fn window_text(control: HWND) -> String {
 }
 
 unsafe fn set_text(control: HWND, text: &str) {
-    let text = wide(text);
-    let _ = SetWindowTextW(control, PCWSTR(text.as_ptr()));
+    crate::native_ui::redraw::set_window_text_if_changed(control, text);
 }
 
 unsafe fn move_control(control: HWND, x: i32, y: i32, width: i32, height: i32) {
@@ -1140,6 +1142,12 @@ mod tests {
             protection_method: "TPM + Recovery Password".into(),
             encryption_percentage: None,
         }
+    }
+
+    #[test]
+    fn unknown_volume_size_uses_placeholder_instead_of_zero_gigabytes() {
+        assert_eq!(format_size(0), "—");
+        assert_eq!(format_size(1024), "1.0 GB");
     }
 
     #[test]

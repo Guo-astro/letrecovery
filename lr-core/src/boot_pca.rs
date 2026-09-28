@@ -40,7 +40,9 @@ pub fn classify_installed_windows_boot_family(
     match version.major {
         5 => Ok(InstalledWindowsBootFamily::Nt5),
         6 if version.minor <= 3 => Ok(InstalledWindowsBootFamily::LegacyUefi),
-        10 => Ok(InstalledWindowsBootFamily::ModernPca),
+        // Windows 10/11 report 10.0. Technical previews (6.4) and any later major version use
+        // the same modern boot-manager family.
+        major if major >= 6 => Ok(InstalledWindowsBootFamily::ModernPca),
         _ => Err(format!("不支持或无法确认的目标 Windows 版本: {version}")),
     }
 }
@@ -49,10 +51,42 @@ pub fn inspect_installed_windows_boot_family(
     windows_partition: &str,
 ) -> Result<(FileVersion, InstalledWindowsBootFamily), String> {
     let win = windows_partition.trim_end_matches(['\\', ':']);
-    let ntdll = PathBuf::from(format!("{}:\\Windows\\System32\\ntdll.dll", win));
-    let version = crate::windows_file_version::query_file_version(&ntdll)
-        .map_err(|error| format!("读取目标系统版本失败 {}: {error}", ntdll.display()))?;
-    Ok((version, classify_installed_windows_boot_family(version)?))
+    let system32 = PathBuf::from(format!("{}:\\Windows\\System32", win));
+    // Modified images sometimes carry an ntdll.dll without a readable version resource. Try the
+    // other core binaries before giving up on the version.
+    let mut first_error = None;
+    for name in [
+        "ntdll.dll",
+        "ntoskrnl.exe",
+        "kernelbase.dll",
+        "kernel32.dll",
+        "winload.efi",
+    ] {
+        let path = system32.join(name);
+        match crate::windows_file_version::query_file_version(&path) {
+            Ok(version) => return Ok((version, classify_installed_windows_boot_family(version)?)),
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("读取目标系统版本失败 {}: {error}", path.display()));
+                }
+            }
+        }
+    }
+    // No core binary exposes a version. Plain BCDBoot (the modern family) works for every
+    // Windows 8+ image and is the least surprising choice.
+    log::warn!(
+        "[BOOT] {}; the modern boot-manager family is used",
+        first_error.unwrap_or_default()
+    );
+    Ok((
+        FileVersion {
+            major: 10,
+            minor: 0,
+            build: 0,
+            revision: 0,
+        },
+        InstalledWindowsBootFamily::ModernPca,
+    ))
 }
 
 fn verify_locked_file(

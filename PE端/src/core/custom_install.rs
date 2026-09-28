@@ -7,7 +7,7 @@
 use anyhow::{bail, Context, Result};
 
 use lr_core::custom_install::{
-    plan_full_disk_layout, validate_existing_staging_extent, CustomInstallPlan, FullDiskRole,
+    plan_full_disk_layout_for_disk, validate_existing_staging_extent, CustomInstallPlan, FullDiskRole,
     PlannedPartition, PlannedPartitionRole, RepartitionAllDisksPlan, RequestedPartitionStyle,
     BIOS_SYSTEM_FUNCTIONAL_MINIMUM_BYTES, ESP_4KN_MINIMUM_BYTES, ESP_512_MINIMUM_BYTES,
     MIN_USEFUL_DATA_BYTES, MSR_WINDOWS_7_MINIMUM_BYTES,
@@ -510,13 +510,26 @@ pub fn preflight_full_disk_install(
         } else {
             initial_layout.disk_size_bytes
         };
-        let layout = plan_full_disk_layout(
+        let layout = plan_full_disk_layout_for_disk(
             selection.style,
             selection.role,
             usable_end,
+            initial_layout.disk_size_bytes,
             current_plan.windows_partition_bytes,
         )
         .map_err(anyhow::Error::msg)?;
+        if let Some(windows) = layout
+            .iter()
+            .find(|partition| partition.role == PlannedPartitionRole::Windows)
+        {
+            log::info!(
+                "[FULL DISK] planned Windows volume {} bytes (image minimum {} bytes, disk {} bytes, usable end {} bytes)",
+                windows.length_bytes,
+                current_plan.windows_partition_bytes,
+                initial_layout.disk_size_bytes,
+                usable_end
+            );
+        }
         prepared.push(PreparedDisk {
             locator_token: target.locator_token,
             role: target.role,
@@ -885,12 +898,46 @@ pub fn cleanup_full_disk_staging(authorization: &FullDiskStagingCleanup) -> Resu
         &layout,
     )
     .context("delete the preserved same-disk staging partition")?;
-    lr_core::windows_storage::extend_volume_checked(
-        authorization.recipient_letter,
-        recipient,
-        reclaim_length,
-    )
-    .context("return preserved staging space to the adjacent volume")?;
+    // The full-disk transaction deleted every old partition except the staging extent, so space
+    // behind the staging extent is free as well. Return the whole contiguous free range to the
+    // recipient instead of leaving that tail unallocated; fall back to the exact staging range if
+    // the provider cannot confirm or extend the larger range.
+    let full_reclaim_length =
+        lr_core::windows_storage::current_free_extents(authorization.disk_number)
+            .ok()
+            .and_then(|extents| {
+                extents
+                    .iter()
+                    .filter(|extent| extent.offset_bytes <= recipient_end)
+                    .filter_map(|extent| extent.offset_bytes.checked_add(extent.length_bytes))
+                    .filter(|end| *end >= staging_end)
+                    .max()
+            })
+            .and_then(|end| end.checked_sub(recipient_end))
+            .filter(|length| *length > reclaim_length)
+            .unwrap_or(reclaim_length);
+    let reclaim_length = if full_reclaim_length != reclaim_length
+        && lr_core::windows_storage::extend_volume_checked(
+            authorization.recipient_letter,
+            recipient,
+            full_reclaim_length,
+        )
+        .is_ok()
+    {
+        log::info!(
+            "[FULL DISK] staging cleanup also returned {} trailing free bytes to the recipient",
+            full_reclaim_length - reclaim_length
+        );
+        full_reclaim_length
+    } else {
+        lr_core::windows_storage::extend_volume_checked(
+            authorization.recipient_letter,
+            recipient,
+            reclaim_length,
+        )
+        .context("return preserved staging space to the adjacent volume")?;
+        reclaim_length
+    };
 
     let expected_length = recipient
         .extent_length_bytes

@@ -59,12 +59,19 @@ if not exist "%lr_script%" (
   echo First-logon launcher: script missing 2>nul >>"%lr_log%"
   exit /b 3
 )
+set "lr_powershell=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+set "lr_ec=0"
+if not exist "%lr_powershell%" (
+  echo First-logon launcher: Windows PowerShell is unavailable, optional first-logon work skipped 2>nul >>"%lr_log%"
+  goto :finalizer_done
+)
 if /i "%~1"=="restore" (
-  "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoP -NonI -WindowStyle Hidden -ExecutionPolicy Bypass -File "%lr_script%" -PersonalRestoreAtShell
+  "%lr_powershell%" -NoP -NonI -WindowStyle Hidden -ExecutionPolicy Bypass -File "%lr_script%" -PersonalRestoreAtShell
 ) else (
-  "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoP -NonI -WindowStyle Hidden -ExecutionPolicy Bypass -File "%lr_script%"
+  "%lr_powershell%" -NoP -NonI -WindowStyle Hidden -ExecutionPolicy Bypass -File "%lr_script%"
 )
 set "lr_ec=!errorlevel!"
+:finalizer_done
 if not "!lr_ec!"=="0" (
   echo First-logon staging cleanup: preserved after failure exit=!lr_ec! 2>nul >>"%lr_log%"
   exit /b !lr_ec!
@@ -101,9 +108,13 @@ if exist "%SystemDrive%\LetRecovery_Scripts" (
     echo LETRECOVERY_FIRST_LOGON_CLEANUP_FAILURE 1>&2
     exit /b 3
   )
-  "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoP -NonI -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Start-Sleep -Milliseconds 500"
-  if not "!errorlevel!"=="0" (
-    exit /b 3
+  if exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" (
+    "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoP -NonI -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Start-Sleep -Milliseconds 500"
+    if not "!errorlevel!"=="0" (
+      exit /b 3
+    )
+  ) else (
+    ping -n 2 127.0.0.1 >nul 2>&1
   )
   goto :retry_cleanup_after_restore
 )
@@ -228,11 +239,28 @@ $builtinTransitionScheduled = $false
 $personalRestoreRestartScheduled = $false
 function Convert-LrUtf16Hex([string]$Value) {
   if ([string]::IsNullOrWhiteSpace($Value) -or (($Value.Length % 4) -ne 0) -or $Value -notmatch '\A[0-9a-f]+\z') { throw 'invalid LetRecovery UTF-16 hex field' }
-  $builder = [System.Text.StringBuilder]::new([int]($Value.Length / 4))
+  $builder = New-Object System.Text.StringBuilder -ArgumentList ([int]($Value.Length / 4))
   for ($offset = 0; $offset -lt $Value.Length; $offset += 4) {
     [void]$builder.Append([char][System.Convert]::ToUInt16($Value.Substring($offset, 4), 16))
   }
   return $builder.ToString()
+}
+function Invoke-LrBoundedProcess([string]$FilePath, [string[]]$ArgumentList, [int]$TimeoutMilliseconds, [string]$Label) {
+  # Wait only for the direct helper process. Start-Process -Wait follows the whole descendant
+  # tree without any timeout, so one stuck or dialog-blocked helper would hold first logon forever.
+  $boundedProcess = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -WindowStyle Hidden -PassThru
+  # Windows PowerShell 5.1 reports ExitCode only for a Process object that owns its handle.
+  try { $null = $boundedProcess.Handle } catch {}
+  if (-not $boundedProcess.WaitForExit($TimeoutMilliseconds)) {
+    try { $boundedProcess.Kill() } catch {}
+    try { [void]$boundedProcess.WaitForExit(5000) } catch {}
+    [System.IO.File]::AppendAllText($logPath, ("{0}: warning timeout={1}ms`r`n" -f $Label, $TimeoutMilliseconds))
+    return 1460
+  }
+  try { $boundedProcess.WaitForExit() } catch {}
+  $boundedExitCode = $boundedProcess.ExitCode
+  if ($null -eq $boundedExitCode) { return 0 }
+  return [int]$boundedExitCode
 }
 try {
   if (-not $PersonalRestoreAtShell) {
@@ -241,8 +269,8 @@ try {
     $temporaryOobeAccountName = Convert-LrUtf16Hex $temporaryOobeAccountHex
     if ([string]::Equals([System.Environment]::UserName, $temporaryOobeAccountName, [System.StringComparison]::OrdinalIgnoreCase)) {
       if (-not [string]::IsNullOrWhiteSpace($personalRestoreSessionId)) {
-        $gateProcess = Start-Process -FilePath $personalRestoreHelper -ArgumentList @('--internal-activate-personal-restore-shell-gate',$personalRestoreSessionId) -WindowStyle Hidden -Wait -PassThru
-        if ($gateProcess.ExitCode -ne 0) { throw ('personal-file Shell gate activation failed with exit code {0}' -f $gateProcess.ExitCode) }
+        $gateExitCode = Invoke-LrBoundedProcess $personalRestoreHelper @('--internal-activate-personal-restore-shell-gate',$personalRestoreSessionId) 600000 'Personal files restore: Shell gate activation'
+        if ($gateExitCode -ne 0) { throw ('personal-file Shell gate activation failed with exit code {0}' -f $gateExitCode) }
         [System.IO.File]::AppendAllText($logPath, "Personal files restore: Shell gate armed for final built-in Administrator logon`r`n")
       }
       if ([string]::IsNullOrWhiteSpace($personalRestoreSessionId)) {
@@ -251,35 +279,40 @@ try {
         $transitionArguments = @('--internal-begin-builtin-administrator-transition-with-personal-restore',$builtinAdministratorNameHex,$temporaryOobeAccountHex,$personalRestoreSessionId)
       }
       [System.IO.File]::AppendAllText($logPath, "First-logon transition: requesting pre-desktop restart force_apps_closed=true`r`n")
-      $transitionProcess = Start-Process -FilePath $personalRestoreHelper -ArgumentList $transitionArguments -WindowStyle Hidden -Wait -PassThru
-      if ($transitionProcess.ExitCode -ne 0) { throw ('built-in Administrator transition failed with exit code {0}' -f $transitionProcess.ExitCode) }
+      $transitionExitCode = Invoke-LrBoundedProcess $personalRestoreHelper $transitionArguments 600000 'Built-in Administrator transition'
+      if ($transitionExitCode -ne 0) { throw ('built-in Administrator transition failed with exit code {0}' -f $transitionExitCode) }
       $builtinTransitionScheduled = $true
       [System.IO.File]::AppendAllText($logPath, "Built-in Administrator transition: restart scheduled`r`n")
       exit 0
     }
-    $transitionProcess = Start-Process -FilePath $personalRestoreHelper -ArgumentList @('--internal-finish-builtin-administrator-transition',$builtinAdministratorNameHex,$temporaryOobeAccountHex) -WindowStyle Hidden -Wait -PassThru
-    if ($transitionProcess.ExitCode -ne 0) { throw ('built-in Administrator transition finalization failed with exit code {0}' -f $transitionProcess.ExitCode) }
+    $transitionExitCode = Invoke-LrBoundedProcess $personalRestoreHelper @('--internal-finish-builtin-administrator-transition',$builtinAdministratorNameHex,$temporaryOobeAccountHex) 600000 'Built-in Administrator transition finalization'
+    if ($transitionExitCode -ne 0) { throw ('built-in Administrator transition finalization failed with exit code {0}' -f $transitionExitCode) }
     [System.IO.File]::AppendAllText($logPath, "Built-in Administrator transition: final account and profile verified`r`n")
   }
   if (-not [string]::IsNullOrWhiteSpace($personalRestoreSessionId) -and [string]::IsNullOrWhiteSpace($builtinAdministratorNameHex) -and -not [System.IO.File]::Exists($personalRestoreShellGate)) {
     if (-not [System.IO.File]::Exists($personalRestoreHelper)) { throw 'personal-file restore helper is missing' }
     [System.IO.File]::AppendAllText($logPath, "First-logon transition: requesting pre-desktop restart force_apps_closed=true`r`n")
-    $secondLogonProcess = Start-Process -FilePath $personalRestoreHelper -ArgumentList @('--internal-begin-personal-restore-second-logon',$personalRestoreSessionId) -WindowStyle Hidden -Wait -PassThru
-    if ($secondLogonProcess.ExitCode -ne 0) { throw ('personal-file second-logon preparation failed with exit code {0}' -f $secondLogonProcess.ExitCode) }
+    $secondLogonExitCode = Invoke-LrBoundedProcess $personalRestoreHelper @('--internal-begin-personal-restore-second-logon',$personalRestoreSessionId) 600000 'Personal files restore: second-logon preparation'
+    if ($secondLogonExitCode -ne 0) { throw ('personal-file second-logon preparation failed with exit code {0}' -f $secondLogonExitCode) }
     $personalRestoreRestartScheduled = $true
     [System.IO.File]::AppendAllText($logPath, "Personal files restore: second logon and immediate restart scheduled before desktop`r`n")
     exit 0
   }
   if (-not [string]::IsNullOrWhiteSpace($temporaryOobeAccountHex)) {
     if (-not [System.IO.File]::Exists($personalRestoreHelper)) { throw 'temporary OOBE account cleanup helper is missing' }
-    $cleanupProcess = Start-Process -FilePath $personalRestoreHelper -ArgumentList @('--internal-delete-temporary-oobe-account',$temporaryOobeAccountHex) -WindowStyle Hidden -Wait -PassThru
-    if ($cleanupProcess.ExitCode -ne 0) { throw ('temporary OOBE account cleanup failed with exit code {0}' -f $cleanupProcess.ExitCode) }
+    $cleanupExitCode = Invoke-LrBoundedProcess $personalRestoreHelper @('--internal-delete-temporary-oobe-account',$temporaryOobeAccountHex) 600000 'Temporary OOBE account cleanup'
+    if ($cleanupExitCode -ne 0) { throw ('temporary OOBE account cleanup failed with exit code {0}' -f $cleanupExitCode) }
     [System.IO.File]::AppendAllText($logPath, "Temporary OOBE account cleanup: completed`r`n")
   }
   if ([System.IO.File]::Exists($personalRestoreHelper)) {
-    $defaultOobeCleanupProcess = Start-Process -FilePath $personalRestoreHelper -ArgumentList @('--internal-cleanup-disabled-defaultuser0') -WindowStyle Hidden -Wait -PassThru
-    if ($defaultOobeCleanupProcess.ExitCode -ne 0) {
-      [System.IO.File]::AppendAllText($logPath, ("Windows default OOBE account cleanup: warning exit={0}`r`n" -f $defaultOobeCleanupProcess.ExitCode))
+    $defaultOobeCleanupExitCode = 1
+    try {
+      $defaultOobeCleanupExitCode = Invoke-LrBoundedProcess $personalRestoreHelper @('--internal-cleanup-disabled-defaultuser0') 300000 'Windows default OOBE account cleanup'
+    } catch {
+      [System.IO.File]::AppendAllText($logPath, ("Windows default OOBE account cleanup: warning start_failed={0}`r`n" -f $_.Exception.Message))
+    }
+    if ($defaultOobeCleanupExitCode -ne 0) {
+      [System.IO.File]::AppendAllText($logPath, ("Windows default OOBE account cleanup: warning exit={0}`r`n" -f $defaultOobeCleanupExitCode))
     } else {
       [System.IO.File]::AppendAllText($logPath, "Windows default OOBE account cleanup: completed`r`n")
     }
@@ -287,14 +320,15 @@ try {
   if (-not [string]::IsNullOrWhiteSpace($personalRestoreSessionId)) {
     if (-not [System.IO.File]::Exists($personalRestoreShellGate)) { throw 'personal-file Shell gate state is missing on the restore logon' }
     [System.IO.File]::AppendAllText($logPath, "Personal files restore: starting before Explorer`r`n")
-    $restoreProcess = Start-Process -FilePath $personalRestoreHelper -ArgumentList @('--internal-restore-personal-files-before-shell',$personalRestoreSessionId) -WindowStyle Hidden -Wait -PassThru
-    if ($restoreProcess.ExitCode -ne 0) { throw ('pre-Explorer personal-file restore failed with exit code {0}' -f $restoreProcess.ExitCode) }
+    $restoreExitCode = Invoke-LrBoundedProcess $personalRestoreHelper @('--internal-restore-personal-files-before-shell',$personalRestoreSessionId) 21600000 'Personal files restore: pre-Explorer restore'
+    if ($restoreExitCode -ne 0) { throw ('pre-Explorer personal-file restore failed with exit code {0}' -f $restoreExitCode) }
     if (-not [System.IO.File]::Exists($personalRestoreShellReleased)) { throw 'personal-file Shell release receipt is missing' }
     [System.IO.File]::AppendAllText($logPath, "Personal files restore: verified before Explorer; original Shell released`r`n")
   }
   if ([System.IO.File]::Exists($secHealth)) {
     [System.IO.File]::AppendAllText($logPath, "Windows Security UI cleanup retry: starting`r`n")
     $process = Start-Process -FilePath ([System.IO.Path]::Combine($env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')) -ArgumentList @('-NoP','-NonI','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $secHealth),'-SuppressCurrentSecurityUpdate') -WindowStyle Hidden -PassThru
+    try { $null = $process.Handle } catch {}
     if (-not $process.WaitForExit(180000)) {
       try { $process.Kill(); $process.WaitForExit() } catch {}
       [System.IO.File]::AppendAllText($logPath, "Windows Security UI cleanup retry: warning timeout=180000ms`r`n")
@@ -306,9 +340,14 @@ try {
   }
   if ([System.IO.File]::Exists($curated)) {
     [System.IO.File]::AppendAllText($logPath, "Preinstalled application verification: starting`r`n")
-    $process = Start-Process -FilePath ([System.IO.Path]::Combine($env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')) -ArgumentList @('-NoP','-NonI','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $curated)) -WindowStyle Hidden -Wait -PassThru
-    if ($process.ExitCode -ne 0) {
-      [System.IO.File]::AppendAllText($logPath, ("Preinstalled application verification: warning exit={0}`r`n" -f $process.ExitCode))
+    $curatedExitCode = 1
+    try {
+      $curatedExitCode = Invoke-LrBoundedProcess ([System.IO.Path]::Combine($env:SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')) @('-NoP','-NonI','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $curated)) 960000 'Preinstalled application verification'
+    } catch {
+      [System.IO.File]::AppendAllText($logPath, ("Preinstalled application verification: warning start_failed={0}`r`n" -f $_.Exception.Message))
+    }
+    if ($curatedExitCode -ne 0) {
+      [System.IO.File]::AppendAllText($logPath, ("Preinstalled application verification: warning exit={0}`r`n" -f $curatedExitCode))
     } else {
       [System.IO.File]::AppendAllText($logPath, "Preinstalled application verification: completed`r`n")
     }
@@ -317,10 +356,16 @@ try {
   # Windows PowerShell 5.1 writes a top-level JSON array as one Object[] pipeline object.
   # Explicit pipeline enumeration is required; otherwise two packages become one entry whose
   # properties format as System.Object[] and no real installer path can be resolved.
-  $entries = @((ConvertFrom-Json -InputObject $softwarePlanJson) | ForEach-Object { $_ })
+  $entries = @()
+  if ($null -ne (Get-Command ConvertFrom-Json -ErrorAction SilentlyContinue)) {
+    $entries = @((ConvertFrom-Json -InputObject $softwarePlanJson) | ForEach-Object { $_ })
+  } elseif ($softwarePlanJson.Trim() -ne '' -and $softwarePlanJson.Trim() -ne '[]') {
+    # Windows 7 ships Windows PowerShell 2.0, which has no JSON support.
+    [System.IO.File]::AppendAllText($logPath, "Preinstalled software: warning skipped because Windows PowerShell 3.0 or later is required; remaining first-logon work continues`r`n")
+  }
   if ($entries.Count -gt 0) {
     [System.IO.File]::AppendAllText($logPath, ("Preinstalled software: starting expected={0}`r`n" -f $entries.Count))
-    $softwareFailures = [System.Collections.Generic.List[string]]::new()
+    $softwareFailures = New-Object 'System.Collections.Generic.List[string]'
     foreach ($entry in @($entries)) {
       $filename = [string]$entry.filename
       if ([string]::IsNullOrWhiteSpace($filename) -or [System.IO.Path]::GetFileName($filename) -ne $filename) {
@@ -345,16 +390,24 @@ try {
             $argument = [string]$_
             if ($argument -eq '__LETRECOVERY_FIRST_LOGON_INSTALLER__') { $installer } else { $argument }
           })
-          $process = Start-Process -FilePath $program -ArgumentList $arguments -WindowStyle Hidden -PassThru
+          if ($arguments.Count -gt 0) {
+            $process = Start-Process -FilePath $program -ArgumentList $arguments -WindowStyle Hidden -PassThru
+          } else {
+            $process = Start-Process -FilePath $program -WindowStyle Hidden -PassThru
+          }
+          # Windows PowerShell 5.1 reports ExitCode only for a Process object that owns its handle.
+          try { $null = $process.Handle } catch {}
           if (-not $process.WaitForExit(1800000)) {
             try { $process.Kill(); $process.WaitForExit() } catch {}
             throw 'installer timed out after 1800000ms'
           }
-          if ($process.ExitCode -notin @(0, 1641, 3010)) {
-            throw ('installer exit code {0}' -f $process.ExitCode)
+          $installerExitCode = $process.ExitCode
+          if ($null -eq $installerExitCode) { $installerExitCode = 0 }
+          if (@(0, 1641, 3010) -notcontains $installerExitCode) {
+            throw ('installer exit code {0}' -f $installerExitCode)
           }
           $installed = $true
-          [System.IO.File]::AppendAllText($logPath, ("Preinstalled software: completed id={0} attempt={1} exit={2}`r`n" -f $entry.id, $attempt, $process.ExitCode))
+          [System.IO.File]::AppendAllText($logPath, ("Preinstalled software: completed id={0} attempt={1} exit={2}`r`n" -f $entry.id, $attempt, $installerExitCode))
         } catch {
           $lastSoftwareError = $_.Exception.Message
           if ($attempt -lt 3) {
@@ -378,6 +431,7 @@ try {
     }
   }
   if ([System.IO.File]::Exists($wifi)) {
+    try {
     [System.IO.File]::AppendAllText($logPath, "Wi-Fi profile import: starting`r`n")
     if (-not ('LetRecovery.NativeWifiProfile' -as [type])) {
       Add-Type -TypeDefinition @'
@@ -477,13 +531,19 @@ namespace LetRecovery {
         if ($attempt -lt 12) { Start-Sleep -Seconds 5 }
       }
     }
-    if ($null -eq $wifiResult) { throw ('Wi-Fi profile import failed after bounded retries: {0}' -f $wifiError) }
-    [System.IO.File]::AppendAllText($logPath, ("Wi-Fi profile import: {0}`r`n" -f $wifiResult))
+    if ($null -eq $wifiResult) {
+      [System.IO.File]::AppendAllText($logPath, ("Wi-Fi profile import: warning failed after bounded retries: {0}; remaining first-logon work continues`r`n" -f $wifiError))
+    } else {
+      [System.IO.File]::AppendAllText($logPath, ("Wi-Fi profile import: {0}`r`n" -f $wifiResult))
+    }
+  } catch {
+      [System.IO.File]::AppendAllText($logPath, ("Wi-Fi profile import: warning {0}; remaining first-logon work continues`r`n" -f $_.Exception.Message))
+    }
   }
   if ([System.IO.File]::Exists($custom)) {
     [System.IO.File]::AppendAllText($logPath, "Custom first-logon script: starting`r`n")
-    $process = Start-Process -FilePath $env:ComSpec -ArgumentList @('/d','/c',('call "{0}"' -f $custom)) -WindowStyle Hidden -Wait -PassThru
-    if ($process.ExitCode -ne 0) { throw ('custom first-logon script failed with exit code {0}' -f $process.ExitCode) }
+    $customExitCode = Invoke-LrBoundedProcess $env:ComSpec @('/d','/c',('call "{0}"' -f $custom)) 7200000 'Custom first-logon script'
+    if ($customExitCode -ne 0) { throw ('custom first-logon script failed with exit code {0}' -f $customExitCode) }
   }
   }
   if ($PersonalRestoreAtShell) {
@@ -519,8 +579,8 @@ namespace LetRecovery {
   # It must only restore personal files; repeating credential retirement would turn
   # that successful cleanup into a false failure because the marker is intentionally gone.
   if (-not $PersonalRestoreAtShell -and -not [string]::IsNullOrWhiteSpace($builtinAdministratorNameHex)) {
-    $retireProcess = Start-Process -FilePath $personalRestoreHelper -ArgumentList @('--internal-retire-builtin-administrator-transition',$builtinAdministratorNameHex,$temporaryOobeAccountHex) -WindowStyle Hidden -Wait -PassThru
-    if ($retireProcess.ExitCode -ne 0) { throw ('built-in Administrator transition retirement failed with exit code {0}' -f $retireProcess.ExitCode) }
+    $retireExitCode = Invoke-LrBoundedProcess $personalRestoreHelper @('--internal-retire-builtin-administrator-transition',$builtinAdministratorNameHex,$temporaryOobeAccountHex) 600000 'Built-in Administrator transition retirement'
+    if ($retireExitCode -ne 0) { throw ('built-in Administrator transition retirement failed with exit code {0}' -f $retireExitCode) }
     [System.IO.File]::AppendAllText($logPath, "Built-in Administrator transition: temporary autologon retired`r`n")
   }
   if (-not $PersonalRestoreAtShell -and -not [string]::IsNullOrWhiteSpace($personalRestoreSessionId)) {
@@ -528,7 +588,7 @@ namespace LetRecovery {
     $verifiedShellPid = 0
     do {
       if ([System.IO.File]::Exists($personalRestoreShellVerified)) {
-        $verifiedShellReceipt = [System.IO.File]::ReadAllText($personalRestoreShellVerified, [System.Text.UTF8Encoding]::new($false, $true))
+        $verifiedShellReceipt = [System.IO.File]::ReadAllText($personalRestoreShellVerified, (New-Object System.Text.UTF8Encoding -ArgumentList $false, $true))
         $verifiedShellMatch = [regex]::Match($verifiedShellReceipt, '\A([0-9a-f]{32}):([1-9][0-9]{0,9})\z')
         if ($verifiedShellMatch.Success -and [string]::Equals($verifiedShellMatch.Groups[1].Value, $personalRestoreSessionId, [System.StringComparison]::Ordinal)) {
           $verifiedShellPid = [uint32]$verifiedShellMatch.Groups[2].Value
@@ -547,8 +607,8 @@ namespace LetRecovery {
   [System.IO.File]::AppendAllText($logPath, ('First-logon finalization: failed: {0}`r`n' -f $_.Exception.Message))
   if (-not [string]::IsNullOrWhiteSpace($personalRestoreSessionId) -and [System.IO.File]::Exists($personalRestoreShellGate) -and -not [System.IO.File]::Exists($personalRestoreShellReleased) -and [System.IO.File]::Exists($personalRestoreHelper)) {
     try {
-      $retryProcess = Start-Process -FilePath $personalRestoreHelper -ArgumentList @('--internal-rearm-personal-restore-before-shell',$personalRestoreSessionId) -WindowStyle Hidden -Wait -PassThru
-      [System.IO.File]::AppendAllText($logPath, ("Personal files restore: retry RunOnce rearm exit={0}`r`n" -f $retryProcess.ExitCode))
+      $retryExitCode = Invoke-LrBoundedProcess $personalRestoreHelper @('--internal-rearm-personal-restore-before-shell',$personalRestoreSessionId) 600000 'Personal files restore: retry RunOnce rearm'
+      [System.IO.File]::AppendAllText($logPath, ("Personal files restore: retry RunOnce rearm exit={0}`r`n" -f $retryExitCode))
     } catch {
       [System.IO.File]::AppendAllText($logPath, ('Personal files restore: retry RunOnce rearm failed: {0}`r`n' -f $_.Exception.Message))
     }
@@ -622,6 +682,13 @@ namespace LetRecovery {
 }
 exit $finalExitCode
 "#;
+
+/// cmd.exe resolves `goto :label` by rescanning the batch file, and that scan is unreliable for
+/// LF-only files. Rust normalizes the literal to LF, so the staged launcher is written with the
+/// Windows CRLF line endings cmd.exe expects.
+fn launcher_file_bytes() -> Vec<u8> {
+    LAUNCHER.replace("\r\n", "\n").replace('\n', "\r\n").into_bytes()
+}
 
 pub fn stage(target_partition: &str) -> Result<PathBuf> {
     stage_with_software(target_partition, &[])
@@ -706,14 +773,15 @@ pub fn stage_with_software_shutdown_and_personal_restore_and_builtin(
         anyhow::bail!("first-logon finalizer readback mismatch");
     }
     let launcher = root.join(LAUNCHER_FILE_NAME);
+    let launcher_bytes = launcher_file_bytes();
     let temporary = crate::scoped_temp_file::ScopedTempFile::create_in(
         &root,
         "lr-first-logon-launcher",
         "cmd",
-        LAUNCHER.as_bytes(),
+        &launcher_bytes,
     )?;
     temporary.persist_replace(&launcher)?;
-    if std::fs::read(&launcher)? != LAUNCHER.as_bytes() {
+    if std::fs::read(&launcher)? != launcher_bytes {
         anyhow::bail!("first-logon launcher readback mismatch");
     }
     Ok(target)
@@ -3190,7 +3258,8 @@ fn spawn_personal_restore_cleanup() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("restore staging directory has no volume root"))?
         .join(LAUNCHER_FILE_NAME);
     explorer_restore_command(&launcher)?;
-    if std::fs::read(&launcher)? != LAUNCHER.as_bytes() {
+    let staged_launcher = std::fs::read(&launcher)?;
+    if staged_launcher != launcher_file_bytes() && staged_launcher != LAUNCHER.as_bytes() {
         anyhow::bail!("personal-file restore cleanup launcher content mismatch");
     }
     let system_root = std::env::var_os("SystemRoot")
@@ -3435,7 +3504,8 @@ pub fn is_staged(target_partition: &str) -> Result<bool> {
     if !metadata.is_file() || metadata_is_reparse_point(&metadata) {
         anyhow::bail!("first-logon launcher is not a regular file");
     }
-    Ok(std::fs::read(launcher)? == LAUNCHER.as_bytes())
+    let staged_launcher = std::fs::read(launcher)?;
+    Ok(staged_launcher == launcher_file_bytes() || staged_launcher == LAUNCHER.as_bytes())
 }
 
 pub fn render_command(order: u32) -> Result<String> {

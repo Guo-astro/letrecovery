@@ -262,6 +262,7 @@ mod imp {
 
     #[repr(C)]
     #[derive(Clone, Copy)]
+    #[allow(dead_code)] // ABI layout mirror: every field keeps the native offsets even if unread.
     struct FveGetStatusOutput {
         size: u32,              // 0x00
         version: u32,           // 0x04
@@ -293,6 +294,7 @@ mod imp {
     const _: () = assert!(std::mem::size_of::<FveAuthElement>() == AUTH_ELEMENT_SIZE);
 
     #[repr(C)]
+    #[allow(dead_code)] // ABI layout mirror: every field keeps the native offsets even if unread.
     struct FveUnlockSettings {
         size: u32,                               // 0x00
         version: u32,                            // 0x04
@@ -860,16 +862,19 @@ pub fn enable_volume_privileges() {
     const ERROR_NOT_ALL_ASSIGNED: u32 = 1300;
 
     #[repr(C)]
+    #[allow(dead_code)] // ABI layout mirror: every field keeps the native offsets even if unread.
     struct Luid {
         low: u32,
         high: i32,
     }
     #[repr(C)]
+    #[allow(dead_code)] // ABI layout mirror: every field keeps the native offsets even if unread.
     struct LuidAndAttributes {
         luid: Luid,
         attributes: u32,
     }
     #[repr(C)]
+    #[allow(dead_code)] // ABI layout mirror: every field keeps the native offsets even if unread.
     struct TokenPrivileges {
         count: u32,
         privilege: LuidAndAttributes,

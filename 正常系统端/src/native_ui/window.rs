@@ -47,7 +47,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
-
 use super::controls::{
     begin_layout_batch, center_single_line_edit_in_row, child, draw_indeterminate_ring,
     draw_inno_button, move_layout_window as MoveWindow, wide, ButtonRole,
@@ -61,7 +60,10 @@ const SS_PATH_ELLIPSIS: i32 = SS_SINGLE_LINE_ELLIPSIS | 0x0000_0080;
 const SS_OWNERDRAW_VALUE: i32 = 0x0000_000d;
 use super::dialog::{DialogButtons, DialogResult, DialogShell, DialogSpec};
 use super::driver_transfer_dialog::NativeDriverTransferDialog;
-use super::layout::{centered_control_y_ceil, measure_text, LayoutMetrics};
+use super::layout::{
+    centered_control_y_ceil, control_text_width, control_wrapped_height, fitted_button_width,
+    measure_text, LayoutMetrics,
+};
 use super::pages::advanced::{
     AdvancedBrowseTarget, AdvancedPage, AdvancedPageContext, AdvancedPageIntent,
 };
@@ -213,9 +215,13 @@ fn reconcile_dual_boot_size_gib(
     required_bytes: u64,
 ) -> (u64, Option<u64>) {
     let required = whole_gib_for_capacity(required_bytes);
+    // The automatic value is a practical system size, never the bare image minimum: the
+    // image-derived "expanded size + 2 GB" leaves no room for drivers, updates or the first boot.
+    let automatic =
+        required.max(whole_gib_for_capacity(lr_core::custom_install::OPAQUE_IMAGE_FALLBACK_BYTES));
     match current {
         Some(value) if value >= required && last_automatic != Some(value) => (value, None),
-        _ => (required, Some(required)),
+        _ => (automatic, Some(automatic)),
     }
 }
 
@@ -229,6 +235,39 @@ const WM_IMAGE_INFO_READY: u32 = 0x8002;
 const WM_PCA_FIRMWARE_READY: u32 = 0x8003;
 const WM_PCA_TARGET_READY: u32 = 0x8004;
 const WM_TOOL_WORKER_READY: u32 = 0x8005;
+const WM_REFRESH_SYSTEM_THEME: u32 = 0x8000 + 0x4e3;
+const WM_RUN_UI_AUDIT: u32 = 0x8000 + 0x4e4;
+
+/// Processes pending messages for `milliseconds` (painting, posted layout work) while the audit
+/// walks the pages. A WM_QUIT seen here is posted again for the real message loop.
+unsafe fn pump_messages_for(milliseconds: u64) {
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(milliseconds);
+    let mut message = MSG::default();
+    loop {
+        while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+            &mut message,
+            None,
+            0,
+            0,
+            windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+        )
+        .as_bool()
+        {
+            if message.message == windows::Win32::UI::WindowsAndMessaging::WM_QUIT {
+                PostQuitMessage(message.wParam.0 as i32);
+                return;
+            }
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        if std::time::Instant::now() >= end {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+static MAIN_THEME_REFRESH_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 const WM_PARTITIONS_READY: u32 = 0x8006;
 const WM_INSTALL_PARTITION_SELECTION_CHANGED: u32 = 0x8007;
 const WM_AUTO_IMAGE_DISCOVERY_READY: u32 = 0x8008;
@@ -1117,6 +1156,42 @@ enum StableTargetProbeResult {
     Match,
     Changed(lr_core::windows_storage::StableVolumeIdentity),
     Unavailable(String),
+}
+
+/// Bus type is auxiliary install evidence. Cache it per disk so UI refreshes neither repeat the
+/// IOCTLs nor flood the log when a filter driver rejects them (the old build logged the same
+/// warning dozens of times per second).
+fn cached_disk_bus_type(
+    disk_number: u32,
+    context: &str,
+) -> Option<lr_core::windows_storage::DiskBusType> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    type Entry = (Instant, Option<lr_core::windows_storage::DiskBusType>);
+    static CACHE: OnceLock<Mutex<HashMap<u32, Entry>>> = OnceLock::new();
+    const TTL: Duration = Duration::from_secs(60);
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some((captured, value)) = guard.get(&disk_number) {
+            if captured.elapsed() < TTL {
+                return *value;
+            }
+        }
+    }
+    let value = match lr_core::windows_storage::disk_bus_type(disk_number) {
+        Ok(bus) => Some(bus),
+        Err(error) => {
+            lr_core::windows_storage::warn_storage_once(&format!("bus:{disk_number}"), || {
+                format!("{context} cannot confirm bus type for physical disk {disk_number}: {error}")
+            });
+            None
+        }
+    };
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(disk_number, (Instant::now(), value));
+    }
+    value
 }
 
 fn classify_stable_target_probe(
@@ -3189,7 +3264,7 @@ impl NativeWindow {
         let Some(handles) = self.handles else {
             return;
         };
-        let redraw = redraw::suspend(hwnd);
+        let redraw = redraw::begin_page_transition(hwnd, "重排导航栏");
         let visibility = navigation_visibility(self.easy_mode_enabled(), self.progress_visible);
         for (index, control) in handles.nav.into_iter().enumerate() {
             let _ = ShowWindow(control, if visibility[index] { SW_SHOW } else { SW_HIDE });
@@ -4027,14 +4102,8 @@ impl NativeWindow {
             .iter()
             .map(|partition| BackupPartitionRow {
                 volume: partition.letter.clone(),
-                total_size: format!("{:.1} GB", partition.total_size_mb as f64 / 1024.0),
-                used_size: format!(
-                    "{:.1} GB",
-                    partition
-                        .total_size_mb
-                        .saturating_sub(partition.free_size_mb) as f64
-                        / 1024.0
-                ),
+                total_size: super::layout::format_capacity_mb(partition.total_size_mb),
+                used_size: super::layout::format_capacity_mb(partition.total_size_mb.saturating_sub(partition.free_size_mb)),
                 label: partition.label.clone(),
                 bitlocker: localized_bitlocker_status(&partition.bitlocker_status),
                 status: if partition.has_windows {
@@ -4362,10 +4431,12 @@ impl NativeWindow {
 
     unsafe fn refresh_system_theme(&mut self, hwnd: HWND) {
         let palette = theme::Palette::system();
+        let (selection_text, selection_fill) = theme::list_selection_colors(palette, false);
+        super::syscolor_hook::set_selection_colors(selection_fill, selection_text);
         // WM_THEMECHANGED invalidates cached UxTheme handles even when the light/dark bit did not
         // change.  Reapply the complete control tree every time, but keep the visible transition
         // atomic so pages and their scrollbars cannot expose a mixture of old and new colours.
-        let redraw = redraw::suspend(hwnd);
+        let redraw = redraw::begin_page_transition(hwnd, "切换主题");
         self.palette = palette;
         self.apply_native_dark_theme(hwnd);
         redraw::resume(hwnd, redraw);
@@ -4422,8 +4493,8 @@ impl NativeWindow {
             };
             let values = [
                 first,
-                format!("{:.1} GB", partition.total_size_mb as f64 / 1024.0),
-                format!("{:.1} GB", partition.free_size_mb as f64 / 1024.0),
+                super::layout::format_capacity_mb(partition.total_size_mb),
+                super::layout::format_capacity_mb(partition.free_size_mb),
                 partition.label.clone(),
                 partition.partition_style.to_string(),
                 localized_bitlocker_status(&partition.bitlocker_status),
@@ -4539,7 +4610,26 @@ impl NativeWindow {
         }
     }
 
+    /// Width of the navigation column: the design width, or wider when a translated navigation
+    /// caption needs more (buttons sit 10 px inside the column and keep 12 px around the text).
+    unsafe fn nav_width(&self, hwnd: HWND) -> i32 {
+        let base = self.scale(NAV_WIDTH);
+        let Some(h) = self.handles else {
+            return base;
+        };
+        let widest = h
+            .nav
+            .iter()
+            .map(|item| measure_text(hwnd, self.font, &get_text(*item), None).width)
+            .max()
+            .unwrap_or(0);
+        (widest + self.scale(24) + self.scale(20))
+            .max(base)
+            .min(self.scale(280))
+    }
+
     unsafe fn layout(&self, hwnd: HWND) {
+        let _profile = redraw::profile_scope("排版/总计");
         let Some(h) = self.handles else { return };
         let _layout_batch = begin_layout_batch();
         // Geometry is committed synchronously, but child painting is published once by the root
@@ -4549,7 +4639,7 @@ impl NativeWindow {
         let _ = GetClientRect(hwnd, &mut rect);
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;
-        let nav = self.scale(NAV_WIDTH);
+        let nav = self.nav_width(hwnd);
         let header = self.scale(HEADER_HEIGHT);
         let command = self.scale(COMMAND_HEIGHT);
         let margin = self.scale(24);
@@ -4594,14 +4684,24 @@ impl NativeWindow {
             self.scale(22),
             repaint,
         );
+        // The page description keeps one line when it fits; a longer translation first gets the
+        // full content width, then wraps, and the page content starts below its last line.
+        let description_left = content_left + self.scale(16);
+        let mut description_width = (content_width - self.scale(90)).max(0);
+        if control_text_width(h.description) > description_width {
+            description_width = (content_right - description_left).max(0);
+        }
+        let description_height =
+            control_wrapped_height(h.description, description_width).max(self.scale(20));
         let _ = MoveWindow(
             h.description,
-            content_left + self.scale(16),
+            description_left,
             self.scale(42),
-            (content_width - self.scale(90)).max(0),
-            self.scale(20),
+            description_width,
+            description_height,
             repaint,
         );
+        let header = header + (description_height - self.scale(20)).max(0);
         let y = header + self.scale(14);
         let compact_chinese = self
             .app_config
@@ -4619,7 +4719,7 @@ impl NativeWindow {
             let label_width = measured_install_label_width
                 .max(self.scale(if compact_chinese { 68 } else { 108 }))
                 .min(content_width / 3);
-            let browse_width = self.scale(80);
+            let browse_width = fitted_button_width(h.browse, self.dpi, self.scale(80));
             let image_row_height = metrics.field_height.max(self.scale(24));
             let _ = MoveWindow(
                 h.image_label,
@@ -4825,7 +4925,12 @@ impl NativeWindow {
                 self.scale(180),
                 repaint,
             );
-            let unattend_browse_width = self.scale(if compact_chinese { 132 } else { 180 });
+            let unattend_browse_width = fitted_button_width(
+                h.unattend_browse,
+                self.dpi,
+                self.scale(if compact_chinese { 132 } else { 180 }),
+            )
+            .min(self.scale(360));
             let unattend_clear_width = self.scale(if compact_chinese { 58 } else { 76 });
             let unattend_x = boot_mode_x + boot_mode_width + self.scale(12);
             let _ = MoveWindow(
@@ -4860,7 +4965,11 @@ impl NativeWindow {
                 clear_x + unattend_clear_width + self.scale(8)
             };
             let inline_path_width = (content_right - inline_path_x).max(0);
-            let path_on_own_row = inline_path_width < self.scale(260);
+            // The hint stays beside the buttons only when it fits there on one line; a wrapped
+            // second line would be cut off by the one-line label.
+            let hint_width = control_text_width(h.unattend_path);
+            let path_on_own_row =
+                inline_path_width < self.scale(260) || hint_width > inline_path_width;
             let path_y = if path_on_own_row {
                 if very_compact_options {
                     driver_y + self.scale(34)
@@ -4875,16 +4984,19 @@ impl NativeWindow {
             } else {
                 inline_path_x
             };
+            let path_width = (content_right - path_x).max(0);
+            let path_height = control_wrapped_height(h.unattend_path, path_width)
+                .max(self.scale(20));
             let _ = MoveWindow(
                 h.unattend_path,
                 path_x,
                 path_y + self.scale(3),
-                (content_right - path_x).max(0),
-                self.scale(20),
+                path_width,
+                path_height,
                 repaint,
             );
             let third_y = if path_on_own_row {
-                path_y + self.scale(28)
+                path_y + path_height + self.scale(8)
             } else {
                 second_y + self.scale(34)
             };
@@ -5036,7 +5148,15 @@ impl NativeWindow {
             self.advanced_visible,
             self.progress_visible,
         );
-        let preferred_button_width = self.scale(if compact_chinese { 96 } else { 136 });
+        // Wide enough for the longest translated command caption.
+        let widest_command = [h.automation_export, h.advanced, h.refresh, h.primary]
+            .into_iter()
+            .map(|button| control_text_width(button) + self.scale(24))
+            .max()
+            .unwrap_or(0);
+        let preferred_button_width = self
+            .scale(if compact_chinese { 96 } else { 136 })
+            .max(widest_command.min(self.scale(260)));
         let command_button_width = command_button_width(
             content_width,
             button_gap,
@@ -5096,12 +5216,14 @@ impl NativeWindow {
             self.scale(28),
             repaint,
         );
+        // A long translated status (boot mode, TPM, secure boot) may take three lines: give it
+        // the whole command bar height instead of cutting off the last line.
         let _ = MoveWindow(
             h.status,
             status_layout.x,
-            footer_y + self.scale(6),
+            footer_y + self.scale(2),
             status_layout.width,
-            (command - self.scale(12)).max(0),
+            (command - self.scale(4)).max(0),
             repaint,
         );
         let page_top = if self.progress_visible {
@@ -5179,7 +5301,7 @@ impl NativeWindow {
         let _ = GetClientRect(hwnd, &mut rect);
         let width = (rect.right - rect.left).max(0);
         let height = (rect.bottom - rect.top).max(0);
-        let nav = self.scale(NAV_WIDTH);
+        let nav = self.nav_width(hwnd);
         let command = self.scale(COMMAND_HEIGHT);
         let margin = self.scale(24);
         let content_left = if self.progress_visible {
@@ -5203,7 +5325,15 @@ impl NativeWindow {
             self.advanced_visible,
             self.progress_visible,
         );
-        let preferred_button_width = self.scale(if compact_chinese { 96 } else { 136 });
+        // Wide enough for the longest translated command caption.
+        let widest_command = [h.automation_export, h.advanced, h.refresh, h.primary]
+            .into_iter()
+            .map(|button| control_text_width(button) + self.scale(24))
+            .max()
+            .unwrap_or(0);
+        let preferred_button_width = self
+            .scale(if compact_chinese { 96 } else { 136 })
+            .max(widest_command.min(self.scale(260)));
         let command_button_width = command_button_width(
             content_width,
             button_gap,
@@ -5266,9 +5396,11 @@ impl NativeWindow {
     }
 
     unsafe fn redraw_install_volume_layout_frame(&self, hwnd: HWND, row_visibility: Option<bool>) {
-        let redraw_was_suspended = IsWindowVisible(hwnd).as_bool();
+        let composed = redraw::suspend(hwnd);
+        let redraw_was_suspended = composed.is_some();
         if redraw_was_suspended {
-            let _ = SendMessageW(hwnd, 0x000B, WPARAM(0), LPARAM(0)); // WM_SETREDRAW(FALSE)
+            // WM_SETREDRAW is never sent to the top-level window: it clears WS_VISIBLE, which lets clicks
+            // fall through to the window behind and lets DWM drop the window for a frame.
         }
         if let (Some(handles), Some(visible)) = (self.handles, row_visibility) {
             let command = if visible { SW_SHOW } else { SW_HIDE };
@@ -5277,13 +5409,7 @@ impl NativeWindow {
         }
         self.layout(hwnd);
         if redraw_was_suspended {
-            let _ = SendMessageW(hwnd, 0x000B, WPARAM(1), LPARAM(0)); // WM_SETREDRAW(TRUE)
-            let _ = RedrawWindow(
-                hwnd,
-                None,
-                None,
-                RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
-            );
+            redraw::resume_client(hwnd, composed);
         } else {
             let _ = InvalidateRect(hwnd, None, false);
         }
@@ -5355,8 +5481,294 @@ impl NativeWindow {
         }
     }
 
+    /// LETRECOVERY_UI_AUDIT: shows every page (and both download tabs) and logs every text that
+    /// does not fit its control in the current language. LETRECOVERY_UI_AUDIT_PAUSE_MS keeps each
+    /// page on screen for that long, and LETRECOVERY_UI_AUDIT_MARKERS names a folder where a file
+    /// per page is written when it is shown (for taking screenshots from outside).
+    unsafe fn run_ui_audit(&mut self, hwnd: HWND) {
+        let pause = std::env::var("LETRECOVERY_UI_AUDIT_PAUSE_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(300);
+        let markers = std::env::var("LETRECOVERY_UI_AUDIT_MARKERS").ok();
+        let bench = std::env::var_os("LETRECOVERY_UI_RESIZE_BENCH").is_some();
+        // Window sizes to audit, e.g. "1399x943,1100x760"; the current size when unset.
+        let sizes: Vec<(i32, i32)> = std::env::var("LETRECOVERY_UI_AUDIT_SIZES")
+            .ok()
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter_map(|size| {
+                        let (width, height) = size.trim().split_once('x')?;
+                        Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let sizes = if sizes.is_empty() { vec![(0, 0)] } else { sizes };
+        for (width, height) in sizes {
+            if width > 0 && height > 0 {
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND::default(),
+                    0,
+                    0,
+                    width,
+                    height,
+                    windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            let mut window = RECT::default();
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut window);
+            let size_name = format!(
+                "{}x{}",
+                window.right - window.left,
+                window.bottom - window.top
+            );
+            for (page, name) in [
+                (Page::Install, "install"),
+                (Page::Backup, "backup"),
+                (Page::Download, "download"),
+                (Page::Tools, "tools"),
+                (Page::Hardware, "hardware"),
+                (Page::About, "about"),
+            ] {
+                self.select_page(hwnd, page);
+                let tabs: &[(Option<DownloadTab>, &str)] = if page == Page::Download {
+                    &[(None, ""), (Some(DownloadTab::Software), "-software")]
+                } else {
+                    &[(None, "")]
+                };
+                for (tab, suffix) in tabs {
+                    if let Some(tab) = tab {
+                        self.handle_download_intent(hwnd, DownloadIntent::SelectTab(*tab));
+                    }
+                    let label = format!("{size_name}-{name}{suffix}");
+                    pump_messages_for(pause.min(400));
+                    super::ui_audit::audit_surface(hwnd, &format!("主窗口/{label}"));
+                    if let Some(folder) = &markers {
+                        let _ = std::fs::write(
+                            std::path::Path::new(folder).join(format!("{label}.ready")),
+                            b"1",
+                        );
+                    }
+                    pump_messages_for(pause);
+                    if bench {
+                        self.run_resize_benchmark(hwnd, &label);
+                    }
+                }
+                if page == Page::Download {
+                    self.handle_download_intent(
+                        hwnd,
+                        DownloadIntent::SelectTab(DownloadTab::SystemImage),
+                    );
+                }
+            }
+        }
+        if std::env::var_os("LETRECOVERY_UI_AUDIT_TOOLS").is_some() {
+            self.run_tool_window_audit(hwnd, markers.as_deref(), pause);
+        }
+        self.select_page(hwnd, Page::Install);
+        if let Some(folder) = &markers {
+            let _ = std::fs::write(std::path::Path::new(folder).join("done.ready"), b"1");
+        }
+        log::info!("[UI 文本检查] 主窗口各页面检查完成");
+    }
+
+    /// LETRECOVERY_UI_AUDIT_TOOLS: opens every tool window in turn (each audits itself when it is
+    /// first shown), then closes it. Message boxes a tool raises are dismissed by a watcher so
+    /// the walk cannot stop at one. Tools that start external programs are skipped.
+    unsafe fn run_tool_window_audit(&mut self, hwnd: HWND, markers: Option<&str>, pause: u64) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EnumThreadWindows, EnumWindows, GetClassNameW, GetWindow, GetWindowThreadProcessId,
+            PostMessageW, GW_OWNER, WM_CLOSE,
+        };
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let watcher_stop = stop.clone();
+        let process = std::process::id();
+        let watcher = std::thread::spawn(move || {
+            unsafe extern "system" fn close_message_box(window: HWND, lparam: LPARAM) -> windows::Win32::Foundation::BOOL {
+                let mut owner_process = 0u32;
+                let _ = GetWindowThreadProcessId(window, Some(&mut owner_process));
+                if owner_process == lparam.0 as u32 && IsWindowVisible(window).as_bool() {
+                    let mut class = [0u16; 16];
+                    let length = GetClassNameW(window, &mut class).max(0) as usize;
+                    if String::from_utf16_lossy(&class[..length]) == "#32770" {
+                        let _ = PostMessageW(window, WM_CLOSE, WPARAM(0), LPARAM(0));
+                    }
+                }
+                windows::Win32::Foundation::BOOL(1)
+            }
+            while !watcher_stop.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                let _ = EnumWindows(Some(close_message_box), LPARAM(process as isize));
+            }
+        });
+        struct Owned {
+            owner: HWND,
+            windows: Vec<HWND>,
+        }
+        unsafe extern "system" fn collect_owned(window: HWND, lparam: LPARAM) -> windows::Win32::Foundation::BOOL {
+            let owned = &mut *(lparam.0 as *mut Owned);
+            if GetWindow(window, GW_OWNER).ok() == Some(owned.owner) && IsWindowVisible(window).as_bool()
+            {
+                owned.windows.push(window);
+            }
+            windows::Win32::Foundation::BOOL(1)
+        }
+        for (index, intent) in ToolIntent::ALL.into_iter().enumerate() {
+            if matches!(
+                intent,
+                ToolIntent::RunGhost | ToolIntent::RunSpaceSniffer | ToolIntent::EnterPeMaintenance
+            ) {
+                continue;
+            }
+            // LETRECOVERY_UI_AUDIT_TOOLS may name the tools to open (e.g. "VerifyFileHash,...").
+            if let Ok(filter) = std::env::var("LETRECOVERY_UI_AUDIT_TOOLS") {
+                let name = format!("{intent:?}");
+                if filter.chars().any(|c| c.is_ascii_alphabetic())
+                    && !filter.split(',').any(|entry| entry.trim() == name)
+                {
+                    continue;
+                }
+            }
+            log::info!("[UI 文本检查] 打开工具 {:?}", intent);
+            self.handle_tool_intent(hwnd, intent);
+            pump_messages_for(pause.max(900));
+            // Select some text in the tool's first multi-line field, so the screenshot shows the
+            // selection colours.
+            {
+                unsafe extern "system" fn find_report(window: HWND, lparam: LPARAM) -> windows::Win32::Foundation::BOOL {
+                    let found = &mut *(lparam.0 as *mut HWND);
+                    let mut class = [0u16; 16];
+                    let length = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(window, &mut class).max(0) as usize;
+                    if found.is_invalid()
+                        && String::from_utf16_lossy(&class[..length]).eq_ignore_ascii_case("Edit")
+                        && GetWindowLongPtrW(window, windows::Win32::UI::WindowsAndMessaging::GWL_STYLE) & 0x0004 != 0
+                        && IsWindowVisible(window).as_bool()
+                    {
+                        *found = window;
+                    }
+                    windows::Win32::Foundation::BOOL(1)
+                }
+                let mut owned = Owned {
+                    owner: hwnd,
+                    windows: Vec::new(),
+                };
+                let _ = EnumThreadWindows(
+                    windows::Win32::System::Threading::GetCurrentThreadId(),
+                    Some(collect_owned),
+                    LPARAM(&mut owned as *mut Owned as isize),
+                );
+                for window in owned.windows {
+                    let mut report = HWND::default();
+                    let _ = windows::Win32::UI::WindowsAndMessaging::EnumChildWindows(
+                        window,
+                        Some(find_report),
+                        LPARAM(&mut report as *mut HWND as isize),
+                    );
+                    if !report.is_invalid() {
+                        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(report);
+                        let _ = SendMessageW(report, 0x00b1, WPARAM(0), LPARAM(10));
+                    }
+                }
+                pump_messages_for(300);
+            }
+            if let Some(folder) = markers {
+                let _ = std::fs::write(
+                    std::path::Path::new(folder).join(format!("tool-{index:02}.ready")),
+                    b"1",
+                );
+            }
+            pump_messages_for(pause);
+            let mut owned = Owned {
+                owner: hwnd,
+                windows: Vec::new(),
+            };
+            let _ = EnumThreadWindows(
+                windows::Win32::System::Threading::GetCurrentThreadId(),
+                Some(collect_owned),
+                LPARAM(&mut owned as *mut Owned as isize),
+            );
+            for window in owned.windows {
+                let _ = PostMessageW(window, WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            pump_messages_for(500);
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = watcher.join();
+    }
+
+    /// Drives the same code path as a live resize (WM_ENTERSIZEMOVE, one WM_SIZE per step,
+    /// WM_EXITSIZEMOVE) through 80 small size steps and logs how long each step took, so the
+    /// cost of following the pointer can be measured per page.
+    unsafe fn run_resize_benchmark(&mut self, hwnd: HWND, label: &str) {
+        let mut window = RECT::default();
+        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut window).is_err() {
+            return;
+        }
+        let (width, height) = (window.right - window.left, window.bottom - window.top);
+        let _ = SendMessageW(hwnd, WM_ENTERSIZEMOVE, WPARAM(0), LPARAM(0));
+        let _ = redraw::take_profile();
+        let mut steps = Vec::with_capacity(80);
+        for step in 0..80i32 {
+            let phase = if step < 40 { step } else { 80 - step };
+            let started = std::time::Instant::now();
+            let _ = SetWindowPos(
+                hwnd,
+                HWND::default(),
+                0,
+                0,
+                width - phase * 4,
+                height - phase * 3,
+                windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            steps.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        let _ = SendMessageW(hwnd, WM_EXITSIZEMOVE, WPARAM(0), LPARAM(0));
+        let profile = redraw::take_profile();
+        for (name, total, count) in profile.into_iter().take(14) {
+            log::info!(
+                "[UI 改大小测速] {label}  {name}: 共 {:.1} ms，{count} 次，每步 {:.2} ms",
+                total,
+                total / 80.0
+            );
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            HWND::default(),
+            0,
+            0,
+            width,
+            height,
+            windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        let mut sorted = steps.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let average = steps.iter().sum::<f64>() / steps.len().max(1) as f64;
+        log::info!(
+            "[UI 改大小测速] {label}: {} 步，平均 {:.2} ms，中位 {:.2} ms，95% {:.2} ms，最长 {:.2} ms",
+            steps.len(),
+            average,
+            sorted[sorted.len() / 2],
+            sorted[sorted.len() * 95 / 100],
+            sorted[sorted.len() - 1]
+        );
+    }
+
     unsafe fn select_page(&mut self, hwnd: HWND, page: Page) {
         self.select_page_impl(hwnd, page, true);
+    }
+
+    /// A navigation click on the page that is already fully shown does nothing. Re-running the
+    /// complete page switch for every repeated click re-laid out and repainted dozens of
+    /// controls, which was visible as flicker.
+    unsafe fn navigate_to(&mut self, hwnd: HWND, page: Page) {
+        if self.page == page && !self.advanced_visible && !self.progress_visible {
+            return;
+        }
+        self.select_page(hwnd, page);
     }
 
     unsafe fn select_page_impl(&mut self, hwnd: HWND, page: Page, manage_redraw: bool) {
@@ -5375,7 +5787,7 @@ impl NativeWindow {
         // every ShowWindow call paint immediately exposes intermediate layouts as flashes. Suspend
         // the visible top level and every descendant; WM_SETREDRAW is per HWND and freezing only
         // the parent does not stop a child common control from publishing its own intermediate DC.
-        let redraw = manage_redraw.then(|| redraw::suspend(hwnd)).flatten();
+        let redraw = manage_redraw.then(|| redraw::begin_page_transition(hwnd, "切换页面")).flatten();
         if self.advanced_visible {
             if let Some(advanced) = &self.advanced_page {
                 advanced.show(false);
@@ -5555,6 +5967,7 @@ impl NativeWindow {
         } else if manage_redraw {
             let _ = InvalidateRect(hwnd, None, false);
         }
+        redraw::ui_detail_dump_children(hwnd, "切换页面后可见子窗口");
     }
 
     unsafe fn install_control_snapshot(&self) -> Option<InstallControlSnapshot> {
@@ -5730,7 +6143,7 @@ impl NativeWindow {
         // pointer position does not generate WM_MOUSELEAVE until the user moves the mouse and
         // the stale button surface can cover the first frame at its new position.
         let _ = SendMessageW(h.advanced, WM_CANCELMODE, WPARAM(0), LPARAM(0));
-        let redraw = redraw::suspend(hwnd);
+        let redraw = redraw::begin_page_transition(hwnd, "切换高级选项");
         self.advanced_visible = true;
         if let Some(advanced) = &self.advanced_page {
             // Hidden child controls are not authoritative. Publish the latest in-memory model on
@@ -5797,7 +6210,7 @@ impl NativeWindow {
                 hwnd,
                 None,
                 None,
-                RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
             );
         }
     }
@@ -6210,15 +6623,7 @@ impl NativeWindow {
             .selected_install_target()
             .and_then(|target| target.disk_number);
         let target_bus = target_disk_number.and_then(|disk_number| {
-            match lr_core::windows_storage::disk_bus_type(disk_number) {
-                Ok(bus) => Some(bus),
-                Err(error) => {
-                    log::warn!(
-                        "[WIN7 DRIVERS] cannot confirm bus type for physical disk {disk_number}: {error}"
-                    );
-                    None
-                }
-            }
+            cached_disk_bus_type(disk_number, "[WIN7 DRIVERS]")
         });
         let target = selected.map(|image| {
             format!(
@@ -6773,14 +7178,8 @@ impl NativeWindow {
             .iter()
             .map(|partition| BackupPartitionRow {
                 volume: partition.letter.clone(),
-                total_size: format!("{:.1} GB", partition.total_size_mb as f64 / 1024.0),
-                used_size: format!(
-                    "{:.1} GB",
-                    partition
-                        .total_size_mb
-                        .saturating_sub(partition.free_size_mb) as f64
-                        / 1024.0
-                ),
+                total_size: super::layout::format_capacity_mb(partition.total_size_mb),
+                used_size: super::layout::format_capacity_mb(partition.total_size_mb.saturating_sub(partition.free_size_mb)),
                 label: partition.label.clone(),
                 bitlocker: localized_bitlocker_status(&partition.bitlocker_status),
                 status: if partition.has_windows {
@@ -6804,6 +7203,10 @@ impl NativeWindow {
                 let _ = self
                     .download_controller
                     .apply_intent(ControllerIntent::SelectCategory(category));
+                // Switching tabs moves both lists, refills them and repaints the gap between
+                // them. Do it under the same cover as a page switch so the old and new list
+                // contents never show one after the other (the right list flashed).
+                let transition = redraw::begin_page_transition(hwnd, "切换下载标签");
                 if let Some(page) = &mut self.download_page {
                     page.select_tab(tab);
                     page.replace_software_categories(
@@ -6815,6 +7218,8 @@ impl NativeWindow {
                         let _ = InvalidateRect(button, None, true);
                     }
                 }
+                redraw::resume_client(hwnd, transition);
+                redraw::ui_detail_dump_children(hwnd, "下载页切换标签后可见子窗口");
             }
             DownloadIntent::BrowseSaveFolder => {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
@@ -8127,7 +8532,7 @@ impl NativeWindow {
     unsafe fn start_expand_c_execution(&mut self, _hwnd: HWND, request: ExpandCRequest) {
         if request.requires_unsupported_raw_move() {
             let message = crate::tr!(
-                "当前版本只支持使用目标卷后方已有连续未分配空间的纯扩展；未创建 PE 交接或启动项。"
+                "这个扩容方案不受支持（只能使用相邻未分配空间，或移动紧挨在后面的一个 NTFS 数据分区）；未创建 PE 交接或启动项。"
             );
             if let Some(dialog) = &mut self.expand_c_dialog {
                 dialog.set_error(message.clone());
@@ -8266,6 +8671,11 @@ impl NativeWindow {
             strict_analysis_snapshot: request.strict_analysis_snapshot,
             borrow_from_left: request.borrow_from_left,
             donor_target_size_mb: request.donor_target_size_mb,
+            requires_partition_move: request.requires_partition_move,
+            expected_donor_partition_number: request.expected_donor_partition_number,
+            expected_donor_offset_bytes: request.expected_donor_offset_bytes,
+            expected_donor_size_bytes: request.expected_donor_size_bytes,
+            expected_moved_partitions: request.expected_moved_partitions,
             minimum_free_mb: request.minimum_free_mb,
             wim_engine: self.app_config.wim_engine,
             pe,
@@ -10813,7 +11223,14 @@ impl NativeWindow {
             }
             Some(ExpandCDialogIntent::RequestConfirmation(request)) => {
                 let moving = if request.requires_partition_move {
-                    crate::tr!("此目标需要移动 C 盘后的分区数据。")
+                    let donor = request
+                        .donor_drive_letter
+                        .map_or_else(|| crate::tr!("后方分区"), |letter| format!("{}:", letter));
+                    crate::tr!(
+                        "此目标需要把 {} 整体往后挪（必要时先收缩 {}），会复制这些分区的全部数据，分区越大耗时越长，进行中切勿断电或强制关机。",
+                        request.move_description,
+                        donor
+                    )
                 } else {
                     crate::tr!("此目标只使用相邻未分配空间。")
                 };
@@ -10826,7 +11243,7 @@ impl NativeWindow {
                         moving
                     ),
                     width: 640,
-                    height: 320,
+                    height: if request.requires_partition_move { 380 } else { 320 },
                     buttons: DialogButtons {
                         primary: crate::tr!("确认扩容"),
                         secondary: None,
@@ -10913,15 +11330,7 @@ impl NativeWindow {
         let selected = SendMessageW(handles.partitions, 0x100C, WPARAM(usize::MAX), LPARAM(2)).0;
         let partition = self.partitions.get(usize::try_from(selected).ok()?)?;
         let disk_bus_type = partition.disk_number.and_then(|disk_number| {
-            match lr_core::windows_storage::disk_bus_type(disk_number) {
-                Ok(bus) => Some(bus),
-                Err(error) => {
-                    log::warn!(
-                        "[INSTALL TARGET] cannot confirm bus type for physical disk {disk_number}: {error}"
-                    );
-                    None
-                }
-            }
+            cached_disk_bus_type(disk_number, "[INSTALL TARGET]")
         });
         Some(InstallTarget {
             partition: partition.letter.clone(),
@@ -11347,7 +11756,7 @@ impl NativeWindow {
 
     unsafe fn enter_progress(&mut self, hwnd: HWND, initial: LongTaskProgress, timer_id: usize) {
         let Some(handles) = &self.handles else { return };
-        let redraw = redraw::suspend(hwnd);
+        let redraw = redraw::begin_page_transition(hwnd, "进入进度页");
         self.progress_visible = true;
         for control in handles
             .nav
@@ -11534,20 +11943,13 @@ impl NativeWindow {
                 return;
             }
             StableTargetProbeResult::Unavailable(error) => {
-                log::error!(
-                    "[INSTALL TARGET IDENTITY] cannot query {}: {}",
+                // "Cannot verify" is not "changed": filter drivers can reject identity queries.
+                // The exact extent captured with the intent is still used by later phases.
+                log::warn!(
+                    "[INSTALL TARGET IDENTITY] cannot re-query {} ({}); continuing with the captured extent",
                     intent.target_partition,
                     error
                 );
-                if let Some(handles) = &self.handles {
-                    set_text(
-                        handles.status,
-                        &crate::tr!(
-                            "无法读取安装目标的物理身份，安装已停止。请刷新分区后重试；若仍失败，请检查管理员权限和存储控制器状态。"
-                        ),
-                    );
-                }
-                return;
             }
         }
         let partition = self.partitions.iter().find(|partition| {
@@ -11596,11 +11998,6 @@ impl NativeWindow {
                     BitLockerRequirement::UnlockRequired
                 }
                 Some(crate::core::bitlocker::VolumeStatus::Decrypting) => {
-                    BitLockerRequirement::AwaitDecryption
-                }
-                Some(crate::core::bitlocker::VolumeStatus::EncryptedUnlocked)
-                    if target_recovery_key_unavailable(&intent.target_partition) =>
-                {
                     BitLockerRequirement::AwaitDecryption
                 }
                 _ => BitLockerRequirement::Ready,
@@ -12037,7 +12434,7 @@ impl NativeWindow {
         // Returning from a full-window task used to show and move every child one by one.  The
         // intermediate states were visible as a short flash, especially on software-rendered or
         // remote desktops.  Suspend painting until the destination page has its final layout.
-        let redraw = redraw::suspend(hwnd);
+        let redraw = redraw::begin_page_transition(hwnd, "离开进度页");
         self.progress_visible = false;
         if let Some(page) = &self.progress_page {
             page.show(false);
@@ -12349,9 +12746,11 @@ impl NativeWindow {
             state.cancellable = false;
             terminal = true;
         }
-        let terminal_redraw_suspended = terminal && IsWindowVisible(hwnd).as_bool();
+        let composed = if terminal { redraw::begin_page_transition(hwnd, "下载状态切换") } else { None };
+        let terminal_redraw_suspended = composed.is_some();
         if terminal_redraw_suspended {
-            let _ = SendMessageW(hwnd, 0x000B, WPARAM(0), LPARAM(0)); // WM_SETREDRAW(FALSE)
+            // WM_SETREDRAW is never sent to the top-level window: it clears WS_VISIBLE, which lets clicks
+            // fall through to the window behind and lets DWM drop the window for a frame.
         }
         if let Some(page) = &mut self.progress_page {
             if let Some(completion) = completion {
@@ -12367,14 +12766,9 @@ impl NativeWindow {
             // single child redraw so the newly shown Return/Continue button never appears at 0,0.
             self.layout(hwnd);
             if terminal_redraw_suspended {
-                let _ = SendMessageW(hwnd, 0x000B, WPARAM(1), LPARAM(0)); // WM_SETREDRAW(TRUE)
+                // See above: the top-level window was never frozen, so there is nothing to thaw.
             }
-            let _ = RedrawWindow(
-                hwnd,
-                None,
-                None,
-                RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW,
-            );
+            redraw::resume_client(hwnd, composed);
         }
         if let Some(intent) = easy_install {
             self.start_easy_install_after_download(hwnd, intent);
@@ -12667,15 +13061,7 @@ impl NativeWindow {
                 partition_size_bytes: partition.partition_size_bytes,
                 stable_identity: partition.stable_identity,
                 disk_bus_type: partition.disk_number.and_then(|disk_number| {
-                    match lr_core::windows_storage::disk_bus_type(disk_number) {
-                        Ok(bus) => Some(bus),
-                        Err(error) => {
-                            log::warn!(
-                                "[EASY INSTALL TARGET] cannot confirm bus type for physical disk {disk_number}: {error}"
-                            );
-                            None
-                        }
-                    }
+                    cached_disk_bus_type(disk_number, "[EASY INSTALL TARGET]")
                 }),
                 style: partition.partition_style,
                 is_current_system: partition.is_system_partition,
@@ -12878,7 +13264,7 @@ impl NativeWindow {
                             if let Some(handles) = self.handles {
                                 set_text(
                                     handles.status,
-                                    &crate::tr!("鏃犳硶鍚姩闀滃儚涓嬭浇锛歿}", error),
+                                    &crate::tr!("无法启动镜像下载：{}", error),
                                 );
                             }
                         }
@@ -12956,6 +13342,9 @@ impl NativeWindow {
                         self.start_install_execution(hwnd, intent);
                     }
                     Err(error) => {
+                        // The old build showed this only in the status bar, so support logs never
+                        // explained why an installation did not start.
+                        log::warn!("[INSTALL VALIDATION] 安装未开始: {error}");
                         if let Some(handles) = &self.handles {
                             set_text(handles.status, &error.to_string());
                         }
@@ -13005,7 +13394,7 @@ impl NativeWindow {
         // SetWindowText, ComboBox resets and ListView repopulation each invalidate their own
         // native HWND. Keep those intermediate mixed-language frames hidden and publish one
         // complete non-client/client/descendant transaction after layout has stabilised.
-        let redraw = redraw::suspend(hwnd);
+        let redraw = redraw::begin_page_transition(hwnd, "切换语言");
         set_text(hwnd, &crate::build_info::window_title());
         if let Some(handles) = &self.handles {
             for (control, label) in handles.nav.into_iter().zip([
@@ -13295,7 +13684,9 @@ impl NativeWindow {
                         );
                         return;
                     }
-                    Err(error) => log::warn!("[FEEDBACK] 自动反馈失败，保留手动日志流程: {error:#}"),
+                    Err(error) => {
+                        log::warn!("[FEEDBACK] 自动反馈失败，保留手动日志流程: {error:#}")
+                    }
                 }
             }
         }
@@ -13564,8 +13955,8 @@ impl NativeWindow {
 }
 
 unsafe fn set_text(hwnd: HWND, value: &str) {
-    let value = wide(value);
-    let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(hwnd, PCWSTR(value.as_ptr()));
+    // Unchanged text is not re-sent: every WM_SETTEXT repaints the control.
+    redraw::set_window_text_if_changed(hwnd, value);
 }
 
 unsafe fn replace_combo_labels(combo: HWND, labels: &[String]) {
@@ -13878,29 +14269,22 @@ unsafe fn discard_stale_inspected_source(
     }
 }
 
-#[cfg(not(feature = "non-elevated-tests"))]
-fn target_recovery_key_unavailable(volume: &str) -> bool {
-    match crate::core::bitlocker::BitLockerManager::new().get_recovery_key(volume) {
-        Ok(_) => false,
-        Err(error) => {
-            log::warn!(
-                "目标卷 {volume} 无法读取 BitLocker 恢复密钥，将在继续安装前彻底解密：{error}"
-            );
-            true
-        }
-    }
-}
-
-#[cfg(feature = "non-elevated-tests")]
-const fn target_recovery_key_unavailable(_volume: &str) -> bool {
-    false
-}
+use windows::Win32::System::LibraryLoader::FindResourceW;
 
 pub(super) unsafe fn load_application_icons(
     instance: HINSTANCE,
 ) -> windows::core::Result<(HICON, HICON)> {
     const APPLICATION_ICON_ID: usize = 1;
     let resource = PCWSTR(APPLICATION_ICON_ID as *const u16);
+    if FindResourceW(instance, resource, PCWSTR(14 as *const u16)).is_invalid() {
+        // RT_GROUP_ICON missing (a build without the resource script): use the stock icon rather
+        // than refusing to start.
+        let icon = windows::Win32::UI::WindowsAndMessaging::LoadIconW(
+            None,
+            windows::Win32::UI::WindowsAndMessaging::IDI_APPLICATION,
+        )?;
+        return Ok((icon, icon));
+    }
     let large = LoadImageW(
         instance,
         resource,
@@ -14039,7 +14423,7 @@ fn run_with_presentation(
                 "LetRecovery main window has an unsafe click-through extended style",
             ));
         }
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        redraw::show_top_level_without_flash(hwnd);
         // WinPE's reduced USER32/UxTheme implementation can defer the first paint of child
         // controls until later messages. If we enter the message loop immediately, the
         // compositor may present stock white Edit/Combo/List surfaces before their installed
@@ -14059,6 +14443,15 @@ fn run_with_presentation(
                 HRESULT(0x8000_4005_u32 as i32),
                 "LetRecovery main window entered an unsafe click-through state",
             ));
+        }
+        super::syscolor_hook::install();
+        {
+            let (selection_text, selection_fill) =
+                theme::list_selection_colors(theme::Palette::system(), false);
+            super::syscolor_hook::set_selection_colors(selection_fill, selection_text);
+        }
+        if super::ui_audit::enabled() {
+            let _ = PostMessageW(hwnd, WM_RUN_UI_AUDIT, WPARAM(0), LPARAM(0));
         }
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
@@ -14140,7 +14533,11 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
+        windows::Win32::UI::WindowsAndMessaging::WM_NCLBUTTONDOWN => {
+            redraw::nc_left_button_down_with_live_drag(hwnd, wparam, lparam)
+        }
         WM_ENTERSIZEMOVE => {
+            super::controls::set_live_resize(true);
             if let Some(state) = state {
                 // Entering the modal move/size loop does not tell us whether the user grabbed a
                 // caption or a sizing border. Defer paint suppression until WM_SIZING/WM_SIZE so
@@ -14157,21 +14554,33 @@ unsafe extern "system" fn window_proc(
             LRESULT(1)
         }
         WM_SIZE => {
+            // Minimized: keep the layout as it is. Laying the page out for a 0x0 client and then
+            // back on restore rebuilt and repainted everything before the tool windows came back.
+            if wparam.0 == 1 {
+                return LRESULT(0);
+            }
             if let Some(state) = state {
                 if state.size_move_loop {
+                    // Follow the pointer: lay the page out on every size step instead of
+                    // deferring the new size until the mouse button is released.
                     state.live_resize = true;
-                    // A browser can continuously resize one compositor surface. This UI is made
-                    // from many independent USER32 child windows; repositioning all of them from
-                    // the synchronous WM_SIZE path stalls the modal sizing loop and exposes their
-                    // intermediate paints. Keep the retained child surface stable while the mouse
-                    // is down, then publish one complete layout from WM_EXITSIZEMOVE.
-                    return LRESULT(0);
                 }
+                let trace_start = redraw::trace_now();
                 state.layout(hwnd);
+                let layout_done = redraw::trace_now();
+                if state.live_resize {
+                    // Paint the relaid-out controls inside this size step, so the content moves
+                    // with the frame instead of trailing it by a message-loop turn.
+                    let _ = RedrawWindow(hwnd, None, None, RDW_UPDATENOW | RDW_ALLCHILDREN);
+                    redraw::trace_resize_step(hwnd, trace_start, layout_done);
+                    redraw::present_live_resize_step();
+                }
             }
             LRESULT(0)
         }
         WM_EXITSIZEMOVE => {
+            redraw::trace_resize_finished(hwnd, "主窗口");
+            super::controls::set_live_resize(false);
             if let Some(state) = state {
                 state.size_move_loop = false;
                 if state.live_resize {
@@ -14181,7 +14590,7 @@ unsafe extern "system" fn window_proc(
                         hwnd,
                         None,
                         None,
-                        RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                        RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW,
                     );
                 }
             }
@@ -14211,7 +14620,26 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_SETTINGCHANGE | WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+            // One light/dark switch delivers a burst of these messages; the main window refreshes
+            // once for the whole burst instead of running a covered transition for each message.
+            if state.is_some()
+                && theme::settings_change_affects_theme(message, wparam, lparam)
+                && !MAIN_THEME_REFRESH_PENDING.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let _ = PostMessageW(hwnd, WM_REFRESH_SYSTEM_THEME, WPARAM(0), LPARAM(0));
+            }
+            LRESULT(0)
+        }
+        WM_RUN_UI_AUDIT => {
             if let Some(state) = state {
+                state.run_ui_audit(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_REFRESH_SYSTEM_THEME => {
+            MAIN_THEME_REFRESH_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
+            if let Some(state) = state {
+                super::combo_popup::close_any(false);
                 state.refresh_system_theme(hwnd);
             }
             LRESULT(0)
@@ -14898,16 +15326,16 @@ unsafe extern "system" fn window_proc(
                     }
                 }
                 match command_id {
-                    ID_NAV_INSTALL => state.select_page(hwnd, Page::Install),
-                    ID_NAV_BACKUP => state.select_page(hwnd, Page::Backup),
+                    ID_NAV_INSTALL => state.navigate_to(hwnd, Page::Install),
+                    ID_NAV_BACKUP => state.navigate_to(hwnd, Page::Backup),
                     ID_NAV_DOWNLOAD if !state.easy_mode_enabled() => {
-                        state.select_page(hwnd, Page::Download)
+                        state.navigate_to(hwnd, Page::Download)
                     }
                     ID_NAV_TOOLS if !state.easy_mode_enabled() => {
-                        state.select_page(hwnd, Page::Tools)
+                        state.navigate_to(hwnd, Page::Tools)
                     }
-                    ID_NAV_HARDWARE => state.select_page(hwnd, Page::Hardware),
-                    ID_NAV_ABOUT => state.select_page(hwnd, Page::About),
+                    ID_NAV_HARDWARE => state.navigate_to(hwnd, Page::Hardware),
+                    ID_NAV_ABOUT => state.navigate_to(hwnd, Page::About),
                     ID_ADVANCED if state.page == Page::Hardware => state.save_hardware_report(hwnd),
                     ID_ADVANCED => state.toggle_advanced_page(hwnd),
                     ID_FORMAT => {
@@ -15388,31 +15816,36 @@ unsafe extern "system" fn window_proc(
         }
         WM_DRAWITEM => {
             if let Some(state) = state {
-                let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
-                let handled = state
-                    .pe_maintenance_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.draw_item(item, state.control_palette()))
-                    || state
-                        .advanced_page
+                let original = &*(lparam.0 as *const DRAWITEMSTRUCT);
+                // Owner-drawn buttons and custom statics are composed off-screen and copied in
+                // one BitBlt, so their background never shows before their text and glyph.
+                redraw::draw_item_buffered(original, |item| {
+                    let handled = state
+                        .pe_maintenance_dialog
                         .as_ref()
-                        .is_some_and(|page| page.draw_item(item, state.control_palette()))
-                    || state
-                        .progress_page
-                        .as_ref()
-                        .is_some_and(|page| page.draw_item(item, state.control_palette()));
-                if handled {
-                    return LRESULT(1);
-                } else if state
-                    .handles
-                    .is_some_and(|handles| item.hwndItem == handles.status)
-                {
-                    state.draw_footer_status(item);
-                } else if item.CtlType.0 == ODT_HEADER {
-                    state.draw_list_header(item);
-                } else {
-                    state.draw_button(item);
-                }
+                        .is_some_and(|dialog| dialog.draw_item(item, state.control_palette()))
+                        || state
+                            .advanced_page
+                            .as_ref()
+                            .is_some_and(|page| page.draw_item(item, state.control_palette()))
+                        || state
+                            .progress_page
+                            .as_ref()
+                            .is_some_and(|page| page.draw_item(item, state.control_palette()));
+                    if !handled {
+                        if state
+                            .handles
+                            .is_some_and(|handles| item.hwndItem == handles.status)
+                        {
+                            state.draw_footer_status(item);
+                        } else if item.CtlType.0 == ODT_HEADER {
+                            state.draw_list_header(item);
+                        } else {
+                            state.draw_button(item);
+                        }
+                    }
+                    true
+                });
                 return LRESULT(1);
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
@@ -15501,19 +15934,25 @@ unsafe extern "system" fn window_proc(
         WM_PAINT => {
             if let Some(state) = state {
                 let mut paint = PAINTSTRUCT::default();
-                let dc = BeginPaint(hwnd, &mut paint);
+                let target_dc = BeginPaint(hwnd, &mut paint);
                 let mut rect = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rect);
+                // Only the invalid part is composed and published (a resize step or a hidden
+                // control exposes a strip, not the whole window). Every pixel of it is filled
+                // below, so nothing needs to be read back from the screen first.
+                let buffer = redraw::PaintBuffer::begin_opaque(target_dc, rect, paint.rcPaint);
+                let dc = buffer.dc();
                 let carrier = state.brushes.window;
                 let _ = FillRect(dc, &rect, carrier);
                 // Long tasks intentionally occupy the complete client area.  Painting the normal
                 // navigation rail underneath their transparent STATIC controls leaked the old
                 // navigation separator through as several disconnected vertical strokes.
+                let nav_width = state.nav_width(hwnd);
                 if !state.progress_visible {
                     let nav_rect = RECT {
                         left: 0,
                         top: 0,
-                        right: state.scale(NAV_WIDTH),
+                        right: nav_width,
                         bottom: rect.bottom - state.scale(COMMAND_HEIGHT),
                     };
                     let _ = FillRect(dc, &nav_rect, carrier);
@@ -15526,13 +15965,14 @@ unsafe extern "system" fn window_proc(
                     let _ = FillRect(dc, &footer_rect, carrier);
                     draw_line(
                         dc,
-                        state.scale(NAV_WIDTH),
+                        nav_width,
                         0,
-                        state.scale(NAV_WIDTH),
+                        nav_width,
                         rect.bottom - state.scale(COMMAND_HEIGHT),
                         state.palette.separator,
                     );
                 }
+                buffer.present();
                 let _ = EndPaint(hwnd, &paint);
                 return LRESULT(0);
             }
@@ -16367,7 +16807,7 @@ mod tests {
         let gib = lr_core::custom_install::GIB;
         assert_eq!(
             reconcile_dual_boot_size_gib(Some(80), Some(80), 31 * gib + 1),
-            (32, Some(32))
+            (80, Some(80))
         );
         assert_eq!(
             reconcile_dual_boot_size_gib(Some(96), None, 31 * gib + 1),
@@ -16375,19 +16815,23 @@ mod tests {
         );
         assert_eq!(
             reconcile_dual_boot_size_gib(Some(20), None, 31 * gib + 1),
-            (32, Some(32))
+            (80, Some(80))
         );
         assert_eq!(
             reconcile_dual_boot_size_gib(None, None, 31 * gib + 1),
-            (32, Some(32))
+            (80, Some(80))
         );
         assert_eq!(
             reconcile_dual_boot_size_gib(Some(80), Some(80), 20 * gib),
-            (20, Some(20))
+            (80, Some(80))
         );
         assert_eq!(
             reconcile_dual_boot_size_gib(Some(20), None, 20 * gib),
             (20, None)
+        );
+        assert_eq!(
+            reconcile_dual_boot_size_gib(None, None, 100 * gib),
+            (100, Some(100))
         );
     }
     use crate::download::config::{EasyModeConfig, EasyModeSystem};

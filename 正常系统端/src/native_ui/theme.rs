@@ -206,11 +206,68 @@ const fn native_theme_class(kind: NativeControlKind, dark: bool) -> NativeThemeC
 /// Field frames (Edit / ComboBox / ListBox) use the host Windows 11 visual styles only. A previous
 /// owner-drawn rounded overlay left residual system-accent “blue feet” at the four rectangular
 /// corners and fought the Fluent control chrome, so it is no longer installed on those HWNDs.
+const APPLIED_THEME_PROPERTY: windows::core::PCWSTR = windows::core::w!("LetRecovery.AppliedTheme");
+
+static LAST_PALETTE_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the palette most recently applied to controls is dark, for controls that are created
+/// later and must start in the right theme family.
+pub(crate) fn last_palette_dark() -> bool {
+    LAST_PALETTE_DARK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Fields and lists are painted partly through their window DC (frames, bands, closed combo
+/// surface). Without WS_CLIPSIBLINGS such a paint also lands on any sibling that overlaps the
+/// control for a moment during a layout pass, and USER32 then copies those pixels along when the
+/// sibling moves: the "ghost of the edit box on the buttons" seen while resizing.
+unsafe fn ensure_clip_siblings(control: HWND) {
+    let style = GetWindowLongPtrW(control, GWL_STYLE);
+    let bit = WS_CLIPSIBLINGS.0 as isize;
+    if style & bit == 0 {
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+            control,
+            GWL_STYLE,
+            style | bit,
+        );
+    }
+}
+
 pub unsafe fn apply_control_theme(control: HWND, palette: Palette, kind: NativeControlKind) {
+    super::redraw::ui_detail(|| {
+        let mut window = RECT::default();
+        let _ = GetWindowRect(control, &mut window);
+        format!(
+            "apply_control_theme hwnd={:?} class={} kind={:?} style={:#x} exstyle={:#x} window={:?}",
+            control.0,
+            control_class_name(control),
+            kind,
+            GetWindowLongPtrW(control, GWL_STYLE),
+            GetWindowLongPtrW(control, windows::Win32::UI::WindowsAndMessaging::GWL_EXSTYLE),
+            window
+        )
+    });
+    if matches!(
+        kind,
+        NativeControlKind::Field | NativeControlKind::ScrollableField | NativeControlKind::List
+    ) {
+        ensure_clip_siblings(control);
+    }
     if let Some(edit) = single_line_edit_frame_owner(control) {
         apply_single_line_edit_frame_theme(control, edit, palette);
         return;
     }
+    // Multi-line edits always keep the scrollable-field class. Tool dialogs prepare every Edit as a
+    // plain field on each show; switching a report between the CFD and Explorer classes reloaded
+    // its theme every time (a white flash when copying or refreshing) and the CFD edit style drew
+    // its own square border inside the rounded frame.
+    let kind = if matches!(kind, NativeControlKind::Field)
+        && is_edit_class(&control_class_name(control))
+        && !is_single_line_edit(control)
+    {
+        NativeControlKind::ScrollableField
+    } else {
+        kind
+    };
     let class = match native_theme_class(kind, palette.dark) {
         NativeThemeClass::Explorer => w!("Explorer"),
         NativeThemeClass::DarkExplorer => w!("DarkMode_Explorer"),
@@ -219,7 +276,21 @@ pub unsafe fn apply_control_theme(control: HWND, palette: Palette, kind: NativeC
         NativeThemeClass::ItemsView => w!("ItemsView"),
         NativeThemeClass::DarkItemsView => w!("DarkMode_ItemsView"),
     };
-    let _ = SetWindowTheme(control, class, PCWSTR::null());
+    // SetWindowTheme makes the control drop and reload its theme data and repaint its frame and
+    // scrollbars; in between a multi-line edit visibly drew a light scrollbar. Re-applying the
+    // same class (every page show and theme refresh did) is skipped.
+    let class_tag = native_theme_class(kind, palette.dark) as usize + 1;
+    if windows::Win32::UI::WindowsAndMessaging::GetPropW(control, APPLIED_THEME_PROPERTY).0 as usize
+        != class_tag
+    {
+        let _ = SetWindowTheme(control, class, PCWSTR::null());
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetPropW(
+            control,
+            APPLIED_THEME_PROPERTY,
+            windows::Win32::Foundation::HANDLE(class_tag as *mut core::ffi::c_void),
+        );
+    }
+    LAST_PALETTE_DARK.store(palette.dark, std::sync::atomic::Ordering::Relaxed);
     let class_name = control_class_name(control);
     let is_edit = is_edit_class(&class_name);
     let is_combo = is_combo_class(&class_name);
@@ -299,22 +370,46 @@ pub unsafe fn apply_control_theme(control: HWND, palette: Palette, kind: NativeC
             None,
             RDW_FRAME | RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW,
         );
-    } else if is_edit
-        && matches!(kind, NativeControlKind::ScrollableField)
-        && is_read_only_edit(control)
-    {
-        // A fixed report is still a native multiline EDIT so USER32 keeps text selection,
-        // keyboard navigation and its WS_VSCROLL scrollbar.  Only remove the competing square
-        // non-client edge and paint the same deterministic rounded frame used by list surfaces.
+    } else if is_edit && !is_single_line_edit(control) {
+        // A multi-line field is a native EDIT (selection, caret, keyboard, IME and its own
+        // WS_VSCROLL scrollbar stay USER32's) inside the same hollow rounded frame sibling as the
+        // reports. The edit fills the frame up to its outline, so the scrollbar runs from the
+        // top border to the bottom border and the frame's rounded corners clip it; the text keeps
+        // its distance from every edge through the formatting rectangle.
         apply_borderless_style(control);
-        let _ = SetWindowSubclass(
+        let _ = RemoveWindowSubclass(
             control,
             Some(rounded_control_subclass),
             ROUNDED_CONTROL_SUBCLASS_ID,
+        );
+        let _ = SetWindowSubclass(
+            control,
+            Some(framed_edit_subclass),
+            FRAMED_EDIT_SUBCLASS_ID,
             palette_reference(palette),
         );
         clear_legacy_control_region(control);
-        let _ = InvalidateRect(control, None, false);
+        // Give back a band an earlier pass may have reserved in the non-client area.
+        refresh_frame_band(control);
+        if let Some(frame) = ensure_list_view_frame(control) {
+            let _ = SetWindowSubclass(
+                frame,
+                Some(list_view_frame_subclass),
+                LIST_VIEW_FRAME_SUBCLASS_ID,
+                palette_reference(palette),
+            );
+            let _ = InvalidateRect(frame, None, false);
+            // Show the frame now if the field is already visible (a child of a dialog that is
+            // shown as a whole never receives WM_SHOWWINDOW itself).
+            publish_list_view_frame(control);
+        }
+        apply_edit_text_padding(control, true);
+        let _ = RedrawWindow(
+            control,
+            None,
+            None,
+            RDW_INVALIDATE | RDW_FRAME | RDW_NOERASE,
+        );
     } else if is_edit {
         apply_single_border_style(control);
     } else if is_combo && matches!(kind, NativeControlKind::Field) {
@@ -343,15 +438,16 @@ pub unsafe fn apply_control_theme(control: HWND, palette: Palette, kind: NativeC
     } else if matches!(kind, NativeControlKind::List) && is_list_box(control) {
         // Standalone ListBoxes retain their existing Inno row palette, but the HWND itself has one
         // clipped, borderless surface so USER32 cannot expose square blue/black corner pixels.
+        // Every pixel of the client is composed by `list_box_subclass`; USER32 never paints rows.
         apply_borderless_style(control);
-        let _ = SetWindowSubclass(
-            control,
-            Some(rounded_control_subclass),
-            ROUNDED_CONTROL_SUBCLASS_ID,
-            palette_reference(palette),
-        );
+        install_list_box_subclass(control, palette);
         clear_legacy_control_region(control);
-        let _ = InvalidateRect(control, None, false);
+        let _ = RedrawWindow(
+            control,
+            None,
+            None,
+            RDW_INVALIDATE | RDW_FRAME | RDW_NOERASE,
+        );
     } else if matches!(
         kind,
         NativeControlKind::Field | NativeControlKind::ScrollableField | NativeControlKind::List
@@ -402,6 +498,14 @@ pub unsafe fn apply_control_theme(control: HWND, palette: Palette, kind: NativeC
         );
         let _ = RemovePropW(info.hwndList, LIST_BOX_HOT_PROPERTY);
         apply_combo_popup_native_chrome(info.hwndList, palette);
+        if is_combo && is_drop_down_list(control) {
+            let _ = SetWindowSubclass(
+                info.hwndList,
+                Some(combo_popup_close_subclass),
+                COMBO_POPUP_CLOSE_SUBCLASS_ID,
+                control.0 as usize,
+            );
+        }
         let _ = InvalidateRect(info.hwndList, None, false);
     }
 }
@@ -438,6 +542,52 @@ unsafe fn install_combo_selection_item_subclass(combo: HWND, palette: Palette) {
         palette_reference(palette),
     );
     repaint_combo_selection_item_now(info.hwndItem, palette);
+}
+
+const COMBO_POPUP_CLOSE_SUBCLASS_ID: usize = 0x4c52_4350;
+
+/// Choosing an item closes the popup, and USER32 then draws the chosen caption on the closed field
+/// in the focused (system-blue) style, outside WM_PAINT. The popup hiding is the reliable moment
+/// to queue our own repaint, which runs after that native drawing has finished.
+unsafe extern "system" fn combo_popup_close_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    const WM_WINDOWPOSCHANGED_MESSAGE: u32 = 0x0047;
+    const WM_SHOWWINDOW_MESSAGE: u32 = 0x0018;
+    const SWP_HIDEWINDOW_FLAG: u32 = 0x0080;
+    let result = DefSubclassProc(hwnd, message, wparam, lparam);
+    let hidden = match message {
+        WM_WINDOWPOSCHANGED_MESSAGE if lparam.0 != 0 => {
+            let position = &*(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::WINDOWPOS);
+            position.flags.0 & SWP_HIDEWINDOW_FLAG != 0
+        }
+        WM_SHOWWINDOW_MESSAGE => wparam.0 == 0,
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(
+                hwnd,
+                Some(combo_popup_close_subclass),
+                COMBO_POPUP_CLOSE_SUBCLASS_ID,
+            );
+            false
+        }
+        _ => false,
+    };
+    if hidden {
+        let combo = HWND(reference_data as *mut _);
+        super::redraw::ui_detail(|| format!("combo {:?} popup closed: repaint queued", combo.0));
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            combo,
+            WM_REPAINT_TRACKING_COMBO,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+    result
 }
 
 unsafe fn apply_combo_popup_native_chrome(popup: HWND, palette: Palette) {
@@ -604,6 +754,7 @@ pub unsafe fn apply_list_view_theme(list: HWND, palette: Palette) -> Option<HWND
         LIST_VIEW_SUBCLASS_ID,
         palette_reference(palette),
     );
+    schedule_list_column_fit(list);
     if let Some(frame) = frame {
         let _ = SetWindowSubclass(
             frame,
@@ -653,12 +804,17 @@ pub unsafe fn apply_list_view_theme(list: HWND, palette: Palette) -> Option<HWND
 }
 
 unsafe fn set_list_view_colors(list: HWND, palette: Palette) {
-    for (message, color) in [
-        (0x1001, palette.edit), // LVM_SETBKCOLOR
-        (0x1026, palette.edit), // LVM_SETTEXTBKCOLOR
-        (0x1024, palette.text), // LVM_SETTEXTCOLOR
+    // Send only colours that differ: each LVM_SET*COLOR invalidates the whole report, and this
+    // runs on every size step, focus change and enable change.
+    for (get, set, color) in [
+        (0x1000, 0x1001, palette.edit), // LVM_GETBKCOLOR / LVM_SETBKCOLOR
+        (0x1025, 0x1026, palette.edit), // LVM_GETTEXTBKCOLOR / LVM_SETTEXTBKCOLOR
+        (0x1023, 0x1024, palette.text), // LVM_GETTEXTCOLOR / LVM_SETTEXTCOLOR
     ] {
-        let _ = SendMessageW(list, message, WPARAM(0), LPARAM(color.0 as isize));
+        let current = SendMessageW(list, get, WPARAM(0), LPARAM(0)).0 as u32;
+        if current != color.0 {
+            let _ = SendMessageW(list, set, WPARAM(0), LPARAM(color.0 as isize));
+        }
     }
 }
 
@@ -783,9 +939,11 @@ unsafe fn invalidate_control_visual(control: HWND) {
     );
 }
 
-unsafe fn ensure_hot_tracking(hwnd: HWND, property: PCWSTR, non_client: bool) {
+/// Starts leave tracking and records the hot marker. Returns true only for the transition into
+/// the hot state, so callers repaint once per enter instead of once per mouse message.
+unsafe fn begin_hot_tracking(hwnd: HWND, property: PCWSTR, non_client: bool) -> bool {
     if !GetPropW(hwnd, property).is_invalid() {
-        return;
+        return false;
     }
     let mut tracking = TRACKMOUSEEVENT {
         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -798,17 +956,87 @@ unsafe fn ensure_hot_tracking(hwnd: HWND, property: PCWSTR, non_client: bool) {
         hwndTrack: hwnd,
         dwHoverTime: 0,
     };
-    if TrackMouseEvent(&mut tracking).is_ok()
+    TrackMouseEvent(&mut tracking).is_ok()
         && SetPropW(hwnd, property, HANDLE(std::ptr::dangling_mut())).is_ok()
-    {
-        redraw_control_frame(hwnd);
-    }
 }
 
-unsafe fn clear_hot_tracking(hwnd: HWND, property: PCWSTR) {
-    if RemovePropW(hwnd, property).is_ok_and(|handle| !handle.is_invalid()) {
+unsafe fn ensure_hot_tracking(hwnd: HWND, property: PCWSTR, non_client: bool) -> bool {
+    let entered = begin_hot_tracking(hwnd, property, non_client);
+    if entered {
         redraw_control_frame(hwnd);
     }
+    entered
+}
+
+/// Removes the hot marker. Returns true only for the transition out of the hot state.
+unsafe fn end_hot_tracking(hwnd: HWND, property: PCWSTR) -> bool {
+    RemovePropW(hwnd, property).is_ok_and(|handle| !handle.is_invalid())
+}
+
+unsafe fn clear_hot_tracking(hwnd: HWND, property: PCWSTR) -> bool {
+    let left = end_hot_tracking(hwnd, property);
+    if left {
+        redraw_control_frame(hwnd);
+    }
+    left
+}
+
+const BS_NOTIFY_STYLE: isize = 0x4000;
+const WM_SETREDRAW_MESSAGE: u32 = 0x000b;
+const WM_NCCALCSIZE_MESSAGE: u32 = 0x0083;
+const WM_UPDATEUISTATE_MESSAGE: u32 = 0x0128;
+const WM_PRINTCLIENT_MESSAGE: u32 = 0x0318;
+const BM_SETSTATE_MESSAGE: u32 = 0x00f3;
+
+/// Lets USER32/comctl32 change a custom-painted BUTTON's state (check, push, focus, enable, UI
+/// state, caption) without drawing its stock glyph straight to the screen.
+///
+/// The stock BUTTON paints these changes immediately through GetDC instead of invalidating, so
+/// before this our own glyph only replaced the native one on the next WM_PAINT: every click and
+/// every programmatic BM_SETCHECK briefly showed the system checkbox (light in dark mode). The
+/// change runs with drawing disabled and our own appearance of the new state is then published.
+/// WM_SETREDRAW(TRUE) sets WS_VISIBLE, so hidden or invisible buttons are never toggled; those
+/// cannot draw anyway. BS_NOTIFY buttons are left alone because they notify their parent from
+/// these messages.
+unsafe fn run_button_state_change_without_native_paint(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    let visible_bit = windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE.0 as isize;
+    let suppress = style & visible_bit != 0
+        && style & BS_NOTIFY_STYLE == 0
+        && IsWindowVisible(hwnd).as_bool();
+    if !suppress {
+        let result = DefSubclassProc(hwnd, message, wparam, lparam);
+        invalidate_control_visual(hwnd);
+        return result;
+    }
+    let _ = DefSubclassProc(hwnd, WM_SETREDRAW_MESSAGE, WPARAM(0), LPARAM(0));
+    let result = DefSubclassProc(hwnd, message, wparam, lparam);
+    if !windows::Win32::UI::WindowsAndMessaging::IsWindow(hwnd).as_bool() {
+        return result;
+    }
+    let _ = DefSubclassProc(hwnd, WM_SETREDRAW_MESSAGE, WPARAM(1), LPARAM(0));
+    // Pointer and keyboard feedback is published at once; a programmatic change (page switch,
+    // configuration load) joins the normal paint queue and is painted once with its neighbours.
+    let interactive = windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == hwnd
+        || GetFocus() == hwnd;
+    let _ = RedrawWindow(
+        hwnd,
+        None,
+        None,
+        RDW_INVALIDATE
+            | RDW_NOERASE
+            | if interactive {
+                RDW_UPDATENOW
+            } else {
+                Default::default()
+            },
+    );
+    result
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -882,12 +1110,16 @@ unsafe extern "system" fn check_box_subclass(
             clear_hot_tracking(hwnd, CHECK_BOX_HOT_PROPERTY);
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
-        WM_ENABLE | WM_SETFOCUS | WM_KILLFOCUS | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_KEYDOWN
-        | WM_KEYUP | WM_CAPTURECHANGED | WM_THEMECHANGED | WM_SETTEXT | BM_SETCHECK_MESSAGE => {
-            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+        BM_SETCHECK_MESSAGE | BM_SETSTATE_MESSAGE | WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE
+        | WM_UPDATEUISTATE_MESSAGE | WM_SETTEXT => {
             if message == WM_ENABLE && wparam.0 == 0 {
                 let _ = RemovePropW(hwnd, CHECK_BOX_HOT_PROPERTY);
             }
+            run_button_state_change_without_native_paint(hwnd, message, wparam, lparam)
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_KEYDOWN | WM_KEYUP | WM_CAPTURECHANGED
+        | WM_THEMECHANGED => {
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
             invalidate_control_visual(hwnd);
             result
         }
@@ -1057,7 +1289,9 @@ unsafe fn paint_embedded_windows11_checkbox(
     let target_dc = BeginPaint(hwnd, &mut paint);
     let mut client = RECT::default();
     let _ = GetClientRect(hwnd, &mut client);
-    let dc = target_dc;
+    // The whole client is filled below: compose only the invalid part, without a read-back.
+    let buffer = super::redraw::PaintBuffer::begin_opaque(target_dc, client, paint.rcPaint);
+    let dc = buffer.dc();
     fill(dc, &client, palette.window);
     let dpi = GetDpiForWindow(hwnd).max(96);
     let width = (client.right - client.left).max(0);
@@ -1095,6 +1329,8 @@ unsafe fn paint_embedded_windows11_checkbox(
             }
         }
     }
+    buffer.present();
+    drop(buffer);
     let _ = EndPaint(hwnd, &paint);
 }
 
@@ -1351,12 +1587,16 @@ unsafe extern "system" fn radio_button_subclass(
             clear_hot_tracking(hwnd, RADIO_BUTTON_HOT_PROPERTY);
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
-        WM_ENABLE | WM_SETFOCUS | WM_KILLFOCUS | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_KEYDOWN
-        | WM_KEYUP | WM_CAPTURECHANGED | WM_THEMECHANGED | WM_SETTEXT | BM_SETCHECK_MESSAGE => {
-            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+        BM_SETCHECK_MESSAGE | BM_SETSTATE_MESSAGE | WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE
+        | WM_UPDATEUISTATE_MESSAGE | WM_SETTEXT => {
             if message == WM_ENABLE && wparam.0 == 0 {
                 let _ = RemovePropW(hwnd, RADIO_BUTTON_HOT_PROPERTY);
             }
+            run_button_state_change_without_native_paint(hwnd, message, wparam, lparam)
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_KEYDOWN | WM_KEYUP | WM_CAPTURECHANGED
+        | WM_THEMECHANGED => {
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
             invalidate_control_visual(hwnd);
             result
         }
@@ -1375,7 +1615,8 @@ unsafe fn paint_radio_button(hwnd: HWND, palette: Palette, state: ControlState, 
     let target_dc = BeginPaint(hwnd, &mut paint);
     let mut client = RECT::default();
     let _ = GetClientRect(hwnd, &mut client);
-    let dc = target_dc;
+    let buffer = super::redraw::PaintBuffer::begin_opaque(target_dc, client, paint.rcPaint);
+    let dc = buffer.dc();
     fill(dc, &client, palette.window);
     let dpi = GetDpiForWindow(hwnd).max(96);
     let width = (client.right - client.left).max(0);
@@ -1405,6 +1646,8 @@ unsafe fn paint_radio_button(hwnd: HWND, palette: Palette, state: ControlState, 
             }
         }
     }
+    buffer.present();
+    drop(buffer);
     let _ = EndPaint(hwnd, &paint);
 }
 
@@ -1434,11 +1677,44 @@ unsafe extern "system" fn header_subclass(
     }
 }
 
+const HDM_LAYOUT_MESSAGE: u32 = 0x1205;
+
+/// Height of the report's upper frame band that continues the header, minus the outline itself.
+unsafe fn header_band_overlap(list: HWND) -> i32 {
+    if list.is_invalid() || !control_class_name(list).eq_ignore_ascii_case("SysListView32") {
+        return 0;
+    }
+    let mut window = RECT::default();
+    if GetWindowRect(list, &mut window).is_err() {
+        return 0;
+    }
+    frame_band_insets(list, window.right - window.left, window.bottom - window.top)
+        .map_or(0, |(side, band)| (band - side).max(0))
+}
+
+/// Captions are centred on the whole visible header block (band plus header window), as before
+/// the band existed, as far as the header window leaves room above the text.
+unsafe fn header_caption_lift(header: HWND, dc: HDC, height: i32) -> i32 {
+    let overlap = GetParent(header).map_or(0, |list| header_band_overlap(list));
+    if overlap <= 0 {
+        return 0;
+    }
+    let mut metrics = windows::Win32::Graphics::Gdi::TEXTMETRICW::default();
+    if !windows::Win32::Graphics::Gdi::GetTextMetricsW(dc, &mut metrics).as_bool() {
+        return 0;
+    }
+    (overlap / 2).min(((height - metrics.tmHeight) / 2).max(0))
+}
+
 unsafe fn paint_header(hwnd: HWND, palette: Palette) {
     let mut paint = PAINTSTRUCT::default();
-    let dc = BeginPaint(hwnd, &mut paint);
+    let target = BeginPaint(hwnd, &mut paint);
     let mut client = RECT::default();
     let _ = GetClientRect(hwnd, &mut client);
+    // The band background, captions and separators are composed off-screen: painting them to the
+    // screen one after another blanked every caption for a frame whenever the report was resized.
+    let buffer = super::redraw::PaintBuffer::begin_opaque(target, client, paint.rcPaint);
+    let dc = buffer.dc();
     fill(dc, &client, palette.button);
     let font = SendMessageW(hwnd, WM_GETFONT, WPARAM(0), LPARAM(0));
     let old_font = if font.0 != 0 {
@@ -1505,6 +1781,8 @@ unsafe fn paint_header(hwnd: HWND, palette: Palette) {
     if let Some(old_font) = old_font {
         let _ = SelectObject(dc, old_font);
     }
+    buffer.present();
+    drop(buffer);
     let _ = EndPaint(hwnd, &paint);
 }
 
@@ -1520,14 +1798,13 @@ unsafe extern "system" fn list_view_frame_subclass(
         WM_NCHITTEST => LRESULT(-1), // HTTRANSPARENT: preserve native ListView hit testing.
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
+            // Validate, then publish the complete hollow frame in one composed BitBlt. The former
+            // sequence (client fill, then frame fill, arc, outline and header rails straight to
+            // the screen) was visible as a flashing edge whenever the report repainted.
             let mut paint = PAINTSTRUCT::default();
-            let dc = BeginPaint(hwnd, &mut paint);
-            let mut client = RECT::default();
-            let _ = GetClientRect(hwnd, &mut client);
-            fill(dc, &client, palette_from_reference(reference_data).edit);
+            let _ = BeginPaint(hwnd, &mut paint);
             let _ = EndPaint(hwnd, &paint);
-            let palette = palette_from_reference(reference_data);
-            paint_list_view_frame(hwnd, palette);
+            paint_list_view_frame(hwnd, palette_from_reference(reference_data));
             LRESULT(0)
         }
         WM_ENABLE | WM_SIZE | WM_THEMECHANGED => {
@@ -1548,72 +1825,83 @@ unsafe extern "system" fn list_view_frame_subclass(
 }
 
 unsafe fn paint_list_view_frame(frame: HWND, palette: Palette) {
-    let Some(list) = list_view_frame_owner(frame) else {
-        paint_rounded_control_frame(frame, palette);
-        return;
-    };
-    let style = GetWindowLongPtrW(list, GWL_STYLE);
-    if is_category_list_view(style) {
-        // Category selection is an inset client-area surface. It must never become the
-        // interior colour of the sibling frame: when WS_VSCROLL is present, the upper-right
-        // frame corner meets the scrollbar rather than the selected item.
-        paint_rounded_control_frame(frame, palette);
-        return;
-    }
-    let header = HWND(SendMessageW(list, 0x101f, WPARAM(0), LPARAM(0)).0 as *mut _);
-    if header.is_invalid() || !IsWindowVisible(header).as_bool() {
-        paint_rounded_control_frame(frame, palette);
-        return;
-    }
+    let dpi = GetDpiForWindow(frame).max(96);
+    // A frame whose owner has no visible column header (or a category list) is the plain rounded
+    // outline over the report surface.
+    let header = list_view_frame_owner(frame).and_then(|list| {
+        let style = GetWindowLongPtrW(list, GWL_STYLE);
+        if is_category_list_view(style) {
+            // Category selection is an inset client-area surface. It must never become the
+            // interior colour of the sibling frame: when WS_VSCROLL is present, the upper-right
+            // frame corner meets the scrollbar rather than the selected item.
+            return None;
+        }
+        let header = HWND(SendMessageW(list, 0x101f, WPARAM(0), LPARAM(0)).0 as *mut _);
+        (!header.is_invalid() && IsWindowVisible(header).as_bool()).then_some(header)
+    });
     let mut window = RECT::default();
     if GetWindowRect(frame, &mut window).is_err() {
         return;
     }
-    let width = (window.right - window.left).max(0);
-    let height = (window.bottom - window.top).max(0);
-    let Some(geometry) =
-        rounded_control_frame_geometry(width, height, GetDpiForWindow(frame).max(96))
-    else {
-        return;
-    };
-    let dc = GetWindowDC(frame);
-    if dc.is_invalid() {
-        return;
-    }
-    let rect = RECT {
-        left: 0,
-        top: 0,
-        right: width,
-        bottom: height,
-    };
-    // The overlay owns only the hollow frame region.  Prime its complete upper arc with the
-    // adjacent header surface before drawing the outline so fully-interior corner samples cannot
-    // retain the ListView row colour.  The lower frame continues to meet the row surface.
-    fill(dc, &rect, palette.edit);
-    fill(
-        dc,
-        &RECT {
-            left: 0,
-            top: 0,
-            right: width,
-            bottom: geometry.arc_band.min(height),
-        },
-        palette.button,
-    );
-    draw_antialiased_control_frame_with_vertical_interiors(
-        dc,
-        rect,
-        geometry,
-        palette.button,
-        palette.edit,
-        palette.control_border(),
-        rounded_control_exterior(palette),
-    );
     let mut header_window = RECT::default();
-    if GetWindowRect(header, &mut header_window).is_ok() {
-        if let Some(header_band) =
+    let header_window = header
+        .filter(|header| GetWindowRect(*header, &mut header_window).is_ok())
+        .map(|_| header_window);
+    let scrollbar_column = list_view_frame_owner(frame)
+        .and_then(|list| list_view_scrollbar_column(list, window, palette));
+    let interior = list_view_frame_owner(frame)
+        .filter(|owner| is_edit_class(&control_class_name(*owner)))
+        .map_or(palette.edit, |edit| edit_surface_color(edit, palette));
+    super::redraw::ui_detail_changed(frame, "listview-frame", || {
+        format!(
+            "window={:?} header={:?} scrollbar_column={:?}",
+            window, header_window, scrollbar_column
+        )
+    });
+    super::redraw::paint_window_buffered(frame, |dc, rect| {
+        let (width, height) = (rect.right, rect.bottom);
+        fill(dc, &rect, interior);
+        let Some(geometry) = rounded_control_frame_geometry(width, height, dpi) else {
+            return;
+        };
+        if header.is_none() {
+            draw_antialiased_control_frame(
+                dc,
+                rect,
+                geometry,
+                interior,
+                palette.control_border(),
+                rounded_control_exterior(palette),
+            );
+            recolor_scrollbar_corners(dc, rect, geometry, scrollbar_column, palette);
+            return;
+        }
+        // The overlay owns only the hollow frame region.  Prime its complete upper arc with the
+        // adjacent header surface before drawing the outline so fully-interior corner samples
+        // cannot retain the ListView row colour.  The lower frame continues to meet the row
+        // surface.
+        fill(
+            dc,
+            &RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: geometry.arc_band.min(height),
+            },
+            palette.button,
+        );
+        draw_antialiased_control_frame_with_vertical_interiors(
+            dc,
+            rect,
+            geometry,
+            palette.button,
+            palette.edit,
+            palette.control_border(),
+            rounded_control_exterior(palette),
+        );
+        if let Some(header_band) = header_window.and_then(|header_window| {
             list_view_frame_header_band(window, header_window, width, height, geometry.arc_band)
-        {
+        }) {
             // The sibling's hollow region is two or more pixels wide at scaled DPI. Painting
             // that entire region with the report body colour and then adding a vertical outline
             // leaves a dark rail on both sides of the independently painted header. Publish the
@@ -1626,8 +1914,210 @@ unsafe fn paint_list_view_frame(frame: HWND, palette: Palette) {
                 fill(dc, &side_border, palette.control_border());
             }
         }
+        recolor_scrollbar_corners(dc, rect, geometry, scrollbar_column, palette);
+    });
+}
+
+/// Where the report's vertical scrollbar lies inside its frame, and the colours USER32 paints it
+/// with (upper arrow, track, lower arrow), sampled from an off-screen WM_PRINT of the report's
+/// non-client area along the scrollbar's outer edge, away from the thumb.
+#[derive(Clone, Copy, Debug)]
+struct ScrollbarColumn {
+    left: i32,
+    top_end: i32,
+    bottom_start: i32,
+    top: COLORREF,
+    track: COLORREF,
+    bottom: COLORREF,
+}
+
+thread_local! {
+    static SCROLLBAR_COLOR_CACHE: std::cell::RefCell<Vec<((isize, bool, i32), (COLORREF, COLORREF, COLORREF))>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether a settings broadcast concerns colours or theme. WM_SETTINGCHANGE also arrives for
+/// unrelated changes (environment, work area, input settings...), and re-theming every window
+/// for those is expensive; the light/dark switch arrives as "ImmersiveColorSet".
+pub(crate) unsafe fn settings_change_affects_theme(message: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
+    const SPI_SETHIGHCONTRAST_VALUE: usize = 0x0043;
+    if message != windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE {
+        return true;
     }
-    let _ = ReleaseDC(frame, dc);
+    if wparam.0 == SPI_SETHIGHCONTRAST_VALUE {
+        return true;
+    }
+    if lparam.0 == 0 {
+        return false;
+    }
+    let area = PCWSTR(lparam.0 as *const u16).to_string().unwrap_or_default();
+    ["ImmersiveColorSet", "WindowsThemeElement", "WindowMetrics"]
+        .iter()
+        .any(|name| area.eq_ignore_ascii_case(name))
+}
+
+unsafe fn list_view_scrollbar_column(
+    list: HWND,
+    frame_window: RECT,
+    palette: Palette,
+) -> Option<ScrollbarColumn> {
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, GetDC, GetPixel,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetScrollBarInfo, OBJID_VSCROLL, SCROLLBARINFO};
+    const WM_PRINT_MESSAGE: u32 = 0x0317;
+    const PRF_NONCLIENT_FLAG: isize = 0x0002;
+    let mut info = SCROLLBARINFO {
+        cbSize: std::mem::size_of::<SCROLLBARINFO>() as u32,
+        ..Default::default()
+    };
+    GetScrollBarInfo(list, OBJID_VSCROLL, &mut info).ok()?;
+    if info.rgstate[0] & (0x0000_8000 | 0x0001_0000) != 0 {
+        return None;
+    }
+    let bar = info.rcScrollBar;
+    let bar_width = bar.right - bar.left;
+    if bar_width <= 2 || bar.bottom - bar.top < 4 {
+        return None;
+    }
+    let arrow = bar_width.min((bar.bottom - bar.top) / 2);
+    let mut list_window = RECT::default();
+    GetWindowRect(list, &mut list_window).ok()?;
+    let width = (list_window.right - list_window.left).max(1);
+    let height = (list_window.bottom - list_window.top).max(1);
+    let mut colors = (palette.edit, palette.edit, palette.edit);
+    // Sampling renders the whole non-client area off-screen. Doing that on every frame repaint
+    // made each live-resize step pay for it; the colours only change with the theme.
+    let cache_key = (list.0 as isize, palette.dark, bar_width);
+    let cached = SCROLLBAR_COLOR_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(key, _)| *key == cache_key)
+            .map(|(_, colors)| *colors)
+    });
+    let screen = if let Some(cached) = cached {
+        colors = cached;
+        HDC::default()
+    } else {
+        GetDC(HWND::default())
+    };
+    if !screen.is_invalid() {
+        let dc = CreateCompatibleDC(screen);
+        let bitmap = CreateCompatibleBitmap(screen, width, height);
+        let _ = ReleaseDC(HWND::default(), screen);
+        if !dc.is_invalid() && !bitmap.is_invalid() {
+            let previous = SelectObject(dc, bitmap);
+            let _ = SendMessageW(
+                list,
+                WM_PRINT_MESSAGE,
+                WPARAM(dc.0 as usize),
+                LPARAM(PRF_NONCLIENT_FLAG),
+            );
+            // The outermost column but one: the thumb never reaches the scrollbar's edge.
+            let x = bar.right - list_window.left - 2;
+            let usable = |color: COLORREF| color.0 != 0xffff_ffff && color.0 != 0;
+            let sample = |y: i32, fallback: COLORREF| {
+                let color = GetPixel(dc, x, y - list_window.top);
+                if usable(color) {
+                    color
+                } else {
+                    fallback
+                }
+            };
+            let top = sample(bar.top + 1, palette.edit);
+            let bottom = sample(bar.bottom - 2, palette.edit);
+            // The track colour is the most frequent of several samples along it.
+            let mut votes: Vec<(u32, usize)> = Vec::new();
+            let track_top = bar.top + arrow;
+            let track_bottom = bar.bottom - arrow;
+            for step in 1..=7 {
+                let y = track_top + (track_bottom - track_top) * step / 8;
+                let color = sample(y, top);
+                match votes.iter_mut().find(|(value, _)| *value == color.0) {
+                    Some((_, count)) => *count += 1,
+                    None => votes.push((color.0, 1)),
+                }
+            }
+            let track = votes
+                .iter()
+                .max_by_key(|(_, count)| *count)
+                .map_or(top, |(value, _)| COLORREF(*value));
+            colors = (top, track, bottom);
+            SCROLLBAR_COLOR_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                cache.retain(|(key, _)| key.0 != cache_key.0);
+                if cache.len() >= 64 {
+                    cache.remove(0);
+                }
+                cache.push((cache_key, colors));
+            });
+            let _ = SelectObject(dc, previous);
+        }
+        if !bitmap.is_invalid() {
+            let _ = DeleteObject(bitmap);
+        }
+        if !dc.is_invalid() {
+            let _ = DeleteDC(dc);
+        }
+    }
+    Some(ScrollbarColumn {
+        left: bar.left - frame_window.left,
+        top_end: bar.top - frame_window.top + arrow,
+        bottom_start: bar.bottom - frame_window.top - arrow,
+        top: colors.0,
+        track: colors.1,
+        bottom: colors.2,
+    })
+}
+
+/// The frame ring beside the report's vertical scrollbar used to carry the header or row colour:
+/// a light wedge in the upper rounded corner, a thin light strip along the scrollbar next to the
+/// header and a block of another colour under it. Every ring pixel in the scrollbar's column now
+/// takes the colour of the scrollbar part next to it, so the scrollbar looks cleanly clipped by the
+/// rounded outline.
+unsafe fn recolor_scrollbar_corners(
+    dc: HDC,
+    rect: RECT,
+    geometry: super::controls::RoundedControlFrameGeometry,
+    column: Option<ScrollbarColumn>,
+    palette: Palette,
+) {
+    use windows::Win32::Graphics::Gdi::{IntersectClipRect, RestoreDC, SaveDC};
+    let Some(column) = column else {
+        return;
+    };
+    let top_end = column.top_end.clamp(rect.top, rect.bottom);
+    let bottom_start = column.bottom_start.clamp(top_end, rect.bottom);
+    for (top, bottom, color) in [
+        (rect.top, top_end, column.top),
+        (top_end, bottom_start, column.track),
+        (bottom_start, rect.bottom, column.bottom),
+    ] {
+        let area = RECT {
+            left: column.left.max(rect.left),
+            top,
+            right: rect.right,
+            bottom,
+        };
+        if area.right <= area.left || area.bottom <= area.top {
+            continue;
+        }
+        let saved = SaveDC(dc);
+        let _ = IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
+        fill(dc, &area, color);
+        draw_antialiased_control_frame(
+            dc,
+            rect,
+            geometry,
+            color,
+            palette.control_border(),
+            rounded_control_exterior(palette),
+        );
+        if saved != 0 {
+            let _ = RestoreDC(dc, saved);
+        }
+    }
 }
 
 fn list_view_frame_header_band(
@@ -1668,6 +2158,186 @@ fn list_view_frame_header_side_borders(header_band: RECT, side_band: i32) -> [RE
     ]
 }
 
+const WM_FIT_LIST_COLUMNS: u32 = 0x8000 + 0x4e5;
+const LIST_FIT_PENDING_PROPERTY: PCWSTR = w!("LetRecovery.InnoListView.FitPending");
+
+thread_local! {
+    /// Width each report column needs for its header and its widest cell, per list.
+    static LIST_COLUMN_NEEDS: std::cell::RefCell<Vec<(isize, Vec<i32>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Lists without a column header (category lists) keep the width their page gives them.
+unsafe fn list_fits_columns(list: HWND) -> bool {
+    const LVS_NOCOLUMNHEADER_STYLE: isize = 0x4000;
+    GetWindowLongPtrW(list, GWL_STYLE) & LVS_NOCOLUMNHEADER_STYLE == 0
+}
+
+unsafe fn schedule_list_column_fit(list: HWND) {
+    if !list_fits_columns(list) || !GetPropW(list, LIST_FIT_PENDING_PROPERTY).is_invalid() {
+        return;
+    }
+    if SetPropW(list, LIST_FIT_PENDING_PROPERTY, HANDLE(std::ptr::dangling_mut())).is_ok() {
+        let _ = PostMessageW(list, WM_FIT_LIST_COLUMNS, WPARAM(0), LPARAM(0));
+    }
+}
+
+unsafe fn list_column_need(list: HWND, column: i32) -> i32 {
+    let known = LIST_COLUMN_NEEDS.with(|needs| {
+        needs
+            .borrow()
+            .iter()
+            .any(|(key, _)| *key == list.0 as isize)
+    });
+    if !known {
+        measure_list_column_needs(list);
+    }
+    LIST_COLUMN_NEEDS.with(|needs| {
+        needs
+            .borrow()
+            .iter()
+            .find(|(key, _)| *key == list.0 as isize)
+            .and_then(|(_, columns)| columns.get(column.max(0) as usize).copied())
+            .unwrap_or(0)
+    })
+}
+
+/// Measures every header and cell text of a report and widens the columns that are too narrow
+/// for them. Translations are often much longer than the Chinese text the column widths were
+/// chosen for; a column is never narrower than its header and its widest cell. When the columns
+/// together are wider than the list, the list scrolls horizontally instead of cutting text.
+unsafe fn fit_list_view_columns(list: HWND) {
+    if !list_fits_columns(list) {
+        return;
+    }
+    let needs = measure_list_column_needs(list);
+    const LVM_GETCOLUMNWIDTH_MESSAGE: u32 = 0x101d;
+    const LVM_SETCOLUMNWIDTH_MESSAGE: u32 = 0x101e;
+    for (column, need) in needs.into_iter().enumerate() {
+        let current =
+            SendMessageW(list, LVM_GETCOLUMNWIDTH_MESSAGE, WPARAM(column), LPARAM(0)).0 as i32;
+        if current > 0 && current < need {
+            let _ = SendMessageW(
+                list,
+                LVM_SETCOLUMNWIDTH_MESSAGE,
+                WPARAM(column),
+                LPARAM(need as isize),
+            );
+        }
+    }
+}
+
+/// Measures the width every column needs (header and widest cell) and remembers it.
+unsafe fn measure_list_column_needs(list: HWND) -> Vec<i32> {
+    use windows::Win32::Graphics::Gdi::GetTextExtentPoint32W;
+    use windows::Win32::UI::Controls::{HDITEMW, HDI_TEXT};
+    const LVM_GETHEADER: u32 = 0x101f;
+    const LVM_GETITEMCOUNT: u32 = 0x1004;
+    const LVM_GETCOLUMNWIDTH: u32 = 0x101d;
+    const LVM_SETCOLUMNWIDTH: u32 = 0x101e;
+    const LVM_GETITEMTEXTW: u32 = 0x1073;
+    const HDM_GETITEMCOUNT: u32 = 0x1200;
+    const HDM_GETITEMW: u32 = 0x120b;
+    let header = HWND(SendMessageW(list, LVM_GETHEADER, WPARAM(0), LPARAM(0)).0 as *mut _);
+    if header.is_invalid() {
+        return Vec::new();
+    }
+    let columns = SendMessageW(header, HDM_GETITEMCOUNT, WPARAM(0), LPARAM(0)).0.max(0) as i32;
+    if columns == 0 {
+        return Vec::new();
+    }
+    let rows = SendMessageW(list, LVM_GETITEMCOUNT, WPARAM(0), LPARAM(0)).0.clamp(0, 2000) as usize;
+    let dpi = GetDpiForWindow(list).max(96);
+    let dc = windows::Win32::Graphics::Gdi::GetDC(list);
+    if dc.is_invalid() {
+        return Vec::new();
+    }
+    let measure = |font_owner: HWND, text: &[u16]| -> i32 {
+        let font = SendMessageW(font_owner, WM_GETFONT, WPARAM(0), LPARAM(0));
+        let previous = (font.0 != 0)
+            .then(|| SelectObject(dc, windows::Win32::Graphics::Gdi::HGDIOBJ(font.0 as *mut _)));
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        let _ = GetTextExtentPoint32W(dc, text, &mut size);
+        if let Some(previous) = previous {
+            let _ = SelectObject(dc, previous);
+        }
+        size.cx
+    };
+    let checkbox_slot = if rows > 0 {
+        list_view_label_left(list, 0)
+            .map(|label| {
+                let mut bounds = RECT::default();
+                let _ = SendMessageW(
+                    list,
+                    0x100E,
+                    WPARAM(0),
+                    LPARAM((&mut bounds as *mut RECT) as isize),
+                );
+                (label - bounds.left).max(0)
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let padding = scale(16, dpi);
+    let mut needs = Vec::with_capacity(columns as usize);
+    for column in 0..columns {
+        let mut text = vec![0u16; 260];
+        let mut item = HDITEMW {
+            mask: HDI_TEXT,
+            pszText: PWSTR(text.as_mut_ptr()),
+            cchTextMax: text.len() as i32,
+            ..Default::default()
+        };
+        let mut need = 0;
+        if SendMessageW(
+            header,
+            HDM_GETITEMW,
+            WPARAM(column as usize),
+            LPARAM((&mut item as *mut HDITEMW) as isize),
+        )
+        .0 != 0
+        {
+            let length = text.iter().position(|unit| *unit == 0).unwrap_or(0);
+            if length > 0 {
+                need = measure(header, &text[..length]) + padding + scale(4, dpi);
+            }
+        }
+        for row in 0..rows {
+            let mut cell = vec![0u16; 512];
+            let mut item = LVITEMW {
+                iSubItem: column,
+                pszText: PWSTR(cell.as_mut_ptr()),
+                cchTextMax: cell.len() as i32,
+                ..Default::default()
+            };
+            let length = SendMessageW(
+                list,
+                LVM_GETITEMTEXTW,
+                WPARAM(row),
+                LPARAM((&mut item as *mut LVITEMW) as isize),
+            )
+            .0
+            .clamp(0, 511) as usize;
+            if length > 0 {
+                let slot = if column == 0 { checkbox_slot } else { 0 };
+                need = need.max(measure(list, &cell[..length]) + padding + slot);
+            }
+        }
+        needs.push(need);
+    }
+    let _ = ReleaseDC(list, dc);
+    LIST_COLUMN_NEEDS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.retain(|(key, _)| *key != list.0 as isize);
+        if cache.len() >= 256 {
+            cache.remove(0);
+        }
+        cache.push((list.0 as isize, needs.clone()));
+    });
+    needs
+}
+
 unsafe extern "system" fn list_view_subclass(
     hwnd: HWND,
     message: u32,
@@ -1677,61 +2347,130 @@ unsafe extern "system" fn list_view_subclass(
     reference_data: usize,
 ) -> LRESULT {
     match message {
-        WM_ERASEBKGND => {
-            // An empty or temporarily disabled report receives no item custom-draw callbacks.
-            // Fill the complete client area here so loading never exposes comctl32's white class
-            // brush before the first row exists.
-            let mut client = RECT::default();
-            let _ = GetClientRect(hwnd, &mut client);
-            fill(
-                HDC(wparam.0 as *mut _),
-                &client,
-                palette_from_reference(reference_data).edit,
-            );
-            LRESULT(1)
+        // A column may be set narrower by a page layout; never below what its text needs. A
+        // request for the width the column already has does nothing (layouts set every column
+        // on every size step, and each real change makes the report recalculate).
+        0x101e if (lparam.0 & 0xffff) as u16 as i16 > 0 => {
+            let _profile = super::redraw::profile_scope("列表设置列宽");
+            let requested = (lparam.0 & 0xffff) as u16 as i16 as i32;
+            let width = if list_fits_columns(hwnd) {
+                requested.max(list_column_need(hwnd, wparam.0 as i32))
+            } else {
+                requested
+            };
+            if SendMessageW(hwnd, 0x101d, wparam, LPARAM(0)).0 as i32 == width {
+                return LRESULT(1);
+            }
+            DefSubclassProc(hwnd, message, wparam, LPARAM(width as isize))
         }
-        WM_PAINT => {
-            // A report with no rows never reaches NM_CUSTOMDRAW.  Some themed/disabled
-            // comctl32 paths repaint the empty body with the class brush after WM_ERASEBKGND,
-            // undoing the LVM_SETBKCOLOR value and exposing a white loading rectangle.  Own the
-            // complete empty paint transaction so there is no later default fill to overwrite it.
-            let item_count = SendMessageW(hwnd, 0x1004, WPARAM(0), LPARAM(0)).0; // LVM_GETITEMCOUNT
-            if list_view_needs_empty_body_paint(item_count) {
-                let mut paint = PAINTSTRUCT::default();
-                let dc = BeginPaint(hwnd, &mut paint);
-                let mut client = RECT::default();
-                let _ = GetClientRect(hwnd, &mut client);
-                fill(dc, &client, palette_from_reference(reference_data).edit);
-                let _ = EndPaint(hwnd, &paint);
-                repaint_list_view_header_now(hwnd);
-                if let Some(frame) = list_view_frame(hwnd) {
-                    paint_list_view_frame(frame, palette_from_reference(reference_data));
-                }
+        WM_NCPAINT => {
+            if super::redraw::layout_commit_active() {
+                super::redraw::defer_frame_paint(hwnd);
                 return LRESULT(0);
             }
+            let _profile = super::redraw::paint_scope("列表边框/滚动条绘制", "(排版中)列表边框/滚动条绘制");
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        // Rows or columns changed: measure again once the current batch of messages is done.
+        0x104d | 0x1074 | 0x104c | 0x1061 | 0x1060 | 0x1008 | 0x0030 => {
             let result = DefSubclassProc(hwnd, message, wparam, lparam);
-            // ItemsView can repaint the client area below the final row with its stock white
-            // class brush after both LVM_SETBKCOLOR and item custom draw. Item callbacks cannot
-            // cover an area that has no item, so restore only that trailing body rectangle after
-            // the native report has finished; rows, header and scrollbars remain native.
-            paint_list_view_trailing_body(hwnd, palette_from_reference(reference_data));
-            // The v6 ListView double buffer can publish its body after the child header has
-            // painted, temporarily replacing only the header background. Repaint that single
-            // child synchronously after the body transaction; `paint_header` never invalidates
-            // the report, so this ordering cannot form a feedback loop.
-            repaint_list_view_header_now(hwnd);
-            // Checkbox glyphs only; the separate hollow sibling owns the fixed rounded frame, so
-            // scrolling this report never copies the frame into its rows.
-            paint_list_view_checkboxes(hwnd, palette_from_reference(reference_data));
-            if let Some(frame) = list_view_frame(hwnd) {
-                // Publish the boundary after comctl32 and NM_CUSTOMDRAW have finished.  This keeps
-                // the frame's corner interior in sync with the current selected edge without an
-                // invalidate loop or a one-frame dark flash during category changes.
-                paint_list_view_frame(frame, palette_from_reference(reference_data));
-            }
+            schedule_list_column_fit(hwnd);
             result
         }
+        0x0047 => {
+            let _profile = super::redraw::profile_scope("列表 WM_WINDOWPOSCHANGED");
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        WM_FIT_LIST_COLUMNS => {
+            let _ = RemovePropW(hwnd, LIST_FIT_PENDING_PROPERTY);
+            fit_list_view_columns(hwnd);
+            LRESULT(0)
+        }
+        // The complete report, background included, is composed off-screen in WM_PAINT. An erase
+        // pass drawn straight to the screen blanked every row for a frame before each repaint.
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT if super::redraw::layout_commit_active() => {
+            // Column width changes inside the layout commit made comctl32 repaint the report
+            // synchronously, and the step painted it again afterwards. Validate without drawing
+            // (an invalid region left behind made every following comctl32 update ask again) and
+            // invalidate it after the commit, so the step's paint pass draws it once.
+            let mut paint = PAINTSTRUCT::default();
+            let _ = BeginPaint(hwnd, &mut paint);
+            let _ = EndPaint(hwnd, &paint);
+            super::redraw::defer_frame_paint(hwnd);
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            let _profile = super::redraw::paint_scope("列表绘制", "(排版中)列表绘制");
+            let palette = palette_from_reference(reference_data);
+            let trace_start = super::redraw::trace_now();
+            let mut paint = PAINTSTRUCT::default();
+            let target = BeginPaint(hwnd, &mut paint);
+            if list_view_hold_active(hwnd) {
+                // A rebuild (delete all, then refill) is still running in the current message.
+                // Keep what is on screen; the finished report is painted once when it is done.
+                let _ = EndPaint(hwnd, &paint);
+                return LRESULT(0);
+            }
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            // Compose the whole report off-screen and publish it with one BitBlt: background,
+            // the native rows (WM_PRINTCLIENT runs comctl32's own paint routine, custom draw
+            // included), the body below the last row and the checkbox glyphs. Doing those steps
+            // on screen made every refresh flash: the stock white body below the rows and the
+            // native light check boxes were visible until they were painted over.
+            // Only the invalid part is composed: the memory DC's clip box is that area, so the
+            // WM_PRINTCLIENT pass below lets comctl32 draw just the rows being published (a hover
+            // repaints one row instead of the whole report). Everything is filled first, so no
+            // read-back of the screen is needed.
+            let buffer = super::redraw::PaintBuffer::begin_opaque(target, client, paint.rcPaint);
+            let dc = buffer.dc();
+            fill(dc, &client, palette.edit);
+            let item_count = SendMessageW(hwnd, 0x1004, WPARAM(0), LPARAM(0)).0; // LVM_GETITEMCOUNT
+            if !list_view_needs_empty_body_paint(item_count) {
+                const WM_PRINTCLIENT_MESSAGE: u32 = 0x0318;
+                const PRF_CLIENT_FLAG: isize = 0x0004;
+                let _ = DefSubclassProc(
+                    hwnd,
+                    WM_PRINTCLIENT_MESSAGE,
+                    WPARAM(dc.0 as usize),
+                    LPARAM(PRF_CLIENT_FLAG),
+                );
+                paint_list_view_trailing_body(hwnd, dc, palette);
+                paint_list_view_checkboxes(hwnd, dc, palette);
+            }
+            // The column header is a child window that paints itself; never copy the body
+            // image over it (that is what used to require repainting the header after every
+            // report paint, a flicker of its own).
+            exclude_list_view_header(hwnd, target);
+            buffer.present();
+            drop(buffer);
+            let _ = EndPaint(hwnd, &paint);
+            // The hollow frame is a sibling above the report. Once the report clips its siblings
+            // (ensure_list_view_frame sets WS_CLIPSIBLINGS) its paints can no longer cover the
+            // frame, so the frame is not re-published after every row repaint.
+            if GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CLIPSIBLINGS.0 as isize == 0 {
+                if let Some(frame) = list_view_frame(hwnd) {
+                    paint_list_view_frame(frame, palette);
+                }
+            }
+            super::redraw::trace_list_view_paint(trace_start);
+            LRESULT(0)
+        }
+        0x1009 => {
+            // LVM_DELETEALLITEMS starts a rebuild: the caller refills the report in the same
+            // message. Hold painting until that message is finished so the empty intermediate
+            // state is never shown and the refilled report appears in a single paint.
+            begin_list_view_hold(hwnd);
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        _ if message != 0 && message == list_view_hold_release_message() => {
+            end_list_view_hold(hwnd);
+            LRESULT(0)
+        }
         WM_ENABLE | WM_SETFOCUS | WM_KILLFOCUS | WM_SIZE | WM_THEMECHANGED => {
+            let _profile =
+                (message == WM_SIZE).then(|| super::redraw::profile_scope("列表 WM_SIZE"));
             let result = DefSubclassProc(hwnd, message, wparam, lparam);
             // Comctl32 can restore class-default colours while changing enabled/theme state.
             // Reassert all three ListView colours together; partial updates cause a white empty
@@ -1748,11 +2487,98 @@ unsafe extern "system" fn list_view_subclass(
             result
         }
         WM_NCDESTROY => {
+            let _ = windows::Win32::UI::WindowsAndMessaging::RemovePropW(hwnd, LIST_VIEW_HOLD_PROPERTY);
             let _ = RemoveWindowSubclass(hwnd, Some(list_view_subclass), LIST_VIEW_SUBCLASS_ID);
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
         _ => DefSubclassProc(hwnd, message, wparam, lparam),
     }
+}
+
+const LIST_VIEW_HOLD_PROPERTY: windows::core::PCWSTR = windows::core::w!("LetRecovery.ListViewHold");
+
+fn list_view_hold_release_message() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static MESSAGE: AtomicU32 = AtomicU32::new(0);
+    let current = MESSAGE.load(Ordering::Relaxed);
+    if current != 0 {
+        return current;
+    }
+    let registered = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(windows::core::w!(
+            "LetRecovery.ListViewHoldRelease"
+        ))
+    };
+    MESSAGE.store(registered, Ordering::Relaxed);
+    registered
+}
+
+unsafe fn list_view_hold_active(list: HWND) -> bool {
+    !windows::Win32::UI::WindowsAndMessaging::GetPropW(list, LIST_VIEW_HOLD_PROPERTY).is_invalid()
+}
+
+/// Holds painting of a report until the message that is rebuilding it has returned. The release
+/// is a posted message, so it runs only after the synchronous delete-and-refill has finished.
+unsafe fn begin_list_view_hold(list: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, PostMessageW, SetPropW};
+    if list_view_hold_active(list) || !IsWindowVisible(list).as_bool() {
+        return;
+    }
+    let message = list_view_hold_release_message();
+    if message == 0 {
+        return;
+    }
+    if SetPropW(
+        list,
+        LIST_VIEW_HOLD_PROPERTY,
+        windows::Win32::Foundation::HANDLE(1 as *mut core::ffi::c_void),
+    )
+    .is_err()
+    {
+        return;
+    }
+    if PostMessageW(list, message, WPARAM(0), LPARAM(0)).is_err() {
+        let _ = windows::Win32::UI::WindowsAndMessaging::RemovePropW(list, LIST_VIEW_HOLD_PROPERTY);
+    }
+}
+
+unsafe fn end_list_view_hold(list: HWND) {
+    if !list_view_hold_active(list) {
+        return;
+    }
+    let _ = windows::Win32::UI::WindowsAndMessaging::RemovePropW(list, LIST_VIEW_HOLD_PROPERTY);
+    let _ = windows::Win32::Graphics::Gdi::RedrawWindow(
+        list,
+        None,
+        None,
+        windows::Win32::Graphics::Gdi::RDW_INVALIDATE
+            | windows::Win32::Graphics::Gdi::RDW_FRAME
+            | windows::Win32::Graphics::Gdi::RDW_UPDATENOW,
+    );
+}
+
+/// Removes the report's column header from `dc`'s clip region.
+unsafe fn exclude_list_view_header(list: HWND, dc: HDC) {
+    let header = HWND(SendMessageW(list, 0x101f, WPARAM(0), LPARAM(0)).0 as *mut _); // LVM_GETHEADER
+    if header.is_invalid() || !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(header).as_bool() {
+        return;
+    }
+    let mut rect = RECT::default();
+    if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(header, &mut rect).is_err() {
+        return;
+    }
+    let mut corners = [
+        windows::Win32::Foundation::POINT { x: rect.left, y: rect.top },
+        windows::Win32::Foundation::POINT { x: rect.right, y: rect.bottom },
+    ];
+    let _ = windows::Win32::Graphics::Gdi::MapWindowPoints(HWND::default(), list, &mut corners);
+    let _ = windows::Win32::Graphics::Gdi::ExcludeClipRect(
+        dc,
+        corners[0].x,
+        corners[0].y,
+        corners[1].x,
+        corners[1].y,
+    );
 }
 
 const fn list_view_needs_empty_body_paint(item_count: isize) -> bool {
@@ -1776,7 +2602,7 @@ fn list_view_trailing_body_rect(
     })
 }
 
-unsafe fn paint_list_view_trailing_body(hwnd: HWND, palette: Palette) {
+unsafe fn paint_list_view_trailing_body(hwnd: HWND, dc: HDC, palette: Palette) {
     const LVM_GETITEMCOUNT: u32 = 0x1004;
     const LVM_GETITEMRECT: u32 = 0x100e;
     const LVIR_BOUNDS: i32 = 0;
@@ -1804,11 +2630,7 @@ unsafe fn paint_list_view_trailing_body(hwnd: HWND, palette: Palette) {
     let Some(rect) = list_view_trailing_body_rect(client, item_count, last_bottom) else {
         return;
     };
-    let dc = windows::Win32::Graphics::Gdi::GetDC(hwnd);
-    if !dc.is_invalid() {
-        fill(dc, &rect, palette.edit);
-        let _ = ReleaseDC(hwnd, dc);
-    }
+    fill(dc, &rect, palette.edit);
 }
 
 unsafe fn apply_single_line_edit_frame_theme(frame: HWND, edit: HWND, palette: Palette) {
@@ -1842,34 +2664,24 @@ unsafe fn paint_single_line_edit_frame(frame: HWND, edit: HWND, palette: Palette
     let _ = BeginPaint(frame, &mut paint);
     let _ = EndPaint(frame, &paint);
 
-    let dc = GetWindowDC(frame);
-    if dc.is_invalid() {
-        return;
-    }
-    let mut window = RECT::default();
-    if GetWindowRect(frame, &mut window).is_ok() {
-        let rect = RECT {
-            left: 0,
-            top: 0,
-            right: (window.right - window.left).max(0),
-            bottom: (window.bottom - window.top).max(0),
-        };
-        if let Some(geometry) =
-            rounded_control_frame_geometry(rect.right, rect.bottom, GetDpiForWindow(edit).max(96))
-        {
-            let interior = palette.edit_brush_color_for(edit);
-            fill(dc, &rect, interior);
-            let hot = !GetPropW(edit, ROUNDED_CONTROL_HOT_PROPERTY).is_invalid()
-                || !GetPropW(frame, ROUNDED_CONTROL_HOT_PROPERTY).is_invalid();
-            let border = if !IsWindowEnabled(edit).as_bool() {
-                palette.control_border()
-            } else if GetFocus() == edit {
-                palette.accent_border
-            } else if hot {
-                palette.separator
-            } else {
-                palette.control_border()
-            };
+    let dpi = GetDpiForWindow(edit).max(96);
+    let interior = edit_surface_color(edit, palette);
+    let hot = !GetPropW(edit, ROUNDED_CONTROL_HOT_PROPERTY).is_invalid()
+        || !GetPropW(frame, ROUNDED_CONTROL_HOT_PROPERTY).is_invalid();
+    let border = if !IsWindowEnabled(edit).as_bool() {
+        palette.control_border()
+    } else if GetFocus() == edit {
+        palette.accent_border
+    } else if hot {
+        palette.separator
+    } else {
+        palette.control_border()
+    };
+    // Surface and outline are composed together and published in one BitBlt. Filling the ring
+    // and then drawing the outline on screen made the outline vanish for a frame on every repaint.
+    super::redraw::paint_window_buffered(frame, |dc, rect| {
+        fill(dc, &rect, interior);
+        if let Some(geometry) = rounded_control_frame_geometry(rect.right, rect.bottom, dpi) {
             draw_antialiased_control_frame(
                 dc,
                 rect,
@@ -1879,8 +2691,7 @@ unsafe fn paint_single_line_edit_frame(frame: HWND, edit: HWND, palette: Palette
                 rounded_control_exterior(palette),
             );
         }
-    }
-    let _ = ReleaseDC(frame, dc);
+    });
 }
 
 unsafe fn forward_edit_frame_pointer_message(
@@ -1937,11 +2748,15 @@ unsafe extern "system" fn single_line_edit_frame_subclass(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            ensure_hot_tracking(frame, ROUNDED_CONTROL_HOT_PROPERTY, false);
+            // Only the enter transition changes the outline colour; the former per-message
+            // repaint republished the frame for every pixel the pointer moved.
+            let entered = begin_hot_tracking(frame, ROUNDED_CONTROL_HOT_PROPERTY, false);
             if let Some(edit) = owner {
                 let result =
                     forward_edit_frame_pointer_message(frame, edit, message, wparam, lparam);
-                repaint_single_line_edit_frame(edit, false);
+                if entered {
+                    repaint_single_line_edit_frame(edit, false);
+                }
                 result
             } else {
                 DefSubclassProc(frame, message, wparam, lparam)
@@ -1952,9 +2767,10 @@ unsafe extern "system" fn single_line_edit_frame_subclass(
             |edit| forward_edit_frame_pointer_message(frame, edit, message, wparam, lparam),
         ),
         WM_MOUSELEAVE_MESSAGE => {
-            clear_hot_tracking(frame, ROUNDED_CONTROL_HOT_PROPERTY);
-            if let Some(edit) = owner {
-                repaint_single_line_edit_frame(edit, false);
+            if end_hot_tracking(frame, ROUNDED_CONTROL_HOT_PROPERTY) {
+                if let Some(edit) = owner {
+                    repaint_single_line_edit_frame(edit, false);
+                }
             }
             DefSubclassProc(frame, message, wparam, lparam)
         }
@@ -1986,27 +2802,79 @@ unsafe extern "system" fn single_line_edit_subclass(
     _subclass_id: usize,
     _reference_data: usize,
 ) -> LRESULT {
+    const WM_SETTEXT_MESSAGE: u32 = 0x000c;
+    const WM_CONTEXTMENU_MESSAGE: u32 = 0x007b;
+    const WM_CAPTURECHANGED_MESSAGE: u32 = 0x0215;
     match message {
         WM_NCPAINT => DefSubclassProc(hwnd, message, wparam, lparam),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => paint_edit_buffered(hwnd, palette_from_reference(_reference_data)),
+        WM_CONTEXTMENU_MESSAGE => {
+            super::context_menu::show_for_edit(hwnd, lparam, palette_from_reference(_reference_data));
+            LRESULT(0)
+        }
+        WM_SETTEXT_MESSAGE if edit_text_unchanged(hwnd, lparam) => LRESULT(1),
         WM_MOUSEMOVE => {
-            let result = DefSubclassProc(hwnd, message, wparam, lparam);
-            ensure_hot_tracking(hwnd, ROUNDED_CONTROL_HOT_PROPERTY, false);
-            repaint_single_line_edit_frame(hwnd, false);
+            // Drag-selecting: USER32 would paint the new selection straight onto the screen in
+            // the system colours; publish it through the buffered painter instead.
+            let result = if wparam.0 & 0x0001 != 0 {
+                run_single_line_edit_message(hwnd, message, wparam, lparam)
+            } else {
+                DefSubclassProc(hwnd, message, wparam, lparam)
+            };
+            // The hot outline lives on the sibling frame. Invalidating the Edit itself on hover
+            // made USER32 erase and redraw the text, and repainting the frame on every mouse
+            // message republished it continuously; only the enter transition matters. While the
+            // Edit holds the mouse (drag-selecting) the field simply stays hot: leave tracking
+            // does not work under capture, and toggling hot on and off made the frame blink.
+            let already_hot = !GetPropW(hwnd, ROUNDED_CONTROL_HOT_PROPERTY).is_invalid();
+            if !(already_hot && windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == hwnd)
+                && begin_hot_tracking(hwnd, ROUNDED_CONTROL_HOT_PROPERTY, false)
+            {
+                repaint_single_line_edit_frame(hwnd, false);
+            }
             result
         }
         WM_MOUSELEAVE_MESSAGE => {
             let result = DefSubclassProc(hwnd, message, wparam, lparam);
-            clear_hot_tracking(hwnd, ROUNDED_CONTROL_HOT_PROPERTY);
-            repaint_single_line_edit_frame(hwnd, false);
+            if windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() != hwnd
+                && end_hot_tracking(hwnd, ROUNDED_CONTROL_HOT_PROPERTY)
+            {
+                repaint_single_line_edit_frame(hwnd, false);
+            }
             result
         }
-        WM_ENABLE | WM_SETFOCUS | WM_KILLFOCUS | WM_SIZE | WM_THEMECHANGED => {
+        WM_CAPTURECHANGED_MESSAGE => {
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            // Selection drag finished: the field is hot only if the pointer is still over it.
+            let mut cursor = POINT::default();
+            let mut window = RECT::default();
+            let inside = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cursor).is_ok()
+                && GetWindowRect(hwnd, &mut window).is_ok()
+                && cursor.x >= window.left
+                && cursor.x < window.right
+                && cursor.y >= window.top
+                && cursor.y < window.bottom;
+            if !inside && end_hot_tracking(hwnd, ROUNDED_CONTROL_HOT_PROPERTY) {
+                repaint_single_line_edit_frame(hwnd, false);
+            }
+            result
+        }
+        WM_SETFOCUS | WM_KILLFOCUS => {
+            // Focus shows or hides the selection and creates or destroys the caret.
+            let result = run_single_line_edit_message(hwnd, message, wparam, lparam);
+            repaint_single_line_edit_frame(hwnd, true);
+            result
+        }
+        WM_ENABLE | WM_SIZE | WM_THEMECHANGED => {
             let result = DefSubclassProc(hwnd, message, wparam, lparam);
             repaint_single_line_edit_frame(hwnd, true);
             result
         }
         WM_NCDESTROY => {
             let _ = RemovePropW(hwnd, ROUNDED_CONTROL_HOT_PROPERTY);
+            let _ = RemovePropW(hwnd, EDIT_SELECTION_PROPERTY);
+            let _ = RemovePropW(hwnd, EDIT_CARET_HIDDEN_PROPERTY);
             let _ = RemoveWindowSubclass(
                 hwnd,
                 Some(single_line_edit_subclass),
@@ -2014,8 +2882,46 @@ unsafe extern "system" fn single_line_edit_subclass(
             );
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
+        // Typing, EM_REPLACESEL and cut/paste/clear/undo change the text (the field notifies its
+        // parent meanwhile); they never paint a selection, so USER32 keeps drawing them.
+        0x0102 | 0x00c2 | 0x0300 | 0x0302 | 0x0303 | 0x0304 => {
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            refresh_edit_selection_paint(hwnd);
+            result
+        }
+        _ if edit_selection_message(message, wparam) => {
+            // Clicks, drags, keys and EM_SETSEL: one buffered frame with LetRecovery's selection
+            // colours instead of USER32's direct system-blue drawing.
+            run_single_line_edit_message(hwnd, message, wparam, lparam)
+        }
         _ => DefSubclassProc(hwnd, message, wparam, lparam),
     }
+}
+
+/// Runs a message that can change what a single-line field shows (selection, caret position,
+/// text) with USER32's immediate drawing suspended - it would draw the selection in the system
+/// highlight colours straight onto the screen - and then publishes the field once through the
+/// buffered painter, which draws the selection in LetRecovery's colours. The caret is hidden
+/// while text is selected.
+unsafe fn run_single_line_edit_message(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    const WM_SETREDRAW: u32 = 0x000b;
+    let visible = IsWindowVisible(hwnd).as_bool();
+    if visible {
+        let _ = SendMessageW(hwnd, WM_SETREDRAW, WPARAM(0), LPARAM(0));
+    }
+    let result = DefSubclassProc(hwnd, message, wparam, lparam);
+    if visible {
+        let _ = SendMessageW(hwnd, WM_SETREDRAW, WPARAM(1), LPARAM(0));
+        let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    }
+    store_edit_selection_key(hwnd);
+    sync_edit_selection_caret(hwnd);
+    result
 }
 
 unsafe extern "system" fn combo_selection_item_subclass(
@@ -2029,6 +2935,19 @@ unsafe extern "system" fn combo_selection_item_subclass(
     const WM_PRINTCLIENT: u32 = 0x0318;
     let palette = palette_from_reference(reference_data);
     match message {
+        WM_LBUTTONDOWN | 0x0203 => {
+            // A click on the closed selection child opens LetRecovery's list for its combo.
+            if let Ok(combo) = GetParent(hwnd) {
+                if is_drop_down_list(combo) {
+                    if windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() != combo {
+                        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(combo);
+                    }
+                    super::combo_popup::toggle(combo, palette);
+                    return LRESULT(0);
+                }
+            }
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
         WM_ERASEBKGND | WM_PRINTCLIENT => {
             let dc = HDC(wparam.0 as *mut _);
             if !dc.is_invalid() {
@@ -2054,7 +2973,6 @@ unsafe extern "system" fn combo_selection_item_subclass(
         | WM_SETFOCUS
         | WM_KILLFOCUS
         | WM_THEMECHANGED
-        | WM_LBUTTONDOWN
         | WM_LBUTTONUP
         | WM_KEYDOWN
         | WM_KEYUP
@@ -2091,7 +3009,64 @@ unsafe extern "system" fn rounded_control_subclass(
     reference_data: usize,
 ) -> LRESULT {
     const CB_SHOWDROPDOWN: u32 = 0x014f;
+    const CB_GETDROPPEDSTATE_MESSAGE: u32 = 0x0157;
+    const WM_GETDLGCODE_MESSAGE: u32 = 0x0087;
+    const WM_SYSKEYDOWN_MESSAGE: u32 = 0x0104;
+    const WM_SHOWWINDOW_MESSAGE: u32 = 0x0018;
+    const WM_LBUTTONDBLCLK_MESSAGE: u32 = 0x0203;
+    const DLGC_WANTALLKEYS_CODE: isize = 0x0004;
+    // The drop-down list is LetRecovery's own popup (see combo_popup). It closes whenever the
+    // field loses focus, is disabled, hidden or destroyed.
+    if matches!(message, WM_KILLFOCUS | WM_NCDESTROY)
+        || (matches!(message, WM_ENABLE | WM_SHOWWINDOW_MESSAGE) && wparam.0 == 0)
+    {
+        if super::combo_popup::is_open(hwnd) {
+            super::combo_popup::close(hwnd, false);
+        }
+    }
     match message {
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK_MESSAGE if is_drop_down_list(hwnd) => {
+            // Never enter USER32's drop-list tracking: the click opens (or closes) our list.
+            if windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(hwnd).as_bool() {
+                if windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() != hwnd {
+                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(hwnd);
+                }
+                super::combo_popup::toggle(hwnd, palette_from_reference(reference_data));
+            }
+            LRESULT(0)
+        }
+        CB_SHOWDROPDOWN if is_drop_down_list(hwnd) => {
+            if wparam.0 != 0 {
+                if !super::combo_popup::is_open(hwnd) {
+                    super::combo_popup::open(hwnd, palette_from_reference(reference_data));
+                }
+            } else {
+                super::combo_popup::close(hwnd, false);
+            }
+            LRESULT(1)
+        }
+        CB_GETDROPPEDSTATE_MESSAGE if is_drop_down_list(hwnd) => {
+            LRESULT(isize::from(super::combo_popup::is_open(hwnd)))
+        }
+        WM_GETDLGCODE_MESSAGE
+            if is_drop_down_list(hwnd) && super::combo_popup::is_open(hwnd) =>
+        {
+            // While the list is open, Enter and Escape belong to it, not to the dialog buttons.
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            LRESULT(result.0 | DLGC_WANTALLKEYS_CODE)
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN_MESSAGE | 0x0102 | 0x020a
+            if is_drop_down_list(hwnd)
+                && super::combo_popup::handle_combo_input(
+                    hwnd,
+                    palette_from_reference(reference_data),
+                    message,
+                    wparam,
+                    lparam,
+                ) =>
+        {
+            LRESULT(0)
+        }
         WM_REPAINT_TRACKING_COMBO if is_drop_down_list(hwnd) => {
             // A real mouse click enters USER32's nested drop-list tracking loop. The stock theme
             // can repaint the closed selection after WM_LBUTTONDOWN but before that call returns,
@@ -2101,29 +3076,39 @@ unsafe extern "system" fn rounded_control_subclass(
             repaint_combo_closed_now(hwnd, palette_from_reference(reference_data));
             LRESULT(0)
         }
+        WM_KEYDOWN | WM_KEYUP | 0x0102 | 0x020a | 0x014e | 0x0143 | 0x014a | 0x0144 | 0x014b
+        | WM_ENABLE
+            if is_drop_down_list(hwnd) =>
+        {
+            // Arrow keys, typing, the wheel, CB_SETCURSEL, item changes and enabling make USER32
+            // draw the closed field straight to the screen, in its own style and with its own
+            // caption position; alternating with ours made the caption jump left and right.
+            // Suppress its drawing and publish ours.
+            let result = call_combo_without_native_paint(hwnd, message, wparam, lparam);
+            repaint_combo_closed_now(hwnd, palette_from_reference(reference_data));
+            result
+        }
         WM_ERASEBKGND if is_drop_down_list(hwnd) => {
             // WinPE's reduced USER32/UxTheme stack can still erase the borderless ComboBox with
             // the stock class brush before WM_PAINT. That erase survives as a bright underline
             // because the PE renderer does not agree with the closed-field height reported by
-            // COMBOBOXINFO. Paint the deterministic closed surface into the supplied erase DC and
-            // report the erase as complete. The separate ComboLBox popup remains native.
-            let dc = HDC(wparam.0 as *mut _);
-            if !dc.is_invalid() {
-                paint_combo_closed_to_dc(hwnd, palette_from_reference(reference_data), dc);
-            }
-            paint_rounded_control_frame(hwnd, palette_from_reference(reference_data));
+            // COMBOBOXINFO. Publish the complete deterministic closed surface (field, chevron,
+            // text and frame composed together) and report the erase as complete. The separate
+            // ComboLBox popup remains native.
+            repaint_combo_closed_now(hwnd, palette_from_reference(reference_data));
             LRESULT(1)
         }
+        WM_NCCALCSIZE_MESSAGE if uses_frame_band(hwnd) => band_nccalcsize(hwnd, wparam, lparam),
         WM_PAINT => {
             if is_drop_down_list(hwnd) {
                 paint_combo_closed(hwnd, palette_from_reference(reference_data));
                 return LRESULT(0);
             }
             let result = DefSubclassProc(hwnd, message, wparam, lparam);
-            if is_list_box(hwnd) {
-                paint_list_box_rows(hwnd, palette_from_reference(reference_data));
+            // A banded frame is non-client: client paints cannot reach it.
+            if reserved_frame_band(hwnd).is_none() {
+                paint_rounded_control_frame(hwnd, palette_from_reference(reference_data));
             }
-            paint_rounded_control_frame(hwnd, palette_from_reference(reference_data));
             result
         }
         WM_NCPAINT => {
@@ -2135,7 +3120,11 @@ unsafe extern "system" fn rounded_control_subclass(
                 paint_rounded_control_frame(hwnd, palette_from_reference(reference_data));
                 return LRESULT(0);
             }
-            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            let result = if uses_frame_band(hwnd) {
+                paint_native_scrollbars_only(hwnd, wparam, lparam)
+            } else {
+                DefSubclassProc(hwnd, message, wparam, lparam)
+            };
             paint_rounded_control_frame(hwnd, palette_from_reference(reference_data));
             result
         }
@@ -2144,13 +3133,31 @@ unsafe extern "system" fn rounded_control_subclass(
             ensure_hot_tracking(hwnd, ROUNDED_CONTROL_HOT_PROPERTY, false);
             result
         }
+        WM_MOUSEMOVE
+        | WM_NCMOUSEMOVE_MESSAGE
+        | WM_MOUSELEAVE_MESSAGE
+        | WM_NCMOUSELEAVE_MESSAGE
+            if reserved_frame_band(hwnd).is_some() =>
+        {
+            // Read-only report with its frame in the band: hover never changes the outline and
+            // the scrollbar cannot cover it, so pointer traffic needs no painting at all.
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        message
+            if native_scrollbar_may_repaint_frame(message)
+                && reserved_frame_band(hwnd).is_some() =>
+        {
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
         WM_MOUSEMOVE => {
+            const MK_LBUTTON_FLAG: usize = 0x0001;
             let result = DefSubclassProc(hwnd, message, wparam, lparam);
-            if is_list_box(hwnd) {
-                update_list_box_hot_item(hwnd, lparam);
-            }
-            ensure_hot_tracking(hwnd, ROUNDED_CONTROL_HOT_PROPERTY, false);
-            if !is_drop_down_list(hwnd) {
+            let entered = ensure_hot_tracking(hwnd, ROUNDED_CONTROL_HOT_PROPERTY, false);
+            // Hovering never changes this frame (the hot colour is queued once by the enter
+            // transition above). Only a drag inside a read-only report lets the native control
+            // draw selection over the frame edge, so the frame is restored for drags only instead
+            // of being republished for every pointer message.
+            if !entered && !is_drop_down_list(hwnd) && wparam.0 & MK_LBUTTON_FLAG != 0 {
                 paint_rounded_control_frame(hwnd, palette_from_reference(reference_data));
             }
             result
@@ -2163,9 +3170,6 @@ unsafe extern "system" fn rounded_control_subclass(
         }
         WM_MOUSELEAVE_MESSAGE | WM_NCMOUSELEAVE_MESSAGE => {
             let result = DefSubclassProc(hwnd, message, wparam, lparam);
-            if is_list_box(hwnd) {
-                clear_list_box_hot_item(hwnd);
-            }
             clear_hot_tracking(hwnd, ROUNDED_CONTROL_HOT_PROPERTY);
             if !is_drop_down_list(hwnd) {
                 paint_rounded_control_frame(hwnd, palette_from_reference(reference_data));
@@ -2189,7 +3193,7 @@ unsafe extern "system" fn rounded_control_subclass(
             result
         }
         WM_SETFOCUS if is_drop_down_list(hwnd) => {
-            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            let result = call_combo_without_native_paint(hwnd, message, wparam, lparam);
             install_combo_selection_item_subclass(hwnd, palette_from_reference(reference_data));
             // USER32 creates and shows a caret when a CBS_DROPDOWNLIST receives focus. The closed
             // field is read-only and fully painted by this subclass, so that caret has no editing
@@ -2214,7 +3218,7 @@ unsafe extern "system" fn rounded_control_subclass(
             {
                 let _ = ShowCaret(hwnd);
             }
-            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            let result = call_combo_without_native_paint(hwnd, message, wparam, lparam);
             repaint_combo_closed_now(hwnd, palette_from_reference(reference_data));
             result
         }
@@ -2235,6 +3239,13 @@ unsafe extern "system" fn rounded_control_subclass(
             result
         }
         WM_ENABLE | WM_SETFOCUS | WM_KILLFOCUS | WM_SIZE | WM_THEMECHANGED | WM_LBUTTONUP => {
+            let _profile = (message == WM_SIZE).then(|| {
+                super::redraw::profile_scope(if is_drop_down_list(hwnd) {
+                    "下拉框改尺寸"
+                } else {
+                    "圆角控件改尺寸"
+                })
+            });
             let result = DefSubclassProc(hwnd, message, wparam, lparam);
             if is_drop_down_list(hwnd) {
                 if matches!(message, WM_SIZE | WM_THEMECHANGED) {
@@ -2302,7 +3313,878 @@ unsafe extern "system" fn rounded_control_subclass(
     }
 }
 
+// ------------------------------------------------------------------------------------------
+// Frame band for scrollable fields (read-only multi-line Edit, standalone ListBox).
+// ------------------------------------------------------------------------------------------
+//
+// The rounded frame of these controls used to be painted over the window's own outer pixels,
+// including the native vertical scrollbar. USER32/UxTheme repaint that scrollbar by themselves
+// (hover, press, fade animations driven by internal timers), which wiped the frame edge beside
+// it until the next mouse message restored it: the frame visibly came and went while the pointer
+// rested on the scrollbar. The frame now lives in a thin non-client band reserved through
+// WM_NCCALCSIZE. USER32 lays the scrollbar out inside that band (a scrollbar is always placed
+// beside the client rectangle), so the scrollbar and the frame never share a pixel and neither
+// can erase the other.
+
+unsafe fn uses_frame_band(hwnd: HWND) -> bool {
+    let class_name = control_class_name(hwnd);
+    let _ = class_name;
+    is_list_box(hwnd)
+}
+
+const FRAMED_EDIT_SUBCLASS_ID: usize = 0x4c52_4645;
+const EDIT_LAYOUT_BUSY_PROPERTY: PCWSTR = w!("LetRecovery.FramedEdit.LayoutBusy");
+
+/// Paints an Edit off-screen and publishes it with one BitBlt. USER32 erased the whole field and
+/// then drew the text on top of the screen pixels, so every text update (a progress line, a
+/// hash result) and every auto-scroll while selecting showed an empty field for a moment: the
+/// flicker. The Edit's own painter still draws everything (WM_PRINTCLIENT) - text, selection,
+/// scroll position - only into the off-screen surface, over its own background colour.
+unsafe fn paint_edit_buffered(hwnd: HWND, palette: Palette) -> LRESULT {
+    const WM_PRINTCLIENT: u32 = 0x0318;
+    const PRF_CLIENT: isize = 0x0004;
+    let mut paint = PAINTSTRUCT::default();
+    let target = BeginPaint(hwnd, &mut paint);
+    let mut client = RECT::default();
+    if !target.is_invalid() && GetClientRect(hwnd, &mut client).is_ok() {
+        let area = intersect_rects(client, paint.rcPaint);
+        if area.right > area.left && area.bottom > area.top {
+            let background = edit_surface_color(hwnd, palette);
+            let buffer = super::redraw::PaintBuffer::begin_opaque(target, client, area);
+            let dc = buffer.dc();
+            fill(dc, &client, background);
+            let _ = SendMessageW(hwnd, WM_PRINTCLIENT, WPARAM(dc.0 as usize), LPARAM(PRF_CLIENT));
+            overlay_edit_selection(hwnd, dc, palette);
+            let caret_hidden = HideCaret(hwnd).is_ok();
+            buffer.present();
+            if caret_hidden {
+                let _ = ShowCaret(hwnd);
+            }
+        }
+    }
+    let _ = EndPaint(hwnd, &paint);
+    LRESULT(0)
+}
+
+const STATIC_TEXT_SUBCLASS_ID: usize = 0x4c52_5354;
+
+/// Text labels (STATIC with left, centred, right, simple or no-wrap text) get the same treatment
+/// as the edits: an unchanged text is not set again, and the label is painted off-screen and
+/// published with one BitBlt, so status and progress labels that change many times a second
+/// never show an erased, empty label in between.
+pub(crate) unsafe fn install_static_text_subclass(label: HWND) {
+    let kind = GetWindowLongPtrW(label, GWL_STYLE) & 0x1f;
+    if matches!(kind, 0x00 | 0x01 | 0x02 | 0x0b | 0x0c) {
+        let _ = SetWindowSubclass(label, Some(static_text_subclass), STATIC_TEXT_SUBCLASS_ID, 0);
+    }
+}
+
+unsafe extern "system" fn static_text_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    _reference_data: usize,
+) -> LRESULT {
+    const WM_SETTEXT_MESSAGE: u32 = 0x000c;
+    const WM_PRINTCLIENT: u32 = 0x0318;
+    const PRF_CLIENT: isize = 0x0004;
+    match message {
+        WM_SETTEXT_MESSAGE if edit_text_unchanged(hwnd, lparam) => LRESULT(1),
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let target = BeginPaint(hwnd, &mut paint);
+            let mut client = RECT::default();
+            if !target.is_invalid() && GetClientRect(hwnd, &mut client).is_ok() {
+                let area = intersect_rects(client, paint.rcPaint);
+                if area.right > area.left && area.bottom > area.top {
+                    let buffer = super::redraw::PaintBuffer::begin_opaque(target, client, area);
+                    let dc = buffer.dc();
+                    // The background the label itself would use: the parent's static brush.
+                    let brush = GetParent(hwnd)
+                        .map(|parent| {
+                            SendMessageW(
+                                parent,
+                                windows::Win32::UI::WindowsAndMessaging::WM_CTLCOLORSTATIC,
+                                WPARAM(dc.0 as usize),
+                                LPARAM(hwnd.0 as isize),
+                            )
+                            .0
+                        })
+                        .unwrap_or(0);
+                    if brush != 0 {
+                        let _ = FillRect(
+                            dc,
+                            &client,
+                            windows::Win32::Graphics::Gdi::HBRUSH(brush as *mut _),
+                        );
+                    }
+                    let _ = SendMessageW(hwnd, WM_PRINTCLIENT, WPARAM(dc.0 as usize), LPARAM(PRF_CLIENT));
+                    buffer.present();
+                }
+            }
+            let _ = EndPaint(hwnd, &paint);
+            LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            let _ = RemoveWindowSubclass(hwnd, Some(static_text_subclass), STATIC_TEXT_SUBCLASS_ID);
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        _ => DefSubclassProc(hwnd, message, wparam, lparam),
+    }
+}
+
+const EDIT_SELECTION_PROPERTY: PCWSTR = w!("LetRecovery.Edit.PaintedSelection");
+
+unsafe fn edit_selection(edit: HWND) -> (u32, u32) {
+    let mut start = 0u32;
+    let mut end = 0u32;
+    let _ = SendMessageW(
+        edit,
+        0x00b0, // EM_GETSEL
+        WPARAM(&mut start as *mut u32 as usize),
+        LPARAM(&mut end as *mut u32 as isize),
+    );
+    (start.min(end), start.max(end))
+}
+
+/// Selected text in LetRecovery's selection colours (the same as selected list rows) instead of
+/// the system highlight: after the Edit's own painter, every selected segment is filled and its
+/// text drawn again on top, line by line, at the positions the Edit reports.
+unsafe fn overlay_edit_selection(edit: HWND, dc: HDC, palette: Palette) {
+    const ES_MULTILINE: isize = 0x0004;
+    const ES_PASSWORD: isize = 0x0020;
+    const ES_NOHIDESEL: isize = 0x0100;
+    const EM_GETRECT: u32 = 0x00b2;
+    const EM_LINEINDEX: u32 = 0x00bb;
+    const EM_LINELENGTH: u32 = 0x00c1;
+    const EM_LINEFROMCHAR: u32 = 0x00c9;
+    const EM_POSFROMCHAR: u32 = 0x00d6;
+    let style = GetWindowLongPtrW(edit, GWL_STYLE);
+    if style & ES_PASSWORD != 0 {
+        return;
+    }
+    let focused = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == edit;
+    if !focused && style & ES_NOHIDESEL == 0 {
+        return;
+    }
+    let (start, end) = edit_selection(edit);
+    if start >= end {
+        return;
+    }
+    let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(edit).max(0) as usize;
+    if length == 0 {
+        return;
+    }
+    let mut text = vec![0u16; length + 1];
+    let copied = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(edit, &mut text).max(0) as usize;
+    text.truncate(copied);
+    let (selected_text, selected_fill) = navigation_selection_colors(palette, false);
+    let font = SendMessageW(edit, WM_GETFONT, WPARAM(0), LPARAM(0));
+    let previous = (font.0 != 0)
+        .then(|| SelectObject(dc, windows::Win32::Graphics::Gdi::HGDIOBJ(font.0 as *mut _)));
+    let mut metrics = windows::Win32::Graphics::Gdi::TEXTMETRICW::default();
+    let _ = windows::Win32::Graphics::Gdi::GetTextMetricsW(dc, &mut metrics);
+    let line_height = metrics.tmHeight.max(1);
+    let mut format = RECT::default();
+    let _ = SendMessageW(edit, EM_GETRECT, WPARAM(0), LPARAM((&mut format as *mut RECT) as isize));
+    let saved = windows::Win32::Graphics::Gdi::SaveDC(dc);
+    let _ = windows::Win32::Graphics::Gdi::IntersectClipRect(
+        dc,
+        format.left,
+        format.top,
+        format.right,
+        format.bottom,
+    );
+    let _ = SetBkMode(dc, TRANSPARENT);
+    let _ = SetTextColor(dc, selected_text);
+    let multiline = style & ES_MULTILINE != 0;
+    let (first_line, last_line) = if multiline {
+        (
+            SendMessageW(edit, EM_LINEFROMCHAR, WPARAM(start as usize), LPARAM(0)).0.max(0),
+            SendMessageW(edit, EM_LINEFROMCHAR, WPARAM(end as usize), LPARAM(0)).0.max(0),
+        )
+    } else {
+        (0, 0)
+    };
+    for line in first_line..=last_line {
+        let line_start = if multiline {
+            SendMessageW(edit, EM_LINEINDEX, WPARAM(line as usize), LPARAM(0)).0
+        } else {
+            0
+        };
+        if line_start < 0 {
+            continue;
+        }
+        let line_start = line_start as usize;
+        let line_length = if multiline {
+            SendMessageW(edit, EM_LINELENGTH, WPARAM(line_start), LPARAM(0)).0.max(0) as usize
+        } else {
+            text.len()
+        };
+        let segment_start = (start as usize).max(line_start);
+        let segment_end = (end as usize).min(line_start + line_length).min(text.len());
+        if segment_end <= segment_start {
+            continue;
+        }
+        let position = SendMessageW(edit, EM_POSFROMCHAR, WPARAM(segment_start), LPARAM(0)).0;
+        if position == -1 {
+            continue;
+        }
+        let x = (position & 0xffff) as u16 as i16 as i32;
+        let y = ((position >> 16) & 0xffff) as u16 as i16 as i32;
+        let segment = &text[segment_start..segment_end];
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(dc, segment, &mut size);
+        fill(
+            dc,
+            &RECT {
+                left: x,
+                top: y,
+                right: x + size.cx,
+                bottom: y + line_height,
+            },
+            selected_fill,
+        );
+        let _ = windows::Win32::Graphics::Gdi::TextOutW(dc, x, y, segment);
+    }
+    if saved != 0 {
+        let _ = windows::Win32::Graphics::Gdi::RestoreDC(dc, saved);
+    }
+    if let Some(previous) = previous {
+        let _ = SelectObject(dc, previous);
+    }
+}
+
+fn edit_selection_key(start: u32, end: u32, focused: bool) -> usize {
+    ((start as usize) << 32) | ((end as usize) << 1) | usize::from(focused)
+}
+
+/// Records the selection the field now shows, so the next refresh does not paint it again.
+unsafe fn store_edit_selection_key(edit: HWND) {
+    let (start, end) = edit_selection(edit);
+    let focused = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == edit;
+    let key = edit_selection_key(start, end, focused);
+    let _ = SetPropW(edit, EDIT_SELECTION_PROPERTY, HANDLE(key as *mut _));
+}
+
+const EDIT_CARET_HIDDEN_PROPERTY: PCWSTR = w!("LetRecovery.Edit.CaretHidden");
+
+/// Hides the blinking caret while the focused field has selected text and shows it again once
+/// the selection is collapsed. USER32 counts HideCaret/ShowCaret, so exactly one hide is held
+/// per field; the field destroys its caret (and that count) when it loses focus.
+unsafe fn sync_edit_selection_caret(edit: HWND) {
+    let focused = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == edit;
+    let (start, end) = edit_selection(edit);
+    let want_hidden = focused && start != end;
+    let hidden = !GetPropW(edit, EDIT_CARET_HIDDEN_PROPERTY).is_invalid();
+    if want_hidden && !hidden {
+        if HideCaret(edit).is_ok() {
+            let _ = SetPropW(edit, EDIT_CARET_HIDDEN_PROPERTY, HANDLE(std::ptr::dangling_mut()));
+        }
+    } else if !want_hidden && hidden {
+        let _ = RemovePropW(edit, EDIT_CARET_HIDDEN_PROPERTY);
+        if focused {
+            let _ = ShowCaret(edit);
+        }
+    }
+}
+
+/// After anything that can change the selection: when it did, the field is repainted at once
+/// (buffered), so USER32's own system-blue selection drawing never stays on screen.
+unsafe fn refresh_edit_selection_paint(edit: HWND) {
+    sync_edit_selection_caret(edit);
+    let (start, end) = edit_selection(edit);
+    let focused = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == edit;
+    let key = edit_selection_key(start, end, focused);
+    let previous = GetPropW(edit, EDIT_SELECTION_PROPERTY).0 as usize;
+    let had_selection = previous != 0 && ((previous >> 32) != ((previous >> 1) & 0x7fff_ffff));
+    if key == previous || (start == end && !had_selection) {
+        let _ = SetPropW(edit, EDIT_SELECTION_PROPERTY, HANDLE(key as *mut _));
+        return;
+    }
+    let _ = SetPropW(edit, EDIT_SELECTION_PROPERTY, HANDLE(key as *mut _));
+    let _ = RedrawWindow(edit, None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+}
+
+fn edit_selection_message(message: u32, wparam: WPARAM) -> bool {
+    match message {
+        0x0201 | 0x0202 | 0x0203 | 0x0100 | 0x0101 | 0x00b1 | 0x0113 | 0x0007 | 0x0008
+        | 0x0102 | 0x00c2 => true,
+        0x0200 => wparam.0 & 0x0001 != 0, // WM_MOUSEMOVE with the left button down
+        _ => false,
+    }
+}
+
+/// WM_SETTEXT with exactly the text the Edit already shows: nothing to do. Setting it again reset
+/// the caret and scroll position and repainted the whole field for every repeated status update.
+unsafe fn edit_text_unchanged(hwnd: HWND, lparam: LPARAM) -> bool {
+    let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(hwnd).max(0) as usize;
+    if lparam.0 == 0 {
+        return length == 0;
+    }
+    let pointer = PCWSTR(lparam.0 as *const u16);
+    let incoming = pointer.as_wide();
+    if incoming.len() != length {
+        return false;
+    }
+    let mut current = vec![0u16; length + 1];
+    let copied = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut current).max(0) as usize;
+    current[..copied.min(length)] == *incoming
+}
+
+unsafe fn edit_line_height(edit: HWND) -> i32 {
+    let dc = windows::Win32::Graphics::Gdi::GetDC(edit);
+    if dc.is_invalid() {
+        return scale(18, GetDpiForWindow(edit).max(96));
+    }
+    let font = SendMessageW(edit, WM_GETFONT, WPARAM(0), LPARAM(0));
+    let previous = (font.0 != 0)
+        .then(|| SelectObject(dc, windows::Win32::Graphics::Gdi::HGDIOBJ(font.0 as *mut _)));
+    let mut metrics = windows::Win32::Graphics::Gdi::TEXTMETRICW::default();
+    let measured = windows::Win32::Graphics::Gdi::GetTextMetricsW(dc, &mut metrics).as_bool();
+    if let Some(previous) = previous {
+        let _ = SelectObject(dc, previous);
+    }
+    let _ = ReleaseDC(edit, dc);
+    if measured {
+        metrics.tmHeight.max(1)
+    } else {
+        scale(18, GetDpiForWindow(edit).max(96))
+    }
+}
+
+/// Text placement of a framed multi-line field:
+///  - the vertical scrollbar is shown only while the text needs scrolling (hidden while the text
+///    fits, shown again as soon as it does not; the switch is made with painting suspended and
+///    published in one buffered paint, so it never flickers);
+///  - text that fits and fills at least half of the field is centred vertically, so the first
+///    line is as far from the top edge as the last line is from the bottom edge;
+///  - otherwise the text keeps its normal inner margins.
+unsafe fn refresh_edit_layout(edit: HWND, repaint: bool) {
+    const EM_SETRECTNP: u32 = 0x00b4;
+    const EM_GETLINECOUNT: u32 = 0x00ba;
+    if !GetPropW(edit, EDIT_LAYOUT_BUSY_PROPERTY).is_invalid() {
+        return;
+    }
+    let _ = SetPropW(edit, EDIT_LAYOUT_BUSY_PROPERTY, HANDLE(std::ptr::dangling_mut()));
+    let dpi = GetDpiForWindow(edit).max(96);
+    let horizontal = scale(6, dpi);
+    let vertical = scale(4, dpi);
+    let line = edit_line_height(edit);
+    let mut client = RECT::default();
+    let _ = GetClientRect(edit, &mut client);
+    let raw_lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0)).0.max(1) as i32;
+    // A final line break adds an empty last line that is not content.
+    let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(edit).max(0) as usize;
+    let ends_with_break = length > 0 && {
+        let mut text = vec![0u16; length + 1];
+        let copied =
+            windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(edit, &mut text).max(0) as usize;
+        copied > 0 && text[copied - 1] == u16::from(b'\n')
+    };
+    let visible_lines = if ends_with_break { (raw_lines - 1).max(1) } else { raw_lines };
+    let raw_content = raw_lines * line;
+    let content = if length == 0 { 0 } else { visible_lines * line };
+    let height = client.bottom - client.top;
+    let has_bar = GetWindowLongPtrW(edit, GWL_STYLE)
+        & windows::Win32::UI::WindowsAndMessaging::WS_VSCROLL.0 as isize
+        != 0;
+    let fits_without_bar = raw_content <= height - vertical - line / 2;
+    let needs_bar = raw_content > height - vertical;
+    let want_bar = if has_bar { !fits_without_bar } else { needs_bar };
+    let mut repaint = repaint;
+    if want_bar != has_bar {
+        let _ = SendMessageW(edit, 0x000b, WPARAM(0), LPARAM(0)); // WM_SETREDRAW off
+        let _ = windows::Win32::UI::Controls::ShowScrollBar(
+            edit,
+            windows::Win32::UI::WindowsAndMessaging::SB_VERT,
+            want_bar,
+        );
+        let _ = SendMessageW(edit, 0x000b, WPARAM(1), LPARAM(0));
+        let _ = GetClientRect(edit, &mut client);
+        repaint = true;
+    }
+    let height = client.bottom - client.top;
+    let available = (height - vertical * 2).max(line);
+    let top = if !want_bar && content > 0 && content * 2 >= available {
+        ((height - content) / 2).max(vertical)
+    } else {
+        vertical
+    };
+    let format = RECT {
+        left: client.left + horizontal,
+        top: client.top + top,
+        right: (client.right - horizontal).max(client.left + horizontal + 1),
+        bottom: if want_bar {
+            (client.bottom - vertical).max(client.top + top + 1)
+        } else {
+            client.bottom.max(client.top + top + 1)
+        },
+    };
+    let _ = SendMessageW(
+        edit,
+        EM_SETRECTNP,
+        WPARAM(0),
+        LPARAM((&format as *const RECT) as isize),
+    );
+    let _ = RemovePropW(edit, EDIT_LAYOUT_BUSY_PROPERTY);
+    if repaint {
+        let _ = RedrawWindow(edit, None, None, RDW_INVALIDATE | RDW_FRAME | RDW_NOERASE);
+        if let Some(frame) = list_view_frame(edit) {
+            let _ = InvalidateRect(frame, None, false);
+        }
+    }
+}
+
+/// Keeps the text of a framed multi-line edit away from the frame: a formatting rectangle
+/// inset from the client area (USER32 resets it on every size or font change).
+unsafe fn apply_edit_text_padding(edit: HWND, redraw: bool) {
+    refresh_edit_layout(edit, redraw);
+}
+
+unsafe extern "system" fn framed_edit_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    const WM_SETFONT_MESSAGE: u32 = 0x0030;
+    const WM_SETTEXT_MESSAGE: u32 = 0x000c;
+    const WM_CONTEXTMENU_MESSAGE: u32 = 0x007b;
+    const EM_REPLACESEL: u32 = 0x00c2;
+    match message {
+        WM_NCPAINT if super::redraw::layout_commit_active() => {
+            super::redraw::defer_frame_paint(hwnd);
+            LRESULT(0)
+        }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => paint_edit_buffered(hwnd, palette_from_reference(reference_data)),
+        WM_CONTEXTMENU_MESSAGE => {
+            super::context_menu::show_for_edit(hwnd, lparam, palette_from_reference(reference_data));
+            LRESULT(0)
+        }
+        WM_SETTEXT_MESSAGE => {
+            if edit_text_unchanged(hwnd, lparam) {
+                return LRESULT(1);
+            }
+            // Replace the text with painting suspended, place it (scrollbar, centring), then
+            // publish the finished field once.
+            let _ = SendMessageW(hwnd, 0x000b, WPARAM(0), LPARAM(0));
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            let _ = SendMessageW(hwnd, 0x000b, WPARAM(1), LPARAM(0));
+            refresh_edit_layout(hwnd, true);
+            result
+        }
+        EM_REPLACESEL | 0x0102 | 0x0300 | 0x0302 | 0x0303 | 0x0304 => {
+            // Typing, pasting, cutting, clearing or undoing can change the number of lines.
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            refresh_edit_layout(hwnd, false);
+            refresh_edit_selection_paint(hwnd);
+            result
+        }
+        WM_SIZE | WM_SETFONT_MESSAGE => {
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            refresh_edit_layout(hwnd, message == WM_SETFONT_MESSAGE);
+            result
+        }
+        WM_NCCALCSIZE_MESSAGE => {
+            // The scrollbar appeared or disappeared: the frame recolours its right corners.
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            if let Some(frame) = list_view_frame(hwnd) {
+                let _ = InvalidateRect(frame, None, false);
+            }
+            result
+        }
+        WM_ENABLE => {
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            if let Some(frame) = list_view_frame(hwnd) {
+                let _ = InvalidateRect(frame, None, false);
+            }
+            result
+        }
+        WM_NCDESTROY => {
+            let _ = RemovePropW(hwnd, EDIT_SELECTION_PROPERTY);
+            let _ = RemovePropW(hwnd, EDIT_CARET_HIDDEN_PROPERTY);
+            let _ = RemoveWindowSubclass(hwnd, Some(framed_edit_subclass), FRAMED_EDIT_SUBCLASS_ID);
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        _ if edit_selection_message(message, wparam) => {
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            refresh_edit_selection_paint(hwnd);
+            result
+        }
+        _ => DefSubclassProc(hwnd, message, wparam, lparam),
+    }
+}
+
+/// (side, top/bottom) widths of the band for a window of this size, or None for windows too small
+/// to give up the space.
+unsafe fn frame_band_insets(hwnd: HWND, width: i32, height: i32) -> Option<(i32, i32)> {
+    let geometry = rounded_control_frame_geometry(width, height, GetDpiForWindow(hwnd).max(96))?;
+    let side = geometry.side_band.max(1);
+    let band = geometry.arc_band.max(1);
+    (width > side * 2 + 16 && height > band * 2 + 8).then_some((side, band))
+}
+
+/// WM_NCCALCSIZE of a banded field. The proposed client area is shrunk by the band before
+/// USER32 subtracts its scrollbars (so the scrollbars are placed inside the band). Whatever border
+/// the native control still reserves on top of that (a leftover WS_BORDER, a client edge, a
+/// themed edit border) is then given back to the client, so no square outline can ever appear
+/// between the rounded frame and the text.
+unsafe fn band_nccalcsize(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if lparam.0 == 0 {
+        return DefSubclassProc(hwnd, WM_NCCALCSIZE_MESSAGE, wparam, lparam);
+    }
+    let rect: *mut RECT = if wparam.0 != 0 {
+        &mut (*(lparam.0 as *mut windows::Win32::UI::WindowsAndMessaging::NCCALCSIZE_PARAMS))
+            .rgrc[0]
+    } else {
+        lparam.0 as *mut RECT
+    };
+    let proposed = *rect;
+    let reserved = frame_band_insets(
+        hwnd,
+        proposed.right - proposed.left,
+        proposed.bottom - proposed.top,
+    )
+    .map(|(side, band)| RECT {
+        left: proposed.left + side,
+        top: proposed.top + band,
+        right: proposed.right - side,
+        bottom: proposed.bottom - band,
+    });
+    if let Some(reserved) = reserved {
+        *rect = reserved;
+    }
+    let result = DefSubclassProc(hwnd, WM_NCCALCSIZE_MESSAGE, wparam, lparam);
+    let native = *rect;
+    if let Some(reserved) = reserved {
+        let client = &mut *rect;
+        let extra_x = (client.left - reserved.left).max(0);
+        let extra_y = (client.top - reserved.top).max(0);
+        if extra_x > 0 || extra_y > 0 {
+            client.left -= extra_x;
+            client.top -= extra_y;
+            client.right = (client.right + extra_x).min(reserved.right);
+            client.bottom = (client.bottom + extra_y).min(reserved.bottom);
+        }
+    }
+    super::redraw::ui_detail_changed(hwnd, "nccalcsize", || {
+        format!(
+            "proposed={proposed:?} reserved={reserved:?} native={native:?} final={:?} style={:#x} exstyle={:#x}",
+            *rect,
+            GetWindowLongPtrW(hwnd, GWL_STYLE),
+            GetWindowLongPtrW(hwnd, windows::Win32::UI::WindowsAndMessaging::GWL_EXSTYLE)
+        )
+    });
+    result
+}
+
+/// Re-runs WM_NCCALCSIZE so a newly installed (or re-themed) control reserves its band.
+unsafe fn refresh_frame_band(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+    let _ = SetWindowPos(
+        hwnd,
+        HWND::default(),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+    );
+}
+
+/// Client and visible native scrollbars of a banded field, in window coordinates.
+struct FrameBandLayout {
+    width: i32,
+    height: i32,
+    client: RECT,
+    bars: Vec<RECT>,
+    /// Bounding box of client and scrollbars (the size box between two bars included).
+    inner: RECT,
+}
+
+/// Measures what the native control really occupies instead of assuming it: a field that still
+/// carries a border style (or any other non-client extra) simply has a smaller client, and the
+/// frame band then covers that border too.
+unsafe fn frame_band_layout(hwnd: HWND) -> Option<FrameBandLayout> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetScrollBarInfo, OBJID_HSCROLL, OBJID_VSCROLL, SCROLLBARINFO,
+    };
+    const STATE_SYSTEM_INVISIBLE: u32 = 0x0000_8000;
+    const STATE_SYSTEM_OFFSCREEN: u32 = 0x0001_0000;
+    let mut window = RECT::default();
+    GetWindowRect(hwnd, &mut window).ok()?;
+    let width = (window.right - window.left).max(0);
+    let height = (window.bottom - window.top).max(0);
+    let (side, band) = frame_band_insets(hwnd, width, height)?;
+    let mut client_rect = RECT::default();
+    GetClientRect(hwnd, &mut client_rect).ok()?;
+    let mut origin = POINT { x: 0, y: 0 };
+    if !ClientToScreen(hwnd, &mut origin).as_bool() {
+        return None;
+    }
+    let client = RECT {
+        left: origin.x - window.left,
+        top: origin.y - window.top,
+        right: origin.x - window.left + client_rect.right,
+        bottom: origin.y - window.top + client_rect.bottom,
+    };
+    let mut bars = Vec::new();
+    let mut inner = client;
+    for object in [OBJID_VSCROLL, OBJID_HSCROLL] {
+        let mut info = SCROLLBARINFO {
+            cbSize: std::mem::size_of::<SCROLLBARINFO>() as u32,
+            ..Default::default()
+        };
+        if GetScrollBarInfo(hwnd, object, &mut info).is_ok()
+            && info.rgstate[0] & (STATE_SYSTEM_INVISIBLE | STATE_SYSTEM_OFFSCREEN) == 0
+        {
+            let bar = RECT {
+                left: info.rcScrollBar.left - window.left,
+                top: info.rcScrollBar.top - window.top,
+                right: info.rcScrollBar.right - window.left,
+                bottom: info.rcScrollBar.bottom - window.top,
+            };
+            if bar.right > bar.left && bar.bottom > bar.top {
+                inner.left = inner.left.min(bar.left);
+                inner.top = inner.top.min(bar.top);
+                inner.right = inner.right.max(bar.right);
+                inner.bottom = inner.bottom.max(bar.bottom);
+                bars.push(bar);
+            }
+        }
+    }
+    // The band exists only once WM_NCCALCSIZE has reserved it on every side.
+    if inner.left < side || inner.top < band || inner.right > width - side || inner.bottom > height - band
+    {
+        return None;
+    }
+    Some(FrameBandLayout {
+        width,
+        height,
+        client,
+        bars,
+        inner,
+    })
+}
+
+/// The inner rectangle (client plus native scrollbars, window coordinates) when the band is
+/// actually reserved for the current window size; None before WM_NCCALCSIZE has applied it.
+unsafe fn reserved_frame_band(hwnd: HWND) -> Option<(RECT, i32, i32)> {
+    frame_band_layout(hwnd).map(|layout| (layout.inner, layout.width, layout.height))
+}
+
+/// WM_NCPAINT of a banded field: USER32/UxTheme may paint only the native scrollbars. Everything
+/// else of the non-client area, the size box between two scrollbars included, is the frame band.
+/// A themed Edit otherwise draws its own square border around the client inside the rounded frame
+/// ("a box inside the box") and the size box keeps the light system colour.
+unsafe fn paint_native_scrollbars_only(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use windows::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, HRGN, RGN_AND, RGN_OR};
+    let Some(layout) = frame_band_layout(hwnd) else {
+        return DefSubclassProc(hwnd, WM_NCPAINT, wparam, lparam);
+    };
+    if layout.bars.is_empty() {
+        return LRESULT(0);
+    }
+    let mut window = RECT::default();
+    if GetWindowRect(hwnd, &mut window).is_err() {
+        return DefSubclassProc(hwnd, WM_NCPAINT, wparam, lparam);
+    }
+    // WM_NCPAINT regions are in screen coordinates.
+    let region = CreateRectRgn(0, 0, 0, 0);
+    if region.is_invalid() {
+        return DefSubclassProc(hwnd, WM_NCPAINT, wparam, lparam);
+    }
+    for bar in &layout.bars {
+        let part = CreateRectRgn(
+            window.left + bar.left,
+            window.top + bar.top,
+            window.left + bar.right,
+            window.top + bar.bottom,
+        );
+        if !part.is_invalid() {
+            let _ = CombineRgn(region, region, part, RGN_OR);
+            let _ = DeleteObject(part);
+        }
+    }
+    if wparam.0 > 1 {
+        let _ = CombineRgn(region, region, HRGN(wparam.0 as *mut _), RGN_AND);
+    }
+    let result = DefSubclassProc(hwnd, WM_NCPAINT, WPARAM(region.0 as usize), lparam);
+    let _ = DeleteObject(region);
+    result
+}
+
+/// The colour a text field really paints its background with: what its parent answers to the
+/// WM_CTLCOLOREDIT / WM_CTLCOLORSTATIC query the field itself sends before painting. Read-only
+/// and disabled fields use WM_CTLCOLORSTATIC, and a dialog may answer that differently from an
+/// editable field; a frame that assumed one fixed colour showed a strip of another colour above
+/// and below a disabled field.
+unsafe fn edit_surface_color(control: HWND, palette: Palette) -> COLORREF {
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, DeleteDC, GetBkColor, GetObjectW, SetBkColor, BS_SOLID, HGDIOBJ,
+        LOGBRUSH,
+    };
+    const ES_READONLY_STYLE: isize = 0x0800;
+    const WM_CTLCOLOREDIT_MESSAGE: u32 = 0x0133;
+    const WM_CTLCOLORSTATIC_MESSAGE: u32 = 0x0138;
+    let fallback = palette.edit_brush_color_for(control);
+    let Ok(parent) = GetParent(control) else {
+        return fallback;
+    };
+    if parent.is_invalid() {
+        return fallback;
+    }
+    let message = if GetWindowLongPtrW(control, GWL_STYLE) & ES_READONLY_STYLE != 0
+        || !IsWindowEnabled(control).as_bool()
+    {
+        WM_CTLCOLORSTATIC_MESSAGE
+    } else {
+        WM_CTLCOLOREDIT_MESSAGE
+    };
+    let dc = CreateCompatibleDC(HDC::default());
+    if dc.is_invalid() {
+        return fallback;
+    }
+    let _ = SetBkColor(dc, fallback);
+    let brush = SendMessageW(parent, message, WPARAM(dc.0 as usize), LPARAM(control.0 as isize)).0;
+    let mut color = GetBkColor(dc);
+    if brush != 0 {
+        let mut description = LOGBRUSH::default();
+        if GetObjectW(
+            HGDIOBJ(brush as *mut _),
+            std::mem::size_of::<LOGBRUSH>() as i32,
+            Some((&mut description as *mut LOGBRUSH).cast()),
+        ) > 0
+            && description.lbStyle == BS_SOLID
+        {
+            color = description.lbColor;
+        }
+    }
+    let _ = DeleteDC(dc);
+    if color.0 == 0xffff_ffff {
+        fallback
+    } else {
+        color
+    }
+}
+
+/// Paints outline, antialiased corners and interior-coloured padding into the band, composed
+/// off-screen and published in one BitBlt. The client and the native scrollbars are excluded, so
+/// they are never touched; the size box between two scrollbars is part of the band. Returns false
+/// when no band is reserved.
+unsafe fn paint_frame_band(hwnd: HWND, palette: Palette) -> bool {
+    let Some(layout) = frame_band_layout(hwnd) else {
+        super::redraw::ui_detail_changed(hwnd, "band", || {
+            let mut window = RECT::default();
+            let mut client = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut window);
+            let _ = GetClientRect(hwnd, &mut client);
+            format!("NOT reserved: window={window:?} client={client:?}")
+        });
+        return false;
+    };
+    super::redraw::ui_detail_changed(hwnd, "band", || {
+        format!(
+            "window={}x{} client={:?} bars={:?} inner={:?}",
+            layout.width, layout.height, layout.client, layout.bars, layout.inner
+        )
+    });
+    let Some(geometry) =
+        rounded_control_frame_geometry(layout.width, layout.height, GetDpiForWindow(hwnd).max(96))
+    else {
+        return false;
+    };
+    let class_name = control_class_name(hwnd);
+    let interior = if is_edit_class(&class_name) {
+        edit_surface_color(hwnd, palette)
+    } else {
+        palette.edit
+    };
+    // A report with a visible column header continues the header surface into the upper band,
+    // exactly like the header row of a native bordered ListView.
+    let header_top = class_name.eq_ignore_ascii_case("SysListView32")
+        && !is_category_list_view(GetWindowLongPtrW(hwnd, GWL_STYLE))
+        && {
+            let header = HWND(SendMessageW(hwnd, 0x101f, WPARAM(0), LPARAM(0)).0 as *mut _);
+            !header.is_invalid() && IsWindowVisible(header).as_bool()
+        };
+    let top_interior = if header_top { palette.button } else { interior };
+    let dc = GetWindowDC(hwnd);
+    if dc.is_invalid() {
+        return false;
+    }
+    let client = layout.client;
+    let _ = windows::Win32::Graphics::Gdi::ExcludeClipRect(
+        dc,
+        client.left,
+        client.top,
+        client.right,
+        client.bottom,
+    );
+    for bar in &layout.bars {
+        let _ = windows::Win32::Graphics::Gdi::ExcludeClipRect(
+            dc, bar.left, bar.top, bar.right, bar.bottom,
+        );
+    }
+    let rect = RECT {
+        left: 0,
+        top: 0,
+        right: layout.width,
+        bottom: layout.height,
+    };
+    {
+        let buffer = super::redraw::PaintBuffer::begin_opaque(dc, rect, rect);
+        let surface = buffer.dc();
+        fill(surface, &rect, interior);
+        if top_interior != interior {
+            fill(
+                surface,
+                &RECT {
+                    left: 0,
+                    top: 0,
+                    right: layout.width,
+                    bottom: layout.inner.top,
+                },
+                top_interior,
+            );
+            draw_antialiased_control_frame_with_vertical_interiors(
+                surface,
+                rect,
+                geometry,
+                top_interior,
+                interior,
+                palette.control_border(),
+                rounded_control_exterior(palette),
+            );
+        } else {
+            draw_antialiased_control_frame(
+                surface,
+                rect,
+                geometry,
+                interior,
+                palette.control_border(),
+                rounded_control_exterior(palette),
+            );
+        }
+        buffer.present();
+    }
+    let _ = ReleaseDC(hwnd, dc);
+    true
+}
+
 unsafe fn paint_rounded_control_frame(hwnd: HWND, palette: Palette) {
+    if uses_frame_band(hwnd) && paint_frame_band(hwnd, palette) {
+        return;
+    }
     let dc = GetWindowDC(hwnd);
     if dc.0.is_null() {
         return;
@@ -2410,6 +4292,14 @@ unsafe fn set_combo_selection_field_height(hwnd: HWND, height: i32) {
     if height <= 0 {
         return;
     }
+    // Already at this height: setting it again made the combo recalculate and resize itself and
+    // forced a frame change on every size step of the page.
+    const CB_GETITEMHEIGHT: u32 = 0x0154;
+    if SendMessageW(hwnd, CB_GETITEMHEIGHT, WPARAM(SELECTION_FIELD), LPARAM(0)).0
+        == height as isize
+    {
+        return;
+    }
     let result = SendMessageW(
         hwnd,
         CB_SETITEMHEIGHT,
@@ -2435,7 +4325,10 @@ unsafe fn set_combo_selection_field_height(hwnd: HWND, height: i32) {
 unsafe fn set_combo_popup_row_height(hwnd: HWND, height: i32) {
     const CB_SETITEMHEIGHT: u32 = 0x0153;
     const POPUP_ROWS: usize = 0;
-    if height > 0 {
+    const CB_GETITEMHEIGHT: u32 = 0x0154;
+    if height > 0
+        && SendMessageW(hwnd, CB_GETITEMHEIGHT, WPARAM(POPUP_ROWS), LPARAM(0)).0 != height as isize
+    {
         let _ = SendMessageW(
             hwnd,
             CB_SETITEMHEIGHT,
@@ -2467,6 +4360,19 @@ unsafe fn clip_combo_to_closed_field(hwnd: HWND, _palette: Palette) {
     let dpi = GetDpiForWindow(hwnd).max(96);
     let closed_height =
         combo_closed_height(hwnd, InnoMetrics::for_dpi(dpi).field_height).clamp(1, full_height);
+    // The same region is already set: nothing to do (this runs on every size change).
+    let mut current = RECT::default();
+    if windows::Win32::Graphics::Gdi::GetWindowRgnBox(hwnd, &mut current).0 != 0
+        && current
+            == (RECT {
+                left: 0,
+                top: 0,
+                right: width,
+                bottom: closed_height,
+            })
+    {
+        return;
+    }
     // Keep this region rectangular. CreateRoundRectRgn is a binary pixel mask; using it as the
     // visible silhouette clips away partially covered pixels and leaves a stair-stepped bracket.
     // The painter masks the four corners; this region only hides USER32's retained list height.
@@ -2506,6 +4412,12 @@ unsafe fn clip_combo_to_closed_field(hwnd: HWND, _palette: Palette) {
 /// A GDI region has no partial coverage and cannot represent the visible antialiased edge. The
 /// deterministic last-paint transaction replaces the small exterior corner pixels instead.
 unsafe fn clear_legacy_control_region(hwnd: HWND) {
+    // Runs on every size step. Only touch windows that really carry a region: SetWindowRgn forces
+    // a complete frame recalculation and repaint even when it removes nothing.
+    let mut bounds = RECT::default();
+    if windows::Win32::Graphics::Gdi::GetWindowRgnBox(hwnd, &mut bounds).0 == 0 {
+        return;
+    }
     clear_control_window_region(hwnd);
 }
 
@@ -2558,12 +4470,7 @@ unsafe fn paint_combo_closed(hwnd: HWND, palette: Palette) {
     // WS_EX_CLIENTEDGE are removed. GetDC starts inside that inset, leaving USER32's pale top arc
     // untouched. Paint the complete closed window surface through the window DC, then publish our
     // single deterministic frame last.
-    let dc = GetWindowDC(hwnd);
-    if !dc.is_invalid() {
-        paint_combo_closed_window_to_dc(hwnd, palette, dc);
-        let _ = ReleaseDC(hwnd, dc);
-    }
-    paint_rounded_control_frame(hwnd, palette);
+    repaint_combo_closed_now(hwnd, palette);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2735,8 +4642,63 @@ unsafe fn paint_combo_selection_item_window(item: HWND, palette: Palette) {
         return;
     }
 
-    let dc = GetWindowDC(item);
-    if dc.is_invalid() {
+    // Surface and caption are composed together; filling first and drawing the caption on the
+    // screen afterwards blanked the selected text for a frame on every state change.
+    let surface = combo_closed_surface(combo, palette);
+    super::redraw::paint_window_buffered(item, |dc, bounds| {
+        fill(dc, &bounds, surface);
+        draw_combo_selected_text(combo, dc, bounds, palette);
+    });
+}
+
+/// Publishes the complete closed ComboBox (surface, chevron, caption and rounded frame) in one
+/// composed BitBlt through its window DC.
+///
+/// Hover, focus and click transitions repaint this control several times. Writing the surface,
+/// then the chevron and caption, then the four edges and the antialiased corners straight to the
+/// screen let DWM present the half-finished states (caption blanked, square edge) as a flicker.
+/// Only the closed field is published: where USER32 keeps a taller window rectangle (the drop
+/// height), nothing below the field may be painted, or a page-coloured block covers the controls
+/// underneath.
+/// Runs USER32's handling of a message with the combo's own painting suspended (WM_SETREDRAW off
+/// hides it from direct drawing); the caller then publishes the field with our painter.
+unsafe fn call_combo_without_native_paint(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let visible = IsWindowVisible(hwnd).as_bool();
+    if visible {
+        let _ = SendMessageW(hwnd, 0x000b, WPARAM(0), LPARAM(0));
+    }
+    let result = DefSubclassProc(hwnd, message, wparam, lparam);
+    if visible {
+        let _ = SendMessageW(hwnd, 0x000b, WPARAM(1), LPARAM(0));
+    }
+    result
+}
+
+/// Surface colour of a closed drop-down field (the popup list uses the same colour).
+pub(crate) unsafe fn drop_down_field_color(combo: HWND, palette: Palette) -> COLORREF {
+    combo_closed_surface(combo, palette)
+}
+
+/// Publishes the closed field of a drop-down combo (used by combo_popup after open/close).
+pub(crate) unsafe fn repaint_drop_down_field(combo: HWND, palette: Palette) {
+    repaint_combo_closed_now(combo, palette);
+}
+
+unsafe fn repaint_combo_closed_now(combo: HWND, palette: Palette) {
+    let mut window = RECT::default();
+    if GetWindowRect(combo, &mut window).is_err() {
+        return;
+    }
+    let dpi = GetDpiForWindow(combo).max(96);
+    let width = (window.right - window.left).max(0);
+    let height = combo_closed_height(combo, InnoMetrics::for_dpi(dpi).field_height)
+        .min((window.bottom - window.top).max(0));
+    if width == 0 || height <= 0 {
         return;
     }
     let bounds = RECT {
@@ -2745,18 +4707,20 @@ unsafe fn paint_combo_selection_item_window(item: HWND, palette: Palette) {
         right: width,
         bottom: height,
     };
-    fill(dc, &bounds, combo_closed_surface(combo, palette));
-    draw_combo_selected_text(combo, dc, bounds, palette);
-    let _ = ReleaseDC(item, dc);
-}
-
-unsafe fn repaint_combo_closed_now(combo: HWND, palette: Palette) {
+    let interior = combo_closed_surface(combo, palette);
     let dc = GetWindowDC(combo);
-    if !dc.is_invalid() {
-        paint_combo_closed_window_to_dc(combo, palette, dc);
-        let _ = ReleaseDC(combo, dc);
+    if dc.is_invalid() {
+        return;
     }
-    paint_rounded_control_frame(combo, palette);
+    {
+        let buffer = super::redraw::PaintBuffer::begin_opaque(dc, bounds, bounds);
+        let surface = buffer.dc();
+        fill(surface, &bounds, rounded_control_exterior(palette));
+        paint_combo_closed_window_to_dc(combo, palette, surface);
+        draw_rounded_control_frame_to_dc(surface, combo, palette, interior);
+        buffer.present();
+    }
+    let _ = ReleaseDC(combo, dc);
 }
 
 unsafe fn paint_combo_closed_to_dc(hwnd: HWND, palette: Palette, dc: HDC) {
@@ -2977,122 +4941,688 @@ unsafe fn is_list_box(hwnd: HWND) -> bool {
     matches!(control_class_name(hwnd).as_str(), "ListBox" | "ComboLBox")
 }
 
-unsafe fn update_list_box_hot_item(hwnd: HWND, lparam: LPARAM) {
-    const LB_ITEMFROMPOINT: u32 = 0x01a9;
-    let packed = SendMessageW(hwnd, LB_ITEMFROMPOINT, WPARAM(0), lparam).0 as u32;
-    let outside = packed >> 16 != 0;
-    let hot = (!outside).then_some((packed & 0xffff) as usize);
-    let previous = GetPropW(hwnd, LIST_BOX_HOT_PROPERTY);
-    let previous = (!previous.is_invalid()).then_some(previous.0 as usize - 1);
-    if hot == previous {
+// ------------------------------------------------------------------------------------------
+// Standalone ListBox: one composed surface, row-precise invalidation, no stock drawing.
+// ------------------------------------------------------------------------------------------
+//
+// The former overlay let USER32 paint the whole list (white rows, system-blue selection) and then
+// painted every visible row again through GetDC, so each WM_PAINT reached the screen twice. Every
+// row change of the pointer invalidated the complete list, and every mouse message republished the
+// rounded frame through GetWindowDC one pixel at a time. USER32 also draws a click, a key press or
+// LB_SETCURSEL straight to the screen without WM_PAINT. The result was a list that flickered while
+// the pointer merely moved over it.
+//
+// Now:
+// * WM_PAINT composes background, rows, text and the frame edges inside the client off-screen and
+//   publishes them with one BitBlt; USER32's own WM_PAINT is never called.
+// * Hover invalidates only the row that lost and the row that gained the hot state.
+// * Every message that lets USER32 change selection, caret, focus or scroll position runs with the
+//   control's own redraw switched off (WM_SETREDRAW, which a ListBox handles internally), then the
+//   rows whose state actually changed are invalidated. USER32 therefore never draws system blue.
+// * The dotted focus rectangle is an XOR drawn directly on screen; it is kept hidden through the
+//   documented UISF_HIDEFOCUS UI state, as Raymond Chen describes for controls that must never show
+//   one (the row highlight already marks the current item).
+
+const LIST_BOX_SUBCLASS_ID: usize = 0x4c52_4c42;
+const LB_DELETESTRING_MESSAGE: u32 = 0x0182;
+const LB_SELITEMRANGEEX_MESSAGE: u32 = 0x0183;
+const LB_RESETCONTENT_MESSAGE: u32 = 0x0184;
+const LB_SETSEL_MESSAGE: u32 = 0x0185;
+const LB_SETCURSEL_MESSAGE: u32 = 0x0186;
+const LB_GETSEL_MESSAGE: u32 = 0x0187;
+const LB_GETCURSEL_MESSAGE: u32 = 0x0188;
+const LB_GETTEXT_MESSAGE: u32 = 0x0189;
+const LB_GETTEXTLEN_MESSAGE: u32 = 0x018a;
+const LB_GETCOUNT_MESSAGE: u32 = 0x018b;
+const LB_SELECTSTRING_MESSAGE: u32 = 0x018c;
+const LB_GETTOPINDEX_MESSAGE: u32 = 0x018e;
+const LB_SETTOPINDEX_MESSAGE: u32 = 0x0197;
+const LB_GETITEMRECT_MESSAGE: u32 = 0x0198;
+const LB_SELITEMRANGE_MESSAGE: u32 = 0x019b;
+const LB_SETANCHORINDEX_MESSAGE: u32 = 0x019c;
+const LB_SETCARETINDEX_MESSAGE: u32 = 0x019e;
+const LB_SETITEMHEIGHT_MESSAGE: u32 = 0x01a0;
+const LB_GETITEMHEIGHT_MESSAGE: u32 = 0x01a1;
+const LB_ITEMFROMPOINT_MESSAGE: u32 = 0x01a9;
+const LBS_MULTIPLESEL_STYLE: isize = 0x0008;
+const LBS_EXTENDEDSEL_STYLE: isize = 0x0800;
+const LBS_NOSEL_STYLE: isize = 0x4000;
+const WM_CHAR_MESSAGE: u32 = 0x0102;
+const WM_TIMER_MESSAGE: u32 = 0x0113;
+const WM_HSCROLL_MESSAGE: u32 = 0x0114;
+const WM_VSCROLL_MESSAGE: u32 = 0x0115;
+const WM_LBUTTONDBLCLK_MESSAGE: u32 = 0x0203;
+const WM_MOUSEWHEEL_MESSAGE: u32 = 0x020a;
+const UIS_SET_ACTION: usize = 1;
+const UISF_HIDEFOCUS_FLAG: usize = 0x1;
+
+#[derive(Clone, Copy, Default)]
+struct ListBoxVisualState {
+    hot: Option<usize>,
+    leave_tracked: bool,
+    application_redraw_off: bool,
+    native_redraw_suppressed: bool,
+}
+
+thread_local! {
+    static LIST_BOX_VISUAL_STATES: std::cell::RefCell<Vec<(isize, ListBoxVisualState)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn list_box_state(hwnd: HWND) -> ListBoxVisualState {
+    LIST_BOX_VISUAL_STATES.with(|states| {
+        states
+            .borrow()
+            .iter()
+            .find(|(key, _)| *key == hwnd.0 as isize)
+            .map(|(_, state)| *state)
+            .unwrap_or_default()
+    })
+}
+
+fn update_list_box_state(hwnd: HWND, update: impl FnOnce(&mut ListBoxVisualState)) {
+    LIST_BOX_VISUAL_STATES.with(|states| {
+        let mut states = states.borrow_mut();
+        let key = hwnd.0 as isize;
+        if let Some((_, state)) = states.iter_mut().find(|(candidate, _)| *candidate == key) {
+            update(state);
+        } else {
+            let mut state = ListBoxVisualState::default();
+            update(&mut state);
+            states.push((key, state));
+        }
+    });
+}
+
+fn forget_list_box_state(hwnd: HWND) {
+    LIST_BOX_VISUAL_STATES.with(|states| {
+        states
+            .borrow_mut()
+            .retain(|(key, _)| *key != hwnd.0 as isize);
+    });
+}
+
+unsafe fn install_list_box_subclass(control: HWND, palette: Palette) {
+    // Earlier builds used the generic overlay subclass and window properties for this control.
+    let _ = RemoveWindowSubclass(
+        control,
+        Some(rounded_control_subclass),
+        ROUNDED_CONTROL_SUBCLASS_ID,
+    );
+    let _ = RemovePropW(control, LIST_BOX_HOT_PROPERTY);
+    let _ = RemovePropW(control, ROUNDED_CONTROL_HOT_PROPERTY);
+    update_list_box_state(control, |_| {});
+    let _ = SetWindowSubclass(
+        control,
+        Some(list_box_subclass),
+        LIST_BOX_SUBCLASS_ID,
+        palette_reference(palette),
+    );
+    // The frame lives in a reserved non-client band, beside (never over) the native scrollbar.
+    refresh_frame_band(control);
+    let _ = SendMessageW(
+        control,
+        WM_UPDATEUISTATE_MESSAGE,
+        WPARAM(UIS_SET_ACTION | (UISF_HIDEFOCUS_FLAG << 16)),
+        LPARAM(0),
+    );
+}
+
+unsafe fn list_box_item_rect(hwnd: HWND, index: usize) -> Option<RECT> {
+    let mut rect = RECT::default();
+    (SendMessageW(
+        hwnd,
+        LB_GETITEMRECT_MESSAGE,
+        WPARAM(index),
+        LPARAM((&mut rect as *mut RECT) as isize),
+    )
+    .0 >= 0)
+        .then_some(rect)
+}
+
+unsafe fn invalidate_list_box_row(hwnd: HWND, index: usize) {
+    if let Some(rect) = list_box_item_rect(hwnd, index) {
+        let _ = InvalidateRect(hwnd, Some(&rect), false);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListBoxSelectionMode {
+    Single,
+    Multiple,
+    None,
+}
+
+unsafe fn list_box_selection_mode(hwnd: HWND) -> ListBoxSelectionMode {
+    let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    if style & LBS_NOSEL_STYLE != 0 {
+        ListBoxSelectionMode::None
+    } else if style & (LBS_MULTIPLESEL_STYLE | LBS_EXTENDEDSEL_STYLE) != 0 {
+        ListBoxSelectionMode::Multiple
+    } else {
+        ListBoxSelectionMode::Single
+    }
+}
+
+/// What the painted rows depend on. Comparing a snapshot taken before and after a native state
+/// change tells exactly which rows need a repaint.
+#[derive(PartialEq, Eq)]
+struct ListBoxSnapshot {
+    top: isize,
+    count: isize,
+    item_height: isize,
+    /// Selection flag of every row that is at least partly visible, from `top` down.
+    rows: Vec<bool>,
+}
+
+unsafe fn list_box_snapshot(hwnd: HWND) -> ListBoxSnapshot {
+    let top = SendMessageW(hwnd, LB_GETTOPINDEX_MESSAGE, WPARAM(0), LPARAM(0)).0;
+    let count = SendMessageW(hwnd, LB_GETCOUNT_MESSAGE, WPARAM(0), LPARAM(0)).0;
+    let item_height = SendMessageW(hwnd, LB_GETITEMHEIGHT_MESSAGE, WPARAM(0), LPARAM(0)).0;
+    let mut rows = Vec::new();
+    let mut client = RECT::default();
+    if top >= 0 && count > 0 && GetClientRect(hwnd, &mut client).is_ok() {
+        let mode = list_box_selection_mode(hwnd);
+        let current = if mode == ListBoxSelectionMode::Single {
+            SendMessageW(hwnd, LB_GETCURSEL_MESSAGE, WPARAM(0), LPARAM(0)).0
+        } else {
+            -1
+        };
+        for index in top..count {
+            let Some(rect) = list_box_item_rect(hwnd, index as usize) else {
+                break;
+            };
+            if rect.top >= client.bottom {
+                break;
+            }
+            rows.push(match mode {
+                ListBoxSelectionMode::None => false,
+                ListBoxSelectionMode::Single => current == index,
+                ListBoxSelectionMode::Multiple => {
+                    SendMessageW(hwnd, LB_GETSEL_MESSAGE, WPARAM(index as usize), LPARAM(0)).0 > 0
+                }
+            });
+        }
+    }
+    ListBoxSnapshot {
+        top,
+        count,
+        item_height,
+        rows,
+    }
+}
+
+/// Invalidates what differs between two snapshots. Returns true if the visible range moved.
+unsafe fn invalidate_list_box_changes(
+    hwnd: HWND,
+    before: &ListBoxSnapshot,
+    after: &ListBoxSnapshot,
+) -> bool {
+    if before.top != after.top
+        || before.count != after.count
+        || before.item_height != after.item_height
+        || before.rows.len() != after.rows.len()
+    {
+        // Scrolled, refilled or re-measured: the whole client is republished as one composed paint
+        // (no pixels are blitted around by USER32). The scrollbar is refreshed by USER32 itself
+        // when redraw is switched back on; forcing a second non-client repaint here would draw
+        // the scrollbar twice per wheel step.
+        let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_NOERASE);
+        return true;
+    }
+    for (offset, (was, is)) in before.rows.iter().zip(after.rows.iter()).enumerate() {
+        if was != is {
+            invalidate_list_box_row(hwnd, after.top.max(0) as usize + offset);
+        }
+    }
+    false
+}
+
+/// Runs a message through the stock ListBox with its drawing suspended, then invalidates the rows
+/// whose appearance changed. `immediate` publishes the result before returning (pointer and
+/// keyboard feedback).
+unsafe fn list_box_native_state_change(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    immediate: bool,
+    palette: Palette,
+) -> LRESULT {
+    let state = list_box_state(hwnd);
+    // A ListBox implements WM_SETREDRAW itself (it does not touch WS_VISIBLE). A hidden list cannot
+    // draw, and a list the application has frozen, or that is already suspended by an outer
+    // message, must keep that state.
+    let suppress = !state.native_redraw_suppressed
+        && !state.application_redraw_off
+        && IsWindowVisible(hwnd).as_bool();
+    let before = list_box_snapshot(hwnd);
+    if suppress {
+        update_list_box_state(hwnd, |state| state.native_redraw_suppressed = true);
+        let _ = DefSubclassProc(hwnd, WM_SETREDRAW_MESSAGE, WPARAM(0), LPARAM(0));
+    }
+    let result = DefSubclassProc(hwnd, message, wparam, lparam);
+    if !windows::Win32::UI::WindowsAndMessaging::IsWindow(hwnd).as_bool() {
+        return result;
+    }
+    if suppress {
+        let _ = DefSubclassProc(hwnd, WM_SETREDRAW_MESSAGE, WPARAM(1), LPARAM(0));
+        update_list_box_state(hwnd, |state| state.native_redraw_suppressed = false);
+    }
+    if list_box_state(hwnd).application_redraw_off {
+        // The application froze this list (WM_SETREDRAW FALSE) and repaints it when it re-enables
+        // drawing; do not publish intermediate states in between.
+        return result;
+    }
+    let after = list_box_snapshot(hwnd);
+    if invalidate_list_box_changes(hwnd, &before, &after) {
+        // Content moved under a resting pointer: the hot row follows the pointer.
+        refresh_list_box_hot_row_from_cursor(hwnd);
+    }
+    if suppress {
+        // Re-enabling redraw lets USER32 refresh its scrollbar directly, which covers the rounded
+        // frame edge drawn over it. Restore that edge (no-op when there is no scrollbar).
+        paint_list_box_nonclient_frame(hwnd, palette);
+    }
+    if immediate {
+        let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
+    }
+    result
+}
+
+unsafe fn set_list_box_hot_row(hwnd: HWND, hot: Option<usize>) {
+    let previous = list_box_state(hwnd).hot;
+    if previous == hot {
         return;
     }
-    let _ = RemovePropW(hwnd, LIST_BOX_HOT_PROPERTY);
+    update_list_box_state(hwnd, |state| state.hot = hot);
+    if let Some(index) = previous {
+        invalidate_list_box_row(hwnd, index);
+    }
     if let Some(index) = hot {
-        let _ = SetPropW(
-            hwnd,
-            LIST_BOX_HOT_PROPERTY,
-            HANDLE((index + 1) as *mut core::ffi::c_void),
-        );
+        invalidate_list_box_row(hwnd, index);
+    }
+}
+
+unsafe fn list_box_row_from_point(hwnd: HWND, packed_point: LPARAM) -> Option<usize> {
+    let packed = SendMessageW(hwnd, LB_ITEMFROMPOINT_MESSAGE, WPARAM(0), packed_point).0 as u32;
+    let outside = packed >> 16 != 0;
+    let index = (packed & 0xffff) as isize;
+    let count = SendMessageW(hwnd, LB_GETCOUNT_MESSAGE, WPARAM(0), LPARAM(0)).0;
+    (!outside && index < count).then_some(index as usize)
+}
+
+unsafe fn update_list_box_hot_row(hwnd: HWND, packed_point: LPARAM) {
+    let hot = list_box_row_from_point(hwnd, packed_point);
+    if hot.is_some() && !list_box_state(hwnd).leave_tracked {
         let mut tracking = TRACKMOUSEEVENT {
             cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
             dwFlags: TME_LEAVE,
             hwndTrack: hwnd,
             dwHoverTime: 0,
         };
-        let _ = TrackMouseEvent(&mut tracking);
+        if TrackMouseEvent(&mut tracking).is_ok() {
+            update_list_box_state(hwnd, |state| state.leave_tracked = true);
+        }
     }
-    let _ = InvalidateRect(hwnd, None, false);
+    set_list_box_hot_row(hwnd, hot);
 }
 
-unsafe fn clear_list_box_hot_item(hwnd: HWND) {
-    if RemovePropW(hwnd, LIST_BOX_HOT_PROPERTY).is_ok_and(|handle| !handle.is_invalid()) {
-        let _ = InvalidateRect(hwnd, None, false);
-    }
-}
-
-unsafe fn paint_list_box_rows(hwnd: HWND, palette: Palette) {
-    const LB_GETCOUNT: u32 = 0x018b;
-    const LB_GETCURSEL: u32 = 0x0188;
-    const LB_GETITEMRECT: u32 = 0x0198;
-    const LB_GETTEXT: u32 = 0x0189;
-    const LB_GETTEXTLEN: u32 = 0x018a;
-    const LB_GETTOPINDEX: u32 = 0x018e;
-    let count = SendMessageW(hwnd, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0;
-    if count <= 0 {
+unsafe fn refresh_list_box_hot_row_from_cursor(hwnd: HWND) {
+    if list_box_state(hwnd).hot.is_none() {
         return;
     }
-    let selected = SendMessageW(hwnd, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
-    let hot = GetPropW(hwnd, LIST_BOX_HOT_PROPERTY);
-    let hot = (!hot.is_invalid()).then_some(hot.0 as usize - 1);
-    let top = SendMessageW(hwnd, LB_GETTOPINDEX, WPARAM(0), LPARAM(0))
-        .0
-        .max(0) as usize;
-    let dc = windows::Win32::Graphics::Gdi::GetDC(hwnd);
+    let mut point = POINT::default();
+    if GetCursorPos(&mut point).is_err()
+        || windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(point) != hwnd
+        || !ScreenToClient(hwnd, &mut point).as_bool()
+    {
+        set_list_box_hot_row(hwnd, None);
+        return;
+    }
+    let packed = ((point.x as u16 as u32) | ((point.y as u16 as u32) << 16)) as isize;
+    set_list_box_hot_row(hwnd, list_box_row_from_point(hwnd, LPARAM(packed)));
+}
+
+/// Client origin relative to the window rectangle, and the window size.
+unsafe fn list_box_window_geometry(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
+    let mut window = RECT::default();
+    GetWindowRect(hwnd, &mut window).ok()?;
+    let mut origin = POINT { x: 0, y: 0 };
+    if !ClientToScreen(hwnd, &mut origin).as_bool() {
+        return None;
+    }
+    Some((
+        origin.x - window.left,
+        origin.y - window.top,
+        (window.right - window.left).max(0),
+        (window.bottom - window.top).max(0),
+    ))
+}
+
+unsafe extern "system" fn list_box_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    let palette = palette_from_reference(reference_data);
+    match message {
+        WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            paint_list_box(hwnd, palette);
+            LRESULT(0)
+        }
+        WM_PRINTCLIENT_MESSAGE => {
+            let dc = HDC(wparam.0 as *mut _);
+            let mut client = RECT::default();
+            if !dc.is_invalid() && GetClientRect(hwnd, &mut client).is_ok() {
+                paint_list_box_surface(hwnd, dc, client, client, palette);
+            }
+            LRESULT(0)
+        }
+        WM_NCCALCSIZE_MESSAGE => band_nccalcsize(hwnd, wparam, lparam),
+        WM_NCPAINT => {
+            let result = paint_native_scrollbars_only(hwnd, wparam, lparam);
+            if !paint_frame_band(hwnd, palette) {
+                paint_list_box_nonclient_frame(hwnd, palette);
+            }
+            result
+        }
+        WM_SETREDRAW_MESSAGE => {
+            let enabling = wparam.0 != 0;
+            let was_off = list_box_state(hwnd).application_redraw_off;
+            update_list_box_state(hwnd, |state| state.application_redraw_off = !enabling);
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            if enabling && was_off {
+                // A ListBox does not reliably repaint itself when redraw is switched back on.
+                let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_FRAME | RDW_NOERASE);
+            }
+            result
+        }
+        WM_MOUSEMOVE => {
+            let result = if windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == hwnd {
+                // Button held: USER32 moves the selection with the pointer.
+                list_box_native_state_change(hwnd, message, wparam, lparam, true, palette)
+            } else {
+                DefSubclassProc(hwnd, message, wparam, lparam)
+            };
+            update_list_box_hot_row(hwnd, lparam);
+            result
+        }
+        WM_MOUSELEAVE_MESSAGE => {
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            update_list_box_state(hwnd, |state| state.leave_tracked = false);
+            set_list_box_hot_row(hwnd, None);
+            result
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK_MESSAGE | WM_LBUTTONUP | WM_KEYDOWN | WM_CHAR_MESSAGE
+        | WM_VSCROLL_MESSAGE | WM_HSCROLL_MESSAGE | WM_MOUSEWHEEL_MESSAGE => {
+            list_box_native_state_change(hwnd, message, wparam, lparam, true, palette)
+        }
+        WM_TIMER_MESSAGE
+            if windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == hwnd =>
+        {
+            // Automatic scrolling while a selection is dragged outside the list.
+            list_box_native_state_change(hwnd, message, wparam, lparam, true, palette)
+        }
+        WM_SETFOCUS
+        | WM_KILLFOCUS
+        | WM_CAPTURECHANGED
+        | WM_CANCELMODE
+        | LB_SETCURSEL_MESSAGE
+        | LB_SETSEL_MESSAGE
+        | LB_SETCARETINDEX_MESSAGE
+        | LB_SELECTSTRING_MESSAGE
+        | LB_SELITEMRANGE_MESSAGE
+        | LB_SELITEMRANGEEX_MESSAGE
+        | LB_SETTOPINDEX_MESSAGE
+        | LB_SETANCHORINDEX_MESSAGE => {
+            list_box_native_state_change(hwnd, message, wparam, lparam, false, palette)
+        }
+        WM_ENABLE => {
+            let result =
+                list_box_native_state_change(hwnd, message, wparam, lparam, false, palette);
+            if wparam.0 == 0 {
+                update_list_box_state(hwnd, |state| state.hot = None);
+            }
+            let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_FRAME | RDW_NOERASE);
+            result
+        }
+        WM_UPDATEUISTATE_MESSAGE => {
+            // Anyone may hide focus cues; nobody may show the XOR focus rectangle again.
+            let action = wparam.0 & 0xffff;
+            let mut flags = (wparam.0 >> 16) & 0xffff;
+            if action != UIS_SET_ACTION {
+                flags &= !UISF_HIDEFOCUS_FLAG;
+            }
+            list_box_native_state_change(
+                hwnd,
+                message,
+                WPARAM(action | (flags << 16)),
+                lparam,
+                false,
+                palette,
+            )
+        }
+        WM_SIZE | WM_THEMECHANGED | LB_SETITEMHEIGHT_MESSAGE => {
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            if message != LB_SETITEMHEIGHT_MESSAGE {
+                clear_legacy_control_region(hwnd);
+            }
+            let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_FRAME | RDW_NOERASE);
+            result
+        }
+        LB_RESETCONTENT_MESSAGE | LB_DELETESTRING_MESSAGE => {
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            let count = SendMessageW(hwnd, LB_GETCOUNT_MESSAGE, WPARAM(0), LPARAM(0)).0;
+            if list_box_state(hwnd)
+                .hot
+                .is_some_and(|hot| hot as isize >= count.max(0))
+            {
+                update_list_box_state(hwnd, |state| state.hot = None);
+            }
+            result
+        }
+        message
+            if native_scrollbar_may_repaint_frame(message)
+                || message == WM_NCMOUSEMOVE_MESSAGE
+                || message == WM_NCMOUSELEAVE_MESSAGE =>
+        {
+            // USER32/UxTheme may repaint the non-client scrollbar directly (hover, press); the
+            // frame edge over it is restored afterwards. The client is not touched.
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            paint_list_box_nonclient_frame(hwnd, palette);
+            result
+        }
+        WM_NCDESTROY => {
+            forget_list_box_state(hwnd);
+            let _ = RemovePropW(hwnd, LIST_BOX_HOT_PROPERTY);
+            let _ = RemoveWindowSubclass(hwnd, Some(list_box_subclass), LIST_BOX_SUBCLASS_ID);
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        _ => DefSubclassProc(hwnd, message, wparam, lparam),
+    }
+}
+
+unsafe fn paint_list_box(hwnd: HWND, palette: Palette) {
+    let trace_start = super::redraw::trace_now();
+    let mut paint = PAINTSTRUCT::default();
+    let target = BeginPaint(hwnd, &mut paint);
+    let mut client = RECT::default();
+    if !target.is_invalid() && GetClientRect(hwnd, &mut client).is_ok() {
+        let area = intersect_rects(client, paint.rcPaint);
+        if area.right > area.left && area.bottom > area.top {
+            let buffer = super::redraw::PaintBuffer::begin_opaque(target, client, area);
+            paint_list_box_surface(hwnd, buffer.dc(), client, area, palette);
+            buffer.present();
+        }
+    }
+    let _ = EndPaint(hwnd, &paint);
+    super::redraw::trace_list_view_paint(trace_start);
+}
+
+/// Paints background, the rows that intersect `area`, and the frame edges that lie inside the
+/// client. `area` is in client coordinates; the DC may be an off-screen surface.
+unsafe fn paint_list_box_surface(hwnd: HWND, dc: HDC, client: RECT, area: RECT, palette: Palette) {
+    fill(dc, &area, palette.edit);
+    let count = SendMessageW(hwnd, LB_GETCOUNT_MESSAGE, WPARAM(0), LPARAM(0)).0;
+    let dpi = GetDpiForWindow(hwnd).max(96);
+    if count > 0 {
+        let mode = list_box_selection_mode(hwnd);
+        let current = if mode == ListBoxSelectionMode::Single {
+            SendMessageW(hwnd, LB_GETCURSEL_MESSAGE, WPARAM(0), LPARAM(0)).0
+        } else {
+            -1
+        };
+        let hot = list_box_state(hwnd).hot;
+        let top = SendMessageW(hwnd, LB_GETTOPINDEX_MESSAGE, WPARAM(0), LPARAM(0))
+            .0
+            .max(0);
+        let font = SendMessageW(hwnd, WM_GETFONT, WPARAM(0), LPARAM(0));
+        let old_font = (font.0 != 0)
+            .then(|| SelectObject(dc, windows::Win32::Graphics::Gdi::HGDIOBJ(font.0 as *mut _)));
+        let _ = SetBkMode(dc, TRANSPARENT);
+        let inset = scale(7, dpi);
+        let mut text: Vec<u16> = Vec::with_capacity(128);
+        for index in top..count {
+            let Some(row) = list_box_item_rect(hwnd, index as usize) else {
+                break;
+            };
+            if row.top >= client.bottom || row.top >= area.bottom {
+                break;
+            }
+            if row.bottom <= area.top {
+                continue;
+            }
+            let is_selected = match mode {
+                ListBoxSelectionMode::None => false,
+                ListBoxSelectionMode::Single => current == index,
+                ListBoxSelectionMode::Multiple => {
+                    SendMessageW(hwnd, LB_GETSEL_MESSAGE, WPARAM(index as usize), LPARAM(0)).0 > 0
+                }
+            };
+            let is_hot = hot == Some(index as usize);
+            let (text_color, background) = if is_selected || is_hot {
+                navigation_selection_colors(palette, is_hot)
+            } else {
+                (palette.text, palette.edit)
+            };
+            if background != palette.edit {
+                fill(dc, &row, background);
+            }
+            let length =
+                SendMessageW(hwnd, LB_GETTEXTLEN_MESSAGE, WPARAM(index as usize), LPARAM(0)).0;
+            if length <= 0 {
+                continue;
+            }
+            text.clear();
+            text.resize(length as usize + 1, 0);
+            let copied = SendMessageW(
+                hwnd,
+                LB_GETTEXT_MESSAGE,
+                WPARAM(index as usize),
+                LPARAM(text.as_mut_ptr() as isize),
+            )
+            .0;
+            if copied <= 0 {
+                continue;
+            }
+            text.truncate((copied as usize).min(length as usize));
+            let _ = SetTextColor(dc, text_color);
+            let mut text_rect = row;
+            text_rect.left += inset;
+            text_rect.right -= inset;
+            draw_native_text(
+                dc,
+                &text,
+                &mut text_rect,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                text_color,
+            );
+        }
+        if let Some(old_font) = old_font {
+            let _ = SelectObject(dc, old_font);
+        }
+    }
+    // With the frame band reserved the outline is entirely non-client. Otherwise (a list too small
+    // for the band) the part of the frame inside the client is composed here, in the same surface
+    // as the rows, so it is published in the same BitBlt.
+    if reserved_frame_band(hwnd).is_some() {
+        return;
+    }
+    if let Some((client_x, client_y, width, height)) = list_box_window_geometry(hwnd) {
+        if let Some(geometry) = rounded_control_frame_geometry(width, height, dpi) {
+            let _ = windows::Win32::Graphics::Gdi::OffsetViewportOrgEx(
+                dc, -client_x, -client_y, None,
+            );
+            draw_antialiased_control_frame(
+                dc,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: width,
+                    bottom: height,
+                },
+                geometry,
+                palette.edit,
+                palette.control_border(),
+                rounded_control_exterior(palette),
+            );
+            let _ = windows::Win32::Graphics::Gdi::OffsetViewportOrgEx(dc, client_x, client_y, None);
+        }
+    }
+}
+
+/// Paints the frame edge that lies over the non-client scrollbar, never touching the client
+/// (which WM_PAINT owns). Without a scrollbar there is no non-client area and nothing to do.
+unsafe fn paint_list_box_nonclient_frame(hwnd: HWND, palette: Palette) {
+    // A reserved band is painted only by WM_NCPAINT; the scrollbar never reaches it.
+    if reserved_frame_band(hwnd).is_some() {
+        return;
+    }
+    let Some((client_x, client_y, width, height)) = list_box_window_geometry(hwnd) else {
+        return;
+    };
+    let mut client = RECT::default();
+    if GetClientRect(hwnd, &mut client).is_err() {
+        return;
+    }
+    if client_x == 0 && client_y == 0 && client.right >= width && client.bottom >= height {
+        return;
+    }
+    let Some(geometry) =
+        rounded_control_frame_geometry(width, height, GetDpiForWindow(hwnd).max(96))
+    else {
+        return;
+    };
+    let dc = GetWindowDC(hwnd);
     if dc.is_invalid() {
         return;
     }
-    let font = SendMessageW(hwnd, WM_GETFONT, WPARAM(0), LPARAM(0));
-    let old_font = (font.0 != 0)
-        .then(|| SelectObject(dc, windows::Win32::Graphics::Gdi::HGDIOBJ(font.0 as *mut _)));
-    let _ = SetBkMode(dc, TRANSPARENT);
-    let inset = scale(7, GetDpiForWindow(hwnd).max(96));
-    for index in top..count as usize {
-        let mut row = RECT::default();
-        if SendMessageW(
-            hwnd,
-            LB_GETITEMRECT,
-            WPARAM(index),
-            LPARAM((&mut row as *mut RECT) as isize),
-        )
-        .0 < 0
-        {
-            break;
-        }
-        let mut client = RECT::default();
-        let _ = GetClientRect(hwnd, &mut client);
-        if row.top >= client.bottom {
-            break;
-        }
-        let is_selected = selected >= 0 && selected as usize == index;
-        let is_hot = hot == Some(index);
-        let (text_color, background) = if is_selected || is_hot {
-            navigation_selection_colors(palette, is_hot)
-        } else {
-            (palette.text, palette.edit)
-        };
-        fill(dc, &row, background);
-        let length = SendMessageW(hwnd, LB_GETTEXTLEN, WPARAM(index), LPARAM(0)).0;
-        if length < 0 {
-            continue;
-        }
-        let mut text = vec![0u16; length as usize + 1];
-        let _ = SendMessageW(
-            hwnd,
-            LB_GETTEXT,
-            WPARAM(index),
-            LPARAM(text.as_mut_ptr() as isize),
-        );
-        let _ = SetTextColor(dc, text_color);
-        row.left += inset;
-        row.right -= inset;
-        text.truncate(
-            text.iter()
-                .position(|value| *value == 0)
-                .unwrap_or(text.len()),
-        );
-        draw_native_text(
-            dc,
-            &text,
-            &mut row,
-            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-            text_color,
-        );
-    }
-    if let Some(old_font) = old_font {
-        let _ = SelectObject(dc, old_font);
-    }
-    let _ = windows::Win32::Graphics::Gdi::ReleaseDC(hwnd, dc);
+    let _ = windows::Win32::Graphics::Gdi::ExcludeClipRect(
+        dc,
+        client_x,
+        client_y,
+        client_x + client.right,
+        client_y + client.bottom,
+    );
+    draw_antialiased_control_frame(
+        dc,
+        RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        },
+        geometry,
+        palette.edit,
+        palette.control_border(),
+        rounded_control_exterior(palette),
+    );
+    let _ = ReleaseDC(hwnd, dc);
 }
 
 unsafe extern "system" fn list_view_parent_subclass(
@@ -3263,9 +5793,20 @@ unsafe fn paint_list_view_row(
         {
             continue;
         }
-        text_rect.left = text_rect.left.max(client.left);
-        text_rect.right = text_rect.right.min(client.right);
-        if text_rect.right <= text_rect.left {
+        // The text keeps its column's own extent. Clipping it to the visible client area put the
+        // ellipsis at the window edge; a horizontal scroll then moved that cut text (and its
+        // "...") into the middle of the row, and scrolling back left fragments behind.
+        if subitem == 0 {
+            // For the first column LVM_GETSUBITEMRECT returns the whole item: use the column.
+            let width = SendMessageW(list, 0x101D, WPARAM(0), LPARAM(0)).0 as i32; // LVM_GETCOLUMNWIDTH
+            if width > 0 {
+                text_rect.right = text_rect.left + width;
+            }
+        }
+        if text_rect.right <= text_rect.left
+            || text_rect.right <= client.left
+            || text_rect.left >= client.right
+        {
             continue;
         }
 
@@ -3289,9 +5830,13 @@ unsafe fn paint_list_view_row(
 
         text_rect.left += inset;
         if subitem == 0 && state_image & LVIS_STATEIMAGEMASK as u32 != 0 {
-            // The deterministic checkbox painter replaces the native state image after WM_PAINT.
-            // Reserve the same leading slot so selected-row text never overlaps its glyph.
-            text_rect.left += scale(24, dpi);
+            // Selected rows start their text where comctl32 starts it on the other rows: at the
+            // label, right after the state-image slot our checkbox is painted into.
+            if let Some(label) = list_view_label_left(list, item_index as usize) {
+                text_rect.left = text_rect.left.max(label + scale(2, dpi));
+            } else {
+                text_rect.left += scale(24, dpi);
+            }
         }
         text_rect.right -= inset.min((text_rect.right - text_rect.left).max(0));
         draw_opaque_surface_text(
@@ -3609,6 +6154,11 @@ fn list_view_row_colors(palette: Palette, selected: bool) -> (COLORREF, COLORREF
     }
 }
 
+/// Text and fill of a highlighted list row, shared with the drop-down list (combo_popup).
+pub(crate) fn list_selection_colors(palette: Palette, hot: bool) -> (COLORREF, COLORREF) {
+    navigation_selection_colors(palette, hot)
+}
+
 /// Reuses the exact normal/hot palette of the selected left navigation entry. Keeping this as the
 /// single source of truth prevents report rows and standalone lists drifting back to system blue.
 fn navigation_selection_colors(palette: Palette, hot: bool) -> (COLORREF, COLORREF) {
@@ -3634,6 +6184,41 @@ const fn list_view_custom_draw_state(snapshot: u32) -> u32 {
     snapshot & !(CDIS_SELECTED | CDIS_FOCUS | CDIS_HOT)
 }
 
+/// Left edge of an item's label (LVIR_LABEL): where comctl32 starts drawing the item text.
+unsafe fn list_view_label_left(list: HWND, index: usize) -> Option<i32> {
+    let mut label = RECT {
+        left: 2, // LVIR_LABEL
+        ..Default::default()
+    };
+    (SendMessageW(
+        list,
+        0x100E, // LVM_GETITEMRECT
+        WPARAM(index),
+        LPARAM((&mut label as *mut RECT) as isize),
+    )
+    .0 != 0)
+        .then_some(label.left)
+}
+
+/// The checkbox centred in the state-image slot, never wider than the slot leaves room for.
+fn list_view_checkbox_rect_in(slot: RECT, dpi: u32) -> RECT {
+    let slot_width = (slot.right - slot.left).max(1);
+    let row_height = (slot.bottom - slot.top).max(1);
+    let size = scale(13, dpi)
+        .max(1)
+        .min((slot_width - scale(4, dpi)).max(scale(9, dpi)))
+        .min(row_height);
+    let left = slot.left + (slot_width - size) / 2;
+    let top = slot.top + (row_height - size) / 2;
+    RECT {
+        left,
+        top,
+        right: left + size,
+        bottom: top + size,
+    }
+}
+
+#[allow(dead_code)]
 fn list_view_checkbox_rect(row: RECT, dpi: u32) -> RECT {
     let slot_width = scale(24, dpi).max(1);
     let row_height = (row.bottom - row.top).max(1);
@@ -3648,16 +6233,12 @@ fn list_view_checkbox_rect(row: RECT, dpi: u32) -> RECT {
     }
 }
 
-unsafe fn paint_list_view_checkboxes(hwnd: HWND, palette: Palette) {
+unsafe fn paint_list_view_checkboxes(hwnd: HWND, dc: HDC, palette: Palette) {
     const LVIS_STATEIMAGEMASK: isize = 0xf000;
     let top = SendMessageW(hwnd, 0x1027, WPARAM(0), LPARAM(0)).0.max(0) as i32; // TOPINDEX
     let visible = SendMessageW(hwnd, 0x1028, WPARAM(0), LPARAM(0)).0.max(0) as i32; // PERPAGE
     let count = SendMessageW(hwnd, 0x1004, WPARAM(0), LPARAM(0)).0.max(0) as i32; // ITEMCOUNT
     if count == 0 {
-        return;
-    }
-    let dc = windows::Win32::Graphics::Gdi::GetDC(hwnd);
-    if dc.is_invalid() {
         return;
     }
     let dpi = GetDpiForWindow(hwnd).max(96);
@@ -3701,15 +6282,20 @@ unsafe fn paint_list_view_checkboxes(hwnd: HWND, palette: Palette) {
             LPARAM(0x0002), // LVIS_SELECTED
         )
         .0 != 0;
+        // The slot ends where comctl32 starts the label text. A fixed 24 px slot was wider than
+        // the native state image at several DPIs and covered the first letters of the text.
+        let slot_right = list_view_label_left(hwnd, index as usize)
+            .filter(|label| *label > row.left + scale(6, dpi))
+            .unwrap_or(row.left + scale(24, dpi));
         let slot = RECT {
             left: row.left,
             top: row.top,
-            right: row.left + scale(24, dpi),
+            right: slot_right,
             bottom: row.bottom,
         };
         let background = list_view_row_colors(palette, selected).1;
         fill(dc, &slot, background);
-        let box_rect = list_view_checkbox_rect(row, dpi);
+        let box_rect = list_view_checkbox_rect_in(slot, dpi);
         let checked = state_image == 2;
         draw_embedded_button_glyph(
             dc,
@@ -3718,7 +6304,6 @@ unsafe fn paint_list_view_checkboxes(hwnd: HWND, palette: Palette) {
             background,
         );
     }
-    let _ = windows::Win32::Graphics::Gdi::ReleaseDC(hwnd, dc);
 }
 
 unsafe extern "system" fn progress_subclass(
@@ -3749,14 +6334,67 @@ unsafe extern "system" fn progress_subclass(
     }
 }
 
+/// Native progress bars (partition copy and any other tool) look exactly like the install page:
+/// the same 10 px capsule and colours, followed by the percentage in a 48 px slot after an 8 px
+/// gap, all inside the control. Error and paused colours come from PBM_GETSTATE. Composed
+/// off-screen and published with one BitBlt.
 unsafe fn paint_progress(hwnd: HWND, palette: Palette) {
     let mut paint = PAINTSTRUCT::default();
-    let dc = BeginPaint(hwnd, &mut paint);
+    let target = BeginPaint(hwnd, &mut paint);
     let mut rect = RECT::default();
     let _ = GetClientRect(hwnd, &mut rect);
-    let position = SendMessageW(hwnd, 0x0408, WPARAM(0), LPARAM(0)).0.max(0) as u64;
     let maximum = SendMessageW(hwnd, 0x0407, WPARAM(0), LPARAM(0)).0.max(1) as u64;
-    draw_progress(dc, rect, position, maximum, ProgressRole::Normal, palette);
+    let position = (SendMessageW(hwnd, 0x0408, WPARAM(0), LPARAM(0)).0.max(0) as u64).min(maximum);
+    let role = match SendMessageW(hwnd, 0x0411, WPARAM(0), LPARAM(0)).0 {
+        2 => ProgressRole::Error,
+        3 => ProgressRole::Paused,
+        _ => ProgressRole::Normal,
+    };
+    let dpi = GetDpiForWindow(hwnd).max(96);
+    let width = (rect.right - rect.left).max(0);
+    let height = (rect.bottom - rect.top).max(0);
+    let percent_width = scale(48, dpi).min(width / 3);
+    let gap = scale(8, dpi).min(width / 10);
+    let bar_height = scale(10, dpi).min(height).max(1);
+    let bar_top = rect.top + (height - bar_height) / 2;
+    let bar = RECT {
+        left: rect.left,
+        top: bar_top,
+        right: (rect.right - percent_width - gap).max(rect.left),
+        bottom: bar_top + bar_height,
+    };
+    let percent = position.saturating_mul(100) / maximum;
+    super::redraw::ui_detail_changed(hwnd, "progress", || {
+        format!("client={rect:?} bar={bar:?} value={position}/{maximum} role={role:?}")
+    });
+    {
+        let buffer = super::redraw::PaintBuffer::begin_opaque(target, rect, paint.rcPaint);
+        let dc = buffer.dc();
+        fill(dc, &rect, palette.window);
+        draw_progress(dc, bar, position, maximum, role, palette);
+        let font = SendMessageW(hwnd, WM_GETFONT, WPARAM(0), LPARAM(0));
+        let old_font = (font.0 != 0)
+            .then(|| SelectObject(dc, windows::Win32::Graphics::Gdi::HGDIOBJ(font.0 as *mut _)));
+        let _ = SetBkMode(dc, TRANSPARENT);
+        let text: Vec<u16> = format!("{percent}%").encode_utf16().collect();
+        let mut text_rect = RECT {
+            left: bar.right + gap,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        };
+        draw_native_text(
+            dc,
+            &text,
+            &mut text_rect,
+            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+            palette.text,
+        );
+        if let Some(old_font) = old_font {
+            let _ = SelectObject(dc, old_font);
+        }
+        buffer.present();
+    }
     let _ = EndPaint(hwnd, &paint);
 }
 
@@ -4030,10 +6668,43 @@ fn scale(value: i32, dpi: u32) -> i32 {
     ((value as i64 * dpi.max(1) as i64 + 48) / 96) as i32
 }
 
+/// Solid fill without creating a brush object per call: ExtTextOut(ETO_OPAQUE) paints the
+/// rectangle with the DC background colour (the classic GDI FillSolidRect). Frames, rows and
+/// surfaces call this dozens of times per paint.
 unsafe fn fill(dc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT, color: COLORREF) {
+    const CLR_INVALID_VALUE: u32 = 0xffff_ffff;
+    let previous = windows::Win32::Graphics::Gdi::SetBkColor(dc, color);
+    if previous.0 != CLR_INVALID_VALUE {
+        let filled = windows::Win32::Graphics::Gdi::ExtTextOutW(
+            dc,
+            0,
+            0,
+            windows::Win32::Graphics::Gdi::ETO_OPAQUE,
+            Some(rect as *const RECT),
+            PCWSTR::null(),
+            0,
+            None,
+        )
+        .as_bool();
+        let _ = windows::Win32::Graphics::Gdi::SetBkColor(dc, previous);
+        if filled {
+            return;
+        }
+    }
     let brush = CreateSolidBrush(color);
     let _ = FillRect(dc, rect, brush);
     let _ = DeleteObject(brush);
+}
+
+fn intersect_rects(first: RECT, second: RECT) -> RECT {
+    let left = first.left.max(second.left);
+    let top = first.top.max(second.top);
+    RECT {
+        left,
+        top,
+        right: first.right.min(second.right).max(left),
+        bottom: first.bottom.min(second.bottom).max(top),
+    }
 }
 
 unsafe fn stroke(dc: windows::Win32::Graphics::Gdi::HDC, rect: RECT, color: COLORREF) {

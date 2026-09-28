@@ -72,6 +72,17 @@ impl Dism {
         image_file: &str,
         progress_tx: Option<Sender<DismProgress>>,
     ) -> Result<(), ImageVerificationError> {
+        self.verify_image_with_resources(image_file, &[], progress_tx)
+    }
+
+    /// Same as [`Self::verify_image`], but split WIM parts after the first one are referenced
+    /// first, so the whole SWM set (also when scattered over several volumes) is verified.
+    pub fn verify_image_with_resources(
+        &self,
+        image_file: &str,
+        resources: &[PathBuf],
+        progress_tx: Option<Sender<DismProgress>>,
+    ) -> Result<(), ImageVerificationError> {
         use lr_core::wimlib::Wimlib;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -114,6 +125,19 @@ impl Dism {
                 let handle = lib.open_wim(image_file).map_err(|error| {
                     ImageVerificationError::Other(tr!("打开镜像失败: {}", error))
                 })?;
+                if resources.len() > 1 {
+                    let references = resources[1..]
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>();
+                    let references = references.iter().map(String::as_str).collect::<Vec<_>>();
+                    if let Err(error) = handle.reference_resource_files_exact(&references) {
+                        break 'verify Err(ImageVerificationError::Other(tr!(
+                            "引用镜像分卷失败: {}",
+                            error
+                        )));
+                    }
+                }
                 match handle.verify_detailed() {
                     Ok(()) => break 'verify Ok(()),
                     Err(error) if should_retry_verify_error(error.code(), attempt) => {

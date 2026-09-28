@@ -57,6 +57,7 @@ pub fn user_driver_source(root: &Path, family: WindowsFamily) -> Option<PathBuf>
 pub enum UnattendArchitecture {
     X86,
     Amd64,
+    Arm64,
 }
 
 impl UnattendArchitecture {
@@ -64,6 +65,7 @@ impl UnattendArchitecture {
         match self {
             Self::X86 => "x86",
             Self::Amd64 => "amd64",
+            Self::Arm64 => "arm64",
         }
     }
 }
@@ -139,32 +141,38 @@ pub fn render_default_unattend(options: &DefaultUnattendOptions<'_>) -> Result<S
     };
     let architecture = options.architecture.as_str();
 
-    let (international_component, time_zone) = if matches!(
-        options.family,
-        WindowsFamily::Windows10 | WindowsFamily::Windows11
-    ) {
-        let international = options.international.ok_or_else(|| {
-            "Windows 10/11 default unattend requires offline international settings".to_string()
-        })?;
-        let input_locale = xml_escape(&international.input_locale);
-        let system_locale = xml_escape(&international.system_locale);
-        let ui_language = xml_escape(&international.ui_language);
-        let user_locale = xml_escape(&international.user_locale);
-        let time_zone = xml_escape(&international.time_zone);
-        (
-            format!(
-                r#"        <component name="Microsoft-Windows-International-Core" processorArchitecture="{architecture}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+    let (international_component, time_zone) = match options.international.filter(|_| {
+        matches!(
+            options.family,
+            WindowsFamily::Windows10 | WindowsFamily::Windows11
+        )
+    }) {
+        // Missing international data only means OOBE asks for region/keyboard; it must not make
+        // an already applied installation fail.
+        Some(international) => {
+            let input_locale = xml_escape(&international.input_locale);
+            let system_locale = xml_escape(&international.system_locale);
+            let ui_language = xml_escape(&international.ui_language);
+            let user_locale = xml_escape(&international.user_locale);
+            let time_zone = international.time_zone.trim();
+            (
+                format!(
+                    r#"        <component name="Microsoft-Windows-International-Core" processorArchitecture="{architecture}" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
             <InputLocale>{input_locale}</InputLocale>
             <SystemLocale>{system_locale}</SystemLocale>
             <UILanguage>{ui_language}</UILanguage>
             <UserLocale>{user_locale}</UserLocale>
         </component>
 "#
-            ),
-            format!("            <TimeZone>{time_zone}</TimeZone>\n"),
-        )
-    } else {
-        (String::new(), String::new())
+                ),
+                if time_zone.is_empty() {
+                    String::new()
+                } else {
+                    format!("\t\t\t<TimeZone>{}</TimeZone>\n", xml_escape(time_zone))
+                },
+            )
+        }
+        None => (String::new(), String::new()),
     };
 
     let builtin = options
@@ -453,8 +461,8 @@ mod tests {
     }
 
     #[test]
-    fn windows_11_unattend_rejects_missing_international_settings() {
-        let error = render_default_unattend(&DefaultUnattendOptions {
+    fn windows_11_unattend_omits_unavailable_international_settings() {
+        let xml = render_default_unattend(&DefaultUnattendOptions {
             architecture: UnattendArchitecture::Amd64,
             family: WindowsFamily::Windows11,
             username: None,
@@ -466,8 +474,24 @@ mod tests {
             reserved_storage_support: None,
             international: None,
         })
-        .unwrap_err();
-        assert!(error.contains("requires offline international settings"));
+        .unwrap();
+        assert!(!xml.contains("Microsoft-Windows-International-Core"));
+        assert!(!xml.contains("<TimeZone>"));
+        assert!(xml.contains("HideOnlineAccountScreens"));
+        let arm64 = render_default_unattend(&DefaultUnattendOptions {
+            architecture: UnattendArchitecture::Arm64,
+            family: WindowsFamily::Windows11,
+            username: None,
+            builtin_administrator: None,
+            temporary_oobe_account_name: None,
+            remove_uwp_apps: false,
+            run_deploy_script: false,
+            remove_security_ui: false,
+            reserved_storage_support: None,
+            international: None,
+        })
+        .unwrap();
+        assert!(arm64.contains("processorArchitecture=\"arm64\""));
     }
 
     #[test]

@@ -23,6 +23,9 @@ pub const HANDOFF_ARTIFACT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ArtifactRole {
     InstallImageSpan,
+    /// Raw byte chunk of one image file. WinPE concatenates all chunks in ordinal order and checks
+    /// the whole-file SHA-256 bound in the authenticated install configuration.
+    InstallImageChunk,
     XpSourceFile,
     CustomUnattend,
     XpAnswer,
@@ -48,6 +51,7 @@ impl ArtifactRole {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InstallImageSpan => "install_image_span",
+            Self::InstallImageChunk => "install_image_chunk",
             Self::XpSourceFile => "xp_source_file",
             Self::CustomUnattend => "custom_unattend",
             Self::XpAnswer => "xp_answer",
@@ -73,6 +77,7 @@ impl ArtifactRole {
     fn parse(value: &str) -> Result<Self> {
         match value {
             "install_image_span" => Ok(Self::InstallImageSpan),
+            "install_image_chunk" => Ok(Self::InstallImageChunk),
             "xp_source_file" => Ok(Self::XpSourceFile),
             "custom_unattend" => Ok(Self::CustomUnattend),
             "xp_answer" => Ok(Self::XpAnswer),
@@ -117,6 +122,7 @@ impl ArtifactRole {
         matches!(
             self,
             Self::InstallImageSpan
+                | Self::InstallImageChunk
                 | Self::PcaPackage
                 | Self::AutoPartitionMarker
                 | Self::ProtectedAdministratorSecret
@@ -674,9 +680,16 @@ fn validate_role_matrix(
     }
 
     if purpose == HandoffPurpose::Install {
-        let image_count = roles
+        let span_count = roles
             .get(&ArtifactRole::InstallImageSpan)
             .map_or(0, Vec::len);
+        let chunk_count = roles
+            .get(&ArtifactRole::InstallImageChunk)
+            .map_or(0, Vec::len);
+        if span_count != 0 && chunk_count != 0 {
+            bail!("installation handoff cannot mix image spans with raw image chunks");
+        }
+        let image_count = span_count + chunk_count;
         let xp_count = roles.get(&ArtifactRole::XpSourceFile).map_or(0, Vec::len);
         if image_count == 0 && xp_count == 0 {
             bail!("installation handoff manifest has no authenticated image or XP source files");

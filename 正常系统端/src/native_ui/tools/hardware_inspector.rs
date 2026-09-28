@@ -1,6 +1,6 @@
 //! Modeless, read-only detailed hardware inspector.
 
-use windows::core::{w, PCWSTR, PWSTR};
+use windows::core::{w, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     RedrawWindow, HFONT, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW,
@@ -12,7 +12,7 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, MoveWindow, SendMessageW, SetWindowTextW, BS_OWNERDRAW, WM_GETFONT, WS_BORDER,
+    GetClientRect, MoveWindow, SendMessageW, BS_OWNERDRAW, WM_GETFONT, WS_BORDER,
     WS_TABSTOP,
 };
 
@@ -960,8 +960,7 @@ unsafe fn replace_rows(list: HWND, rows: &[DetailRow]) {
 }
 
 unsafe fn set_text(hwnd: HWND, value: &str) {
-    let value = wide(value);
-    let _ = SetWindowTextW(hwnd, PCWSTR(value.as_ptr()));
+    crate::native_ui::redraw::set_window_text_if_changed(hwnd, value);
 }
 
 #[cfg(test)]

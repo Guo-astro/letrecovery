@@ -604,7 +604,8 @@ impl BackupPage {
             label_width,
             metrics.label_height,
         );
-        let format_width = s(132).min((width - label_width).max(0));
+        let format_width = crate::native_ui::layout::combo_fitted_width(h.format, dpi, s(132))
+            .min((width - label_width).max(0));
         move_control(
             h.format,
             left + label_width,
@@ -613,12 +614,16 @@ impl BackupPage {
             s(180),
         );
         let detail_x = (label_width + format_width + s(10)).min(width);
+        // A long format description wraps instead of being cut off; the row grows with it.
+        let hint_height = crate::native_ui::layout::control_wrapped_height(h.format_hint, width - detail_x)
+            .max(metrics.label_height);
+        let format_row_height = format_row_height.max(hint_height);
         move_control(
             h.format_hint,
             left + detail_x,
             label_y,
             width - detail_x,
-            metrics.label_height,
+            hint_height,
         );
         let swm_label_width = s(72).min((width - detail_x) / 2);
         move_control(
@@ -637,7 +642,8 @@ impl BackupPage {
         );
 
         let save_top = format_top + format_row_height + s(10);
-        let browse_width = s(76).min(width / 4);
+        let browse_width =
+            crate::native_ui::layout::fitted_button_width(h.browse, dpi, s(76)).min(width / 3);
         move_control(h.save_label, left, save_top + s(3), label_width, s(20));
         move_control(
             h.save_path,
@@ -698,13 +704,20 @@ impl BackupPage {
             incremental_width,
             row_height,
         );
-        move_control(
-            h.warning,
-            left + incremental_width + options_gap,
-            options_top + s(3),
-            width - incremental_width - options_gap,
-            s(20),
-        );
+        let inline_width = width - incremental_width - options_gap;
+        if crate::native_ui::layout::control_text_width(h.warning) <= inline_width {
+            move_control(
+                h.warning,
+                left + incremental_width + options_gap,
+                options_top + s(3),
+                inline_width,
+                s(20),
+            );
+        } else {
+            // A longer translation gets its own row below the options instead of being cut off.
+            let height = crate::native_ui::layout::control_wrapped_height(h.warning, width).max(s(20));
+            move_control(h.warning, left, options_top + row_height + s(6), width, height);
+        }
     }
 
     pub unsafe fn show(&self, visible: bool) {

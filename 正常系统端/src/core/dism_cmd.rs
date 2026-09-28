@@ -306,14 +306,22 @@ impl DismCmd {
             bail!("driver directory contains no INF files: {}", driver_dir);
         }
 
+        let mut failures = Vec::new();
         for inf in inf_files {
             let inf_text = inf.to_string_lossy();
             if let Err(normal_error) =
                 self.add_driver_offline(image_path, &inf_text, false, progress_tx.clone())
             {
-                return Err(normal_error)
-                    .with_context(|| format!("DISM rejected driver package: {}", inf.display()));
+                failures.push(format!("{}: {normal_error:#}", inf.display()));
             }
+        }
+        if !failures.is_empty() {
+            let summary = lr_core::bounded_failure_summary::summarize_failures(&failures, 3);
+            bail!(
+                "DISM rejected {} isolated driver package(s): {}",
+                failures.len(),
+                summary
+            );
         }
         Ok(())
     }

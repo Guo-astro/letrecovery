@@ -637,21 +637,27 @@ fn get_disk_info_from_path(
         )
         .map_err(|error| anyhow!("以只读方式打开当前 SetupAPI 磁盘接口失败: {error}"))?;
 
-        let current_disk_number = lr_core::windows_storage::present_disk_number_from_handle(handle)
-            .map_err(|error| {
+        // Only a positive, different number proves the path moved. Filter drivers (hardware-ID
+        // spoofers) reject this IOCTL; the enumerated number is then kept.
+        match lr_core::windows_storage::present_disk_number_from_handle(handle) {
+            Ok(Some(current)) if current != disk_number => {
                 let _ = CloseHandle(handle);
-                anyhow!("same-handle current disk-number query failed: {error}")
-            })?;
-        if current_disk_number != Some(disk_number) {
-            let _ = CloseHandle(handle);
-            return Err(anyhow!(
-                "SetupAPI interface changed before snapshot: enumerated disk {disk_number}, same-handle current disk {current_disk_number:?}"
-            ));
+                return Err(anyhow!(
+                    "SetupAPI interface changed before snapshot: enumerated disk {disk_number}, same-handle current disk {current}"
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => log::debug!(
+                "disk {disk_number}: same-handle number query unavailable ({error}); keeping the enumerated number"
+            ),
         }
 
         let mut length = DiskLengthInfo::default();
         let mut bytes_returned: u32 = 0;
-        let length_result = DeviceIoControl(
+        let length_result = if lr_core::windows_storage::simulate_restricted_storage() {
+            Err(windows::core::Error::from(HRESULT::from_win32(1)))
+        } else {
+            DeviceIoControl(
             handle,
             IOCTL_DISK_GET_LENGTH_INFO,
             None,
@@ -660,7 +666,8 @@ fn get_disk_info_from_path(
             std::mem::size_of::<DiskLengthInfo>() as u32,
             Some(&mut bytes_returned),
             None,
-        );
+        )
+        };
         let length_bytes = length_result.as_ref().ok().and_then(|_| {
             checked_disk_length(
                 length.length,
@@ -680,7 +687,10 @@ fn get_disk_info_from_path(
         if length_bytes.is_none() {
             let mut geometry = DiskGeometryEx::default();
             bytes_returned = 0;
-            let geometry_result = DeviceIoControl(
+            let geometry_result = if lr_core::windows_storage::simulate_restricted_storage() {
+                Err(windows::core::Error::from(HRESULT::from_win32(1)))
+            } else {
+                DeviceIoControl(
                 handle,
                 IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
                 None,
@@ -689,7 +699,8 @@ fn get_disk_info_from_path(
                 std::mem::size_of::<DiskGeometryEx>() as u32,
                 Some(&mut bytes_returned),
                 None,
-            );
+            )
+            };
             geometry_bytes = geometry_result.as_ref().ok().and_then(|_| {
                 checked_disk_length(
                     geometry.disk_size,
@@ -705,40 +716,56 @@ fn get_disk_info_from_path(
                 Err(error) => error.to_string(),
             };
         }
-        let (size_bytes, capacity_source) = match select_capacity_source(
-            length_bytes,
-            geometry_bytes,
-            None,
-        ) {
-            Some(selected) => selected,
+        let capacity = match select_capacity_source(length_bytes, geometry_bytes, None) {
+            Some(selected) => Some(selected),
             None => match lr_core::windows_storage::vds_disk_size(disk_number) {
                 Ok(size_bytes) => {
                     log::warn!(
                         "SetupAPI 磁盘接口的两个只读容量 IOCTL 均被驱动拒绝；仅容量字段回退到当前磁盘号 {disk_number} 的 VDS 值 {size_bytes} bytes。LENGTH_INFO=({length_context}); GEOMETRY_EX=({geometry_context})"
                     );
-                    select_capacity_source(None, None, Some(size_bytes)).ok_or_else(|| {
-                        let _ = CloseHandle(handle);
-                        anyhow!("VDS returned a zero disk capacity")
-                    })?
+                    select_capacity_source(None, None, Some(size_bytes))
                 }
                 Err(vds_error) => {
-                    let _ = CloseHandle(handle);
-                    return Err(anyhow!(
-                        "exact-path capacity queries failed and the same current disk number had no VDS capacity fallback: LENGTH_INFO=({length_context}); GEOMETRY_EX=({geometry_context}); VDS=({vds_error})"
-                    ));
+                    // Hardware-ID spoofers reject every capacity query; the partition table
+                    // still gives a conservative bound (computed after the layout is read).
+                    lr_core::windows_storage::warn_storage_once(
+                        &format!("qp-capacity:{disk_number}"),
+                        || {
+                            format!(
+                                "磁盘 {disk_number} 的容量查询全部被拒绝，改用分区表推算容量。LENGTH_INFO=({length_context}); GEOMETRY_EX=({geometry_context}); VDS=({vds_error})"
+                            )
+                        },
+                    );
+                    None
                 }
             },
         };
-        log::debug!(
-            "SetupAPI disk interface {} capacity={} bytes source={capacity_source:?}",
-            disk_path,
-            size_bytes
-        );
+        if let Some((size_bytes, capacity_source)) = capacity {
+            log::debug!(
+                "SetupAPI disk interface {} capacity={} bytes source={capacity_source:?}",
+                disk_path,
+                size_bytes
+            );
+        }
 
-        let descriptor = query_disk_device_descriptor(handle).map_err(|error| {
-            let _ = CloseHandle(handle);
-            anyhow!("exact-path device descriptor query failed: {error}")
-        })?;
+        let descriptor = if lr_core::windows_storage::simulate_restricted_storage() {
+            Err(anyhow!("simulated restricted storage"))
+        } else {
+            query_disk_device_descriptor(handle)
+        }
+        .unwrap_or_else(|error| {
+            // Model/serial/bus are display and policy hints only; spoofers reject them.
+            lr_core::windows_storage::warn_storage_once(&format!("qp-descriptor:{disk_number}"), || {
+                format!("磁盘 {disk_number} 的设备描述符被拒绝（{error}），型号与总线类型显示为未知")
+            });
+            DiskDeviceDescriptor {
+                model: crate::tr!("未知型号"),
+                serial_number: String::new(),
+                firmware_revision: String::new(),
+                bus_type: 0,
+                removable_media: false,
+            }
+        });
 
         // DRIVE_LAYOUT_INFORMATION_EX is variable length. Microsoft requires retrying with a
         // larger buffer when the storage stack reports that the supplied buffer was too small.
@@ -748,7 +775,7 @@ fn get_disk_info_from_path(
         let (buffer, returned) = layout.ok_or_else(|| {
             anyhow!("IOCTL_DISK_GET_DRIVE_LAYOUT_EX failed on the exact SetupAPI interface")
         })?;
-        let (partition_style, is_initialized, partitions, partition_count) = {
+        let (partition_style, is_initialized, partitions, partition_count, gpt_usable_end) = {
             if returned < std::mem::size_of::<DriveLayoutInfoExHeader>() as u32 {
                 return Err(anyhow!(
                     "IOCTL_DISK_GET_DRIVE_LAYOUT_EX response is truncated"
@@ -756,6 +783,21 @@ fn get_disk_info_from_path(
             }
             let bytes = std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), returned as usize);
             let header = std::ptr::read_unaligned(bytes.as_ptr().cast::<DriveLayoutInfoExHeader>());
+            // DRIVE_LAYOUT_INFORMATION_GPT: DiskId(8..24), StartingUsableOffset(24..32),
+            // UsableLength(32..40). Only used when every capacity query was rejected.
+            let gpt_usable_end = if header.partition_style == PARTITION_STYLE_GPT.0 as u32
+                && bytes.len() >= 40
+            {
+                let start = i64::from_le_bytes(bytes[24..32].try_into().unwrap_or([0; 8]));
+                let length = i64::from_le_bytes(bytes[32..40].try_into().unwrap_or([0; 8]));
+                u64::try_from(start)
+                    .ok()
+                    .zip(u64::try_from(length).ok())
+                    .and_then(|(start, length)| start.checked_add(length))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
 
             let style = match header.partition_style {
                 x if x == PARTITION_STYLE_MBR.0 as u32 => PartitionStyle::MBR,
@@ -769,7 +811,18 @@ fn get_disk_info_from_path(
             // 解析分区信息
             let partitions = parse_partition_layout(bytes, &header, style, disk_number);
 
-            (style, is_init, partitions, header.partition_count)
+            (style, is_init, partitions, header.partition_count, gpt_usable_end)
+        };
+        let size_bytes = match capacity {
+            Some((size_bytes, _)) => size_bytes,
+            None => {
+                let partition_end = partitions
+                    .iter()
+                    .filter_map(|partition| partition.offset_bytes.checked_add(partition.size_bytes))
+                    .max()
+                    .unwrap_or(0);
+                gpt_usable_end.max(partition_end)
+            }
         };
 
         // 计算未分配空间

@@ -5,6 +5,86 @@
 use crate::tr;
 use crate::utils::cmd::create_command;
 
+/// Select adapters that can carry PE networking.  Hyper-V/VMware host-only, Clash/TUN and
+/// loopback interfaces are deliberately excluded by description/type; a connected adapter must
+/// also have at least one assigned address.  The selector is pure so the same policy can be used
+/// by the normal endpoint and its tests without probing or mutating the network stack.
+pub fn select_pe_network_adapters(
+    adapters: &[crate::core::hardware_info::NetworkAdapterInfo],
+) -> Vec<crate::core::hardware_info::NetworkAdapterInfo> {
+    adapters
+        .iter()
+        .filter(|adapter| {
+            let haystack = format!("{} {}", adapter.name, adapter.description).to_ascii_lowercase();
+            let virtual_hint = [
+                "clash",
+                "tun",
+                "tap",
+                "vmware virtual",
+                "vmware host",
+                "hyper-v",
+                "hyper v",
+                "default switch",
+                "loopback",
+                "vethernet",
+                "virtualbox host",
+            ]
+            .iter()
+            .any(|needle| haystack.contains(needle));
+            let physical_kind = matches!(adapter.adapter_type.as_str(), "以太网" | "无线网络")
+                || adapter
+                    .adapter_type
+                    .to_ascii_lowercase()
+                    .contains("ethernet")
+                || adapter
+                    .adapter_type
+                    .to_ascii_lowercase()
+                    .contains("wireless");
+            !virtual_hint
+                && physical_kind
+                && adapter.status == "已连接"
+                && !adapter.ip_addresses.is_empty()
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod pe_network_tests {
+    use super::select_pe_network_adapters;
+    use crate::core::hardware_info::NetworkAdapterInfo;
+
+    fn adapter(name: &str, description: &str, kind: &str) -> NetworkAdapterInfo {
+        NetworkAdapterInfo {
+            name: name.into(),
+            description: description.into(),
+            adapter_type: kind.into(),
+            status: "已连接".into(),
+            ip_addresses: vec!["192.0.2.10".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn excludes_virtual_tunnels_and_keeps_physical_ethernet_and_wifi() {
+        let candidates = vec![
+            adapter("Ethernet", "Intel Ethernet Controller", "以太网"),
+            adapter("Wi-Fi", "Qualcomm Wireless Adapter", "无线网络"),
+            adapter(
+                "vEthernet (Default Switch)",
+                "Hyper-V Virtual Ethernet",
+                "以太网",
+            ),
+            adapter("Clash", "Clash TUN Adapter", "隧道"),
+        ];
+        let selected = select_pe_network_adapters(&candidates);
+        assert_eq!(selected.len(), 2);
+        assert!(selected
+            .iter()
+            .all(|item| item.name == "Ethernet" || item.name == "Wi-Fi"));
+    }
+}
+
 /// 使用 Windows API 获取详细的网络信息
 pub fn get_detailed_network_info() -> Vec<crate::core::hardware_info::NetworkAdapterInfo> {
     let mut adapters = Vec::new();

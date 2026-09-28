@@ -34,16 +34,63 @@ fn valid_locale_name(value: &str) -> bool {
 
 fn valid_input_locale(value: &str) -> bool {
     let Some((language, keyboard)) = value.split_once(':') else {
-        return false;
+        return valid_locale_name(value);
     };
     language.len() == 4
-        && keyboard.len() == 8
         && language
             .chars()
             .all(|character| character.is_ascii_hexdigit())
-        && keyboard
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
+        && ((keyboard.len() == 8
+            && keyboard
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()))
+            || valid_input_text_service_profile(keyboard))
+}
+
+/// `{TIP CLSID}{profile GUID}` as used by IME-based input profiles (for example Microsoft Pinyin
+/// on zh-CN images).
+fn valid_input_text_service_profile(value: &str) -> bool {
+    value.is_ascii()
+        && value.len() == 76
+        && is_braced_guid_literal(&value[..38])
+        && is_braced_guid_literal(&value[38..])
+}
+
+fn is_braced_guid_literal(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 38
+        && bytes[0] == b'{'
+        && bytes[37] == b'}'
+        && bytes[1..37]
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => *byte == b'-',
+                _ => byte.is_ascii_hexdigit(),
+            })
+}
+
+/// A plain `LLLL:0000LLLL` keyboard is the layout-only variant of the installation language. For
+/// IME languages (zh-CN, ja-JP, ko-KR ...) using it as `InputLocale` leaves new users without the
+/// default IME, so the language tag is used instead and Windows selects that language's default
+/// input profile. Every other value is returned unchanged.
+pub fn prefer_language_default_input(input_locale: &str, ui_language: &str) -> String {
+    if let Some((language, keyboard)) = input_locale.split_once(':') {
+        if language.len() == 4
+            && keyboard.len() == 8
+            && keyboard.is_ascii()
+            && keyboard.starts_with("0000")
+            && keyboard[4..].eq_ignore_ascii_case(language)
+            && valid_locale_name(ui_language)
+        {
+            if let Ok(name) = locale_name_from_registry_id(language) {
+                if name.eq_ignore_ascii_case(ui_language) {
+                    return ui_language.to_string();
+                }
+            }
+        }
+    }
+    input_locale.to_string()
 }
 
 fn valid_time_zone(value: &str) -> bool {
@@ -152,8 +199,10 @@ impl Drop for LoadedOfflineHive {
 
 /// Reads the applied image's installation language, locales, default keyboard and time zone.
 ///
-/// `image_path` must be a drive designator such as `C:`. Every required value is validated;
-/// incomplete or malformed hives fail closed instead of silently substituting the host locale.
+/// `image_path` must be a drive designator such as `C:`. The installation language and system
+/// locale are required. A missing or malformed user locale, keyboard or time zone falls back to
+/// the target's own system locale, UI-language default input and Windows' default time zone
+/// (an empty value) instead of failing; the host locale is never substituted.
 pub fn read_offline_international_settings(
     image_path: &str,
 ) -> Result<OfflineInternationalSettings> {
@@ -203,23 +252,50 @@ pub fn read_offline_international_settings(
         locale_name_from_registry_id(&system_language).context("转换目标系统区域设置失败")?;
 
     let international_key = default_hive.key(r"Control Panel\International");
-    let user_locale = OfflineRegistry::query_string(&international_key, "LocaleName")
-        .context("读取目标系统默认用户区域设置失败")?;
-    if !valid_locale_name(&user_locale) {
-        bail!("离线 DEFAULT 注册表返回了无效的用户区域设置: {user_locale}");
-    }
+    let user_locale = match OfflineRegistry::query_string(&international_key, "LocaleName") {
+        Ok(value) if valid_locale_name(&value) => value,
+        Ok(value) => {
+            log::warn!(
+                "[UNATTEND] 离线 DEFAULT 注册表用户区域设置无效（{value}），改用系统区域设置 {system_locale}"
+            );
+            system_locale.clone()
+        }
+        Err(error) => {
+            log::warn!(
+                "[UNATTEND] 读取目标系统默认用户区域设置失败，改用系统区域设置 {system_locale}: {error:#}"
+            );
+            system_locale.clone()
+        }
+    };
 
     let keyboard_key = default_hive.key(r"Keyboard Layout\Preload");
-    let keyboard_layout = OfflineRegistry::query_string(&keyboard_key, "1")
-        .context("读取目标系统默认键盘布局失败")?;
-    let input_locale = input_locale_from_keyboard_layout(&keyboard_layout)?;
+    let input_locale = match OfflineRegistry::query_string(&keyboard_key, "1")
+        .map_err(anyhow::Error::from)
+        .and_then(|layout| input_locale_from_keyboard_layout(&layout))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!(
+                "[UNATTEND] 读取目标系统默认键盘布局失败，改用界面语言 {ui_language} 的默认输入法: {error:#}"
+            );
+            ui_language.clone()
+        }
+    };
 
     let time_zone_key = system_hive.key(&format!(r"{control_root}\TimeZoneInformation"));
-    let time_zone = OfflineRegistry::query_string(&time_zone_key, "TimeZoneKeyName")
-        .context("读取目标系统默认时区失败")?;
-    if !valid_time_zone(&time_zone) {
-        bail!("离线 SYSTEM 注册表返回了无效的默认时区: {time_zone}");
-    }
+    let time_zone = match OfflineRegistry::query_string(&time_zone_key, "TimeZoneKeyName") {
+        Ok(value) if valid_time_zone(&value) => value,
+        Ok(value) => {
+            log::warn!("[UNATTEND] 离线 SYSTEM 注册表默认时区无效（{value}），无人值守不设置时区");
+            String::new()
+        }
+        Err(error) => {
+            log::warn!("[UNATTEND] 读取目标系统默认时区失败，无人值守不设置时区: {error:#}");
+            String::new()
+        }
+    };
+
+    let input_locale = prefer_language_default_input(&input_locale, &ui_language);
 
     let settings = OfflineInternationalSettings {
         ui_language,

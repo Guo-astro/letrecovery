@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
 use lr_core::custom_install::{
-    plan_full_disk_layout, validate_dual_boot_plan, validate_full_disk_plan, CustomInstallPlan,
+    plan_full_disk_layout_for_disk, validate_dual_boot_plan, validate_full_disk_plan, CustomInstallPlan,
     DualBootPlan, FullDiskRole, FullDiskSelection, ImageSpaceRequirement, PlannedPartitionRole,
     RepartitionAllDisksPlan, RequestedPartitionStyle, GIB,
 };
@@ -149,7 +149,7 @@ pub fn build_full_disk_plan(
     // into an otherwise too-small optional-data tail. Replacing the minimum with the historical
     // zero/all-remaining sentinel would lose the only lower bound when same-disk staging moves the
     // usable end before PE rebuilds the layout.
-    let windows_partition_bytes = image.windows_partition_bytes;
+    let mut windows_partition_bytes = image.windows_partition_bytes;
     for disk_number in selected {
         let disk = inventory
             .iter()
@@ -167,26 +167,60 @@ pub fn build_full_disk_plan(
             // Reuse the exact shared layout policy instead of subtracting a second guessed
             // "infrastructure reserve". The latter used to reserve 1 GiB for a GPT layout whose
             // actual planned fixed partitions are much smaller, causing a false capacity failure.
-            let candidate = plan_full_disk_layout(
+            if image.source == lr_core::custom_install::ImageSpaceSource::OpaqueOrMissingMetadata {
+                // The 80-GiB figure is only a guess for images without size metadata (for
+                // example GHO). On a small disk it must not block the installation: keep a
+                // realistic Windows floor and let the real apply result decide.
+                const OPAQUE_IMAGE_SMALL_DISK_FLOOR_BYTES: u64 = 16 * GIB;
+                if let Some(available) = plan_full_disk_layout_for_disk(
+                    disk.style,
+                    FullDiskRole::Windows,
+                    disk.size_bytes,
+                    disk.size_bytes,
+                    1,
+                )
+                .ok()
+                .and_then(|layout| {
+                    layout
+                        .into_iter()
+                        .find(|partition| partition.role == PlannedPartitionRole::Windows)
+                })
+                .map(|partition| partition.length_bytes)
+                {
+                    let relaxed = windows_partition_bytes
+                        .min(available)
+                        .max(OPAQUE_IMAGE_SMALL_DISK_FLOOR_BYTES);
+                    if relaxed != windows_partition_bytes {
+                        log::warn!(
+                            "[FULL DISK] image size metadata is unavailable; the Windows minimum on disk {disk_number} is relaxed from {} to {} bytes",
+                            windows_partition_bytes,
+                            relaxed
+                        );
+                        windows_partition_bytes = relaxed;
+                    }
+                }
+            }
+            let candidate = plan_full_disk_layout_for_disk(
                 disk.style,
                 FullDiskRole::Windows,
                 disk.size_bytes,
-                image.windows_partition_bytes,
+                disk.size_bytes,
+                windows_partition_bytes,
             )
             .map_err(|_| {
                 anyhow!(
                     "磁盘 {disk_number} 可用容量不足：所选镜像至少需要 {:.1} GB Windows 分区",
-                    image.windows_partition_bytes as f64 / GIB as f64
+                    windows_partition_bytes as f64 / GIB as f64
                 )
             })?;
             let windows = candidate
                 .iter()
                 .find(|partition| partition.role == PlannedPartitionRole::Windows)
                 .context("共享全盘布局没有生成 Windows 分区")?;
-            if windows.length_bytes < image.windows_partition_bytes {
+            if windows.length_bytes < windows_partition_bytes {
                 bail!(
                     "磁盘 {disk_number} 可用容量不足：所选镜像至少需要 {:.1} GB Windows 分区",
-                    image.windows_partition_bytes as f64 / GIB as f64
+                    windows_partition_bytes as f64 / GIB as f64
                 );
             }
             FullDiskRole::Windows
