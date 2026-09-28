@@ -57,6 +57,7 @@ function New-ReleaseTemplate {
         easy_mode_settings_tip_dismissed = $false
         log_enabled = $true
         automatic_feedback_mode = "normal_and_pe"
+        pe_network_enabled = $false
         log_retention_days = 7
         language = "zh-CN"
         pe_cache = [pscustomobject][ordered]@{
@@ -244,4 +245,4 @@ try {
         Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
     }
 }
-
+
