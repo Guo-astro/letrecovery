@@ -27,6 +27,8 @@ pub const MSR_WINDOWS_7_MINIMUM_BYTES: u64 = 128 * MIB;
 /// separate NTFS system volume of about 350 MiB.  Full-disk installs support BitLocker, so the
 /// smaller boot-only figure is not the functional minimum.
 pub const BIOS_SYSTEM_FUNCTIONAL_MINIMUM_BYTES: u64 = 350 * MIB;
+/// Planned size of the MBR "System Reserved" volume created by a full-disk install.
+pub const MBR_SYSTEM_RESERVED_BYTES: u64 = 550 * MIB;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -289,12 +291,255 @@ fn plan_layout(
     desired_windows_bytes: u64,
     reclaimable_after_bytes: u64,
 ) -> Result<Vec<PlannedPartition>, CustomInstallPlanError> {
+    plan_layout_from(
+        style,
+        role,
+        MIB,
+        usable_end_bytes,
+        windows_minimum_bytes,
+        desired_windows_bytes,
+        reclaimable_after_bytes,
+    )
+}
+
+/// Round a placement preference up to the next whole MiB.
+fn align_up_to_mib(value: u64) -> u64 {
+    value.div_ceil(MIB).saturating_mul(MIB)
+}
+
+/// Fixed boot infrastructure planned in front of the Windows volume.
+const fn infrastructure_bytes(style: RequestedPartitionStyle) -> u64 {
+    match style {
+        RequestedPartitionStyle::Gpt => ESP_4KN_MINIMUM_BYTES + MSR_WINDOWS_7_MINIMUM_BYTES,
+        RequestedPartitionStyle::Mbr => MBR_SYSTEM_RESERVED_BYTES,
+    }
+}
+
+/// Staging-aware automatic full-disk layout used by the installer.
+///
+/// `disk_capacity_bytes` is the whole selected disk. The existing same-disk staging volume starts at
+/// `staging_offset_bytes`, is `staging_length_bytes` long and must survive until the image has
+/// been applied. The post-install cleanup deletes it and returns its space to the nearest
+/// ordinary volume in front of it.
+///
+/// Partitions may be planned on both sides of the staging extent. The layout is chosen by the size
+/// the Windows volume has *after* that cleanup. A staging volume carved from the end of the old
+/// system volume therefore gives the new Windows volume the old boundary back (for example
+/// C: 200 GiB + D: rest) instead of a shrunken Windows volume, a 4-GiB data volume and a large
+/// unallocated tail that only a successful cleanup could repair. A staging extent at the very
+/// start of the disk no longer blocks the installation either: the boot partitions and Windows are
+/// then planned behind it. Only a disk that cannot hold the image-derived minimum anywhere is
+/// rejected.
+pub fn plan_full_disk_layout_around_staging(
+    style: RequestedPartitionStyle,
+    role: FullDiskRole,
+    disk_capacity_bytes: u64,
+    staging_offset_bytes: u64,
+    staging_length_bytes: u64,
+    windows_minimum_bytes: u64,
+) -> Result<Vec<PlannedPartition>, CustomInstallPlanError> {
+    if staging_offset_bytes == 0 || staging_length_bytes == 0 {
+        return Err(CustomInstallPlanError::InvalidPreservedStaging);
+    }
+    let staging_end = staging_offset_bytes
+        .checked_add(staging_length_bytes)
+        .ok_or(CustomInstallPlanError::InvalidPreservedStaging)?;
+    let disk_end = disk_capacity_bytes.max(staging_end);
+    // Partitions behind the staging extent prefer the next whole MiB. Capacity checks use that same
+    // start, so the plan never counts on a sub-MiB sliver it would not place anything into.
+    let back_start = align_up_to_mib(staging_end).min(disk_end);
+    let back_length = disk_end - back_start;
+    match role {
+        FullDiskRole::Data => {
+            plan_data_disk_around_staging(style, staging_offset_bytes, back_start, disk_end)
+        }
+        FullDiskRole::Windows => plan_windows_disk_around_staging(
+            style,
+            staging_offset_bytes,
+            staging_length_bytes,
+            back_start,
+            back_length,
+            disk_end,
+            windows_minimum_bytes,
+        ),
+    }
+}
+
+fn plan_windows_disk_around_staging(
+    style: RequestedPartitionStyle,
+    staging_offset_bytes: u64,
+    staging_length_bytes: u64,
+    back_start: u64,
+    back_length: u64,
+    disk_end: u64,
+    windows_minimum_bytes: u64,
+) -> Result<Vec<PlannedPartition>, CustomInstallPlanError> {
+    if windows_minimum_bytes == 0 {
+        return Err(CustomInstallPlanError::InvalidWindowsPartitionSize);
+    }
+    let desired = automatic_full_disk_windows_bytes(disk_end, windows_minimum_bytes);
+    let staging_end = staging_offset_bytes.saturating_add(staging_length_bytes);
+    let front_windows = staging_offset_bytes
+        .checked_sub(MIB)
+        .and_then(|value| value.checked_sub(infrastructure_bytes(style)))
+        .filter(|before| *before >= windows_minimum_bytes);
+    if let Some(before) = front_windows {
+        if desired != u64::MAX && before.saturating_sub(desired) < MIN_USEFUL_DATA_BYTES {
+            // The front cannot hold the automatic Windows size plus a data volume. Compare the
+            // two layouts by the Windows size after the cleanup:
+            // - merge: Windows fills the front and later absorbs the staging extent, while a data
+            //   volume is created behind the staging extent right away;
+            // - recipient: a small data volume in front of the staging extent absorbs it (and
+            //   the free tail) later, and Windows keeps only the front minus that volume.
+            let tail_joins_windows = back_length < MIN_USEFUL_DATA_BYTES;
+            let merged_windows =
+                before
+                    .saturating_add(staging_length_bytes)
+                    .saturating_add(if tail_joins_windows {
+                        disk_end.saturating_sub(staging_end)
+                    } else {
+                        0
+                    });
+            let recipient_windows =
+                before
+                    .checked_sub(STAGING_RECIPIENT_DATA_BYTES)
+                    .filter(|windows| {
+                        *windows >= windows_minimum_bytes.max(WINDOWS_PREFERRED_FLOOR_BYTES)
+                    });
+            let merge = recipient_windows.is_none_or(|windows| {
+                desired.abs_diff(merged_windows) <= desired.abs_diff(windows)
+            });
+            if merge {
+                let mut layout = plan_layout(
+                    style,
+                    FullDiskRole::Windows,
+                    staging_offset_bytes,
+                    windows_minimum_bytes,
+                    u64::MAX,
+                    0,
+                )?;
+                if !tail_joins_windows {
+                    layout.push(PlannedPartition {
+                        offset_bytes: back_start,
+                        length_bytes: back_length,
+                        role: PlannedPartitionRole::Data,
+                    });
+                }
+                return Ok(layout);
+            }
+        }
+        return plan_layout(
+            style,
+            FullDiskRole::Windows,
+            staging_offset_bytes,
+            windows_minimum_bytes,
+            desired,
+            disk_end - staging_offset_bytes,
+        );
+    }
+
+    // The front cannot hold the boot partitions plus the Windows minimum (for example an existing
+    // data volume at the start of the disk was used for staging). UEFI and BIOS boot do not
+    // require the boot partitions to be first, so plan them and Windows behind the staging extent.
+    let mut layout = Vec::new();
+    let front_data = staging_offset_bytes.saturating_sub(MIB);
+    if front_data >= MIN_USEFUL_DATA_BYTES {
+        // Keeps the front usable and receives the staging extent during the cleanup.
+        layout.push(PlannedPartition {
+            offset_bytes: MIB,
+            length_bytes: front_data,
+            role: PlannedPartitionRole::Data,
+        });
+    }
+    layout.extend(plan_layout_from(
+        style,
+        FullDiskRole::Windows,
+        back_start,
+        disk_end,
+        windows_minimum_bytes,
+        desired,
+        0,
+    )?);
+    Ok(layout)
+}
+
+fn plan_data_disk_around_staging(
+    style: RequestedPartitionStyle,
+    staging_offset_bytes: u64,
+    back_start: u64,
+    disk_end: u64,
+) -> Result<Vec<PlannedPartition>, CustomInstallPlanError> {
+    let msr = match style {
+        RequestedPartitionStyle::Gpt => MSR_WINDOWS_7_MINIMUM_BYTES,
+        RequestedPartitionStyle::Mbr => 0,
+    };
+    let front_holds_data = staging_offset_bytes
+        .checked_sub(MIB)
+        .and_then(|value| value.checked_sub(msr))
+        .is_some_and(|value| value >= MIN_USEFUL_DATA_BYTES);
+    if front_holds_data {
+        // The data volume ends at the staging extent and absorbs it (and the free tail) later.
+        return plan_layout(
+            style,
+            FullDiskRole::Data,
+            staging_offset_bytes,
+            0,
+            u64::MAX,
+            0,
+        );
+    }
+    let mut layout = Vec::new();
+    let mut cursor = back_start;
+    if msr != 0 {
+        let msr_fits_in_front = MIB
+            .checked_add(msr)
+            .is_some_and(|end| end <= staging_offset_bytes);
+        if msr_fits_in_front {
+            layout.push(PlannedPartition {
+                offset_bytes: MIB,
+                length_bytes: msr,
+                role: PlannedPartitionRole::MicrosoftReserved,
+            });
+        } else {
+            layout.push(PlannedPartition {
+                offset_bytes: cursor,
+                length_bytes: msr,
+                role: PlannedPartitionRole::MicrosoftReserved,
+            });
+            cursor = cursor
+                .checked_add(msr)
+                .ok_or(CustomInstallPlanError::InvalidDiskCapacity)?;
+        }
+    }
+    let length = disk_end
+        .checked_sub(cursor)
+        .ok_or(CustomInstallPlanError::InvalidDiskCapacity)?;
+    if length < MIN_USEFUL_DATA_BYTES {
+        return Err(CustomInstallPlanError::InvalidDiskCapacity);
+    }
+    layout.push(PlannedPartition {
+        offset_bytes: cursor,
+        length_bytes: length,
+        role: PlannedPartitionRole::Data,
+    });
+    Ok(layout)
+}
+
+fn plan_layout_from(
+    style: RequestedPartitionStyle,
+    role: FullDiskRole,
+    start_bytes: u64,
+    usable_end_bytes: u64,
+    windows_minimum_bytes: u64,
+    desired_windows_bytes: u64,
+    reclaimable_after_bytes: u64,
+) -> Result<Vec<PlannedPartition>, CustomInstallPlanError> {
     // `usable_end_bytes` is either the provider's current disk capacity or the exact start of an
     // existing staging extent.  Flooring it to a whole MiB discards legal provider space and can
     // reject a disk that fits the exact image requirement by less than one cosmetic alignment
     // unit.  Keep the real boundary; only the initial placement remains a 1 MiB preference.
     let limit = usable_end_bytes;
-    let mut cursor = MIB;
+    let mut cursor = start_bytes;
     let mut output = Vec::new();
     if role == FullDiskRole::Data {
         // Microsoft requires an MSR on every GPT disk. A data-only GPT disk has no ESP, so its
@@ -338,7 +583,10 @@ fn plan_layout(
             )),
         ],
         RequestedPartitionStyle::Mbr => [
-            Some((550 * MIB, PlannedPartitionRole::SystemReserved)),
+            Some((
+                MBR_SYSTEM_RESERVED_BYTES,
+                PlannedPartitionRole::SystemReserved,
+            )),
             None,
         ],
     };
@@ -1085,6 +1333,238 @@ mod tests {
         assert!(!small
             .iter()
             .any(|partition| partition.role == PlannedPartitionRole::Data));
+    }
+
+    fn role_of(layout: &[PlannedPartition], role: PlannedPartitionRole) -> PlannedPartition {
+        *layout
+            .iter()
+            .find(|partition| partition.role == role)
+            .expect("planned role is present")
+    }
+
+    fn assert_ordered_and_clear_of_staging(layout: &[PlannedPartition], offset: u64, end: u64) {
+        assert!(layout
+            .windows(2)
+            .all(|pair| { pair[0].offset_bytes + pair[0].length_bytes <= pair[1].offset_bytes }));
+        assert!(layout.iter().all(|partition| {
+            partition.offset_bytes + partition.length_bytes <= offset
+                || partition.offset_bytes >= end
+        }));
+    }
+
+    #[test]
+    fn staging_carved_from_the_old_system_volume_gives_that_boundary_back_to_windows() {
+        // Reported layout: 953.87-GiB disk, the old C: ended at about 200 GiB and the 8.6-GiB
+        // staging volume was shrunk from its end. The previous planner produced C: 187.1 GiB and
+        // D: 4.25 GiB in front of the staging volume and left 753.5 GiB unallocated behind it.
+        let disk = 953 * GIB + 890 * MIB;
+        let windows_start = MIB + ESP_4KN_MINIMUM_BYTES + MSR_WINDOWS_7_MINIMUM_BYTES;
+        let staging_offset = windows_start + 191 * GIB + 360 * MIB;
+        let staging_length = 8 * GIB + 616 * MIB;
+        let staging_end = staging_offset + staging_length;
+        let layout = plan_full_disk_layout_around_staging(
+            RequestedPartitionStyle::Gpt,
+            FullDiskRole::Windows,
+            disk,
+            staging_offset,
+            staging_length,
+            12 * GIB,
+        )
+        .unwrap();
+        assert_eq!(
+            layout
+                .iter()
+                .map(|partition| partition.role)
+                .collect::<Vec<_>>(),
+            vec![
+                PlannedPartitionRole::EfiSystem,
+                PlannedPartitionRole::MicrosoftReserved,
+                PlannedPartitionRole::Windows,
+                PlannedPartitionRole::Data,
+            ]
+        );
+        assert_ordered_and_clear_of_staging(&layout, staging_offset, staging_end);
+        let windows = role_of(&layout, PlannedPartitionRole::Windows);
+        assert_eq!(windows.offset_bytes + windows.length_bytes, staging_offset);
+        // After the cleanup Windows ends where the old system volume ended.
+        let final_windows = windows.length_bytes + staging_length;
+        assert!(final_windows.abs_diff(FULL_DISK_WINDOWS_DEFAULT_BYTES) < GIB);
+        let data = role_of(&layout, PlannedPartitionRole::Data);
+        assert!(data.offset_bytes >= staging_end);
+        assert_eq!(data.offset_bytes + data.length_bytes, disk);
+        assert!(data.length_bytes > 750 * GIB);
+    }
+
+    #[test]
+    fn large_staging_volume_keeps_a_recipient_data_volume_in_front() {
+        // An old data volume that reaches the disk end was used for staging. Merging it into
+        // Windows would produce a ~930-GiB system volume, so a small data volume receives it.
+        let disk = 931 * GIB;
+        let staging_offset = 200 * GIB;
+        let layout = plan_full_disk_layout_around_staging(
+            RequestedPartitionStyle::Gpt,
+            FullDiskRole::Windows,
+            disk,
+            staging_offset,
+            disk - staging_offset,
+            12 * GIB,
+        )
+        .unwrap();
+        let data = *layout.last().unwrap();
+        assert_eq!(data.role, PlannedPartitionRole::Data);
+        assert_eq!(data.length_bytes, STAGING_RECIPIENT_DATA_BYTES);
+        assert_eq!(data.offset_bytes + data.length_bytes, staging_offset);
+        assert!(layout
+            .iter()
+            .all(|partition| partition.offset_bytes < staging_offset));
+    }
+
+    #[test]
+    fn roomy_front_keeps_the_automatic_windows_size_and_a_recipient_data_volume() {
+        let disk = 931 * GIB;
+        let staging_offset = 700 * GIB;
+        let layout = plan_full_disk_layout_around_staging(
+            RequestedPartitionStyle::Gpt,
+            FullDiskRole::Windows,
+            disk,
+            staging_offset,
+            10 * GIB,
+            12 * GIB,
+        )
+        .unwrap();
+        assert_eq!(
+            role_of(&layout, PlannedPartitionRole::Windows).length_bytes,
+            FULL_DISK_WINDOWS_DEFAULT_BYTES
+        );
+        let data = *layout.last().unwrap();
+        assert_eq!(data.role, PlannedPartitionRole::Data);
+        assert_eq!(data.offset_bytes + data.length_bytes, staging_offset);
+    }
+
+    #[test]
+    fn small_disk_with_staging_still_becomes_one_windows_volume() {
+        let layout = plan_full_disk_layout_around_staging(
+            RequestedPartitionStyle::Gpt,
+            FullDiskRole::Windows,
+            238 * GIB,
+            100 * GIB,
+            10 * GIB,
+            12 * GIB,
+        )
+        .unwrap();
+        assert!(!layout
+            .iter()
+            .any(|partition| partition.role == PlannedPartitionRole::Data));
+        let windows = role_of(&layout, PlannedPartitionRole::Windows);
+        assert_eq!(windows.offset_bytes + windows.length_bytes, 100 * GIB);
+    }
+
+    #[test]
+    fn staging_at_the_disk_start_moves_boot_partitions_and_windows_behind_it() {
+        // Existing data volume directly behind an old 16-MiB MSR was used for staging.
+        let disk = 476 * GIB;
+        let staging_offset = 17 * MIB;
+        let staging_length = 20 * GIB;
+        let staging_end = staging_offset + staging_length;
+        for style in [RequestedPartitionStyle::Gpt, RequestedPartitionStyle::Mbr] {
+            let layout = plan_full_disk_layout_around_staging(
+                style,
+                FullDiskRole::Windows,
+                disk,
+                staging_offset,
+                staging_length,
+                24 * GIB,
+            )
+            .unwrap();
+            assert_ordered_and_clear_of_staging(&layout, staging_offset, staging_end);
+            assert!(layout
+                .iter()
+                .all(|partition| partition.offset_bytes >= staging_end));
+            assert_eq!(
+                role_of(&layout, PlannedPartitionRole::Windows).length_bytes,
+                FULL_DISK_WINDOWS_DEFAULT_BYTES
+            );
+            let data = *layout.last().unwrap();
+            assert_eq!(data.role, PlannedPartitionRole::Data);
+            assert_eq!(data.offset_bytes + data.length_bytes, disk);
+        }
+
+        // A usable front becomes a data volume that later receives the staging extent.
+        let layout = plan_full_disk_layout_around_staging(
+            RequestedPartitionStyle::Gpt,
+            FullDiskRole::Windows,
+            disk,
+            10 * GIB,
+            20 * GIB,
+            24 * GIB,
+        )
+        .unwrap();
+        assert_eq!(layout[0].role, PlannedPartitionRole::Data);
+        assert_eq!(layout[0].offset_bytes + layout[0].length_bytes, 10 * GIB);
+        assert_ordered_and_clear_of_staging(&layout, 10 * GIB, 30 * GIB);
+    }
+
+    #[test]
+    fn data_disk_with_staging_at_its_start_places_the_data_volume_behind_it() {
+        let layout = plan_full_disk_layout_around_staging(
+            RequestedPartitionStyle::Gpt,
+            FullDiskRole::Data,
+            100 * GIB,
+            17 * MIB,
+            30 * GIB,
+            24 * GIB,
+        )
+        .unwrap();
+        assert_eq!(
+            layout
+                .iter()
+                .map(|partition| partition.role)
+                .collect::<Vec<_>>(),
+            vec![
+                PlannedPartitionRole::MicrosoftReserved,
+                PlannedPartitionRole::Data,
+            ]
+        );
+        assert_ordered_and_clear_of_staging(&layout, 17 * MIB, 17 * MIB + 30 * GIB);
+        assert_eq!(layout[1].offset_bytes + layout[1].length_bytes, 100 * GIB);
+
+        let front = plan_full_disk_layout_around_staging(
+            RequestedPartitionStyle::Gpt,
+            FullDiskRole::Data,
+            100 * GIB,
+            40 * GIB,
+            30 * GIB,
+            24 * GIB,
+        )
+        .unwrap();
+        let data = *front.last().unwrap();
+        assert_eq!(data.offset_bytes + data.length_bytes, 40 * GIB);
+    }
+
+    #[test]
+    fn staging_aware_layout_rejects_only_a_truly_impossible_disk() {
+        assert_eq!(
+            plan_full_disk_layout_around_staging(
+                RequestedPartitionStyle::Gpt,
+                FullDiskRole::Windows,
+                64 * GIB,
+                10 * GIB,
+                40 * GIB,
+                30 * GIB,
+            ),
+            Err(CustomInstallPlanError::InvalidDiskCapacity)
+        );
+        assert_eq!(
+            plan_full_disk_layout_around_staging(
+                RequestedPartitionStyle::Gpt,
+                FullDiskRole::Windows,
+                64 * GIB,
+                0,
+                40 * GIB,
+                30 * GIB,
+            ),
+            Err(CustomInstallPlanError::InvalidPreservedStaging)
+        );
     }
 
     #[test]

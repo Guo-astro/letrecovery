@@ -2647,6 +2647,7 @@
         "系统已安装，但没有确认到硬盘控制器驱动（常见于 Intel VMD）。如果新系统开机蓝屏或反复进入自动修复，请进入 BIOS 关闭 VMD（改为 AHCI）后再启动：{}": "The system is installed, but no disk-controller driver could be confirmed (common with Intel VMD). If the new system shows a blue screen or keeps entering Automatic Repair, disable VMD in the BIOS (switch to AHCI) and boot again: {}",
         "系统已安装完成，但本次会话清理未完成；请手动重启后处理残留临时文件: {}": "The system has been installed, but this session's cleanup did not finish; restart manually and remove the leftover temporary files: {}",
         "系统已安装完成，但临时分区未能清理；请手动重启后处理: {}": "The system has been installed, but the temporary partition could not be cleaned up; restart manually and handle it: {}",
+        "全盘重装时有可选的数据分区未能创建，对应空间保持未分配，可在新系统的磁盘管理中新建分区: {}": "Some optional data partitions could not be created during the full-disk reinstall; that space stays unallocated and can be partitioned in Disk Management of the new system: {}",
         "PE 任务认证失败，尚未扫描或修改磁盘。请返回正常系统端重新创建任务。\r\n\r\n{}": "PE task authentication failed; no disk has been scanned or modified. Return to the normal system and create the task again.\r\n\r\n{}",
         "备份任务认证失效: {}": "The backup task authentication is no longer valid: {}",
         "正在读取并验证备份任务...": "Reading and verifying the backup task...",

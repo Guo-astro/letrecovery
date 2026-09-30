@@ -712,6 +712,7 @@ fn fail_install_before_destructive_write(
     if let Err(error) = crate::cleanup_persistent_pe_boot_payload(task.guard()) {
         rollback_errors.push(format!("PE 启动项/私有载荷清理失败: {error:#}"));
     }
+    let staging_hint = task.data_volume_identity();
     match task.into_prewrite_cleanup_authorization() {
         Ok(auto_staging) => {
             if let Some(rollback) = dual_rollback {
@@ -728,6 +729,7 @@ fn fail_install_before_destructive_write(
                 if let Err(error) =
                     crate::core::disk::DiskManager::cleanup_authenticated_auto_staging(
                         &authorization,
+                        Some(staging_hint),
                     )
                 {
                     rollback_errors.push(format!("自动暂存卷回退失败: {error:#}"));
@@ -1022,6 +1024,7 @@ fn execute_install_workflow(
         }
     };
     let mut full_disk_staging_cleanup = None;
+    let mut full_disk_layout_warnings: Vec<String> = Vec::new();
     let public_data_root = authenticated_task.data_volume_root().to_path_buf();
     let data_partition = public_data_root
         .to_string_lossy()
@@ -1512,6 +1515,7 @@ fn execute_install_workflow(
                 target_partition = target.partition;
                 expected_target = target.identity;
                 full_disk_staging_cleanup = target.staging_cleanup;
+                full_disk_layout_warnings = target.layout_warnings;
             }
             Err(error) => {
                 log::error!(
@@ -1821,11 +1825,21 @@ fn execute_install_workflow(
                 return;
             }
         }
+        // The locked XP source tree lives on the staging volume. Release every handle on it
+        // before that volume is deleted by the cleanup below.
+        drop(locked_xp_source);
         terminal_log.mark_target_system_available();
         let _ = tx.send(WorkerMessage::SetInstallStep(InstallStep::Cleanup));
         let mut cleanup_warning = None;
+        if !full_disk_layout_warnings.is_empty() {
+            cleanup_warning = Some(tr!(
+                "全盘重装时有可选的数据分区未能创建，对应空间保持未分配，可在新系统的磁盘管理中新建分区: {}",
+                full_disk_layout_warnings.join("; ")
+            ));
+        }
         authenticated_task.remove_scatter_payload();
         remove_reassembled_image(&target_partition);
+        let staging_hint = authenticated_task.data_volume_identity();
         let auto_staging = match authenticated_task.into_install_cleanup_authorization() {
             Ok(authorization) => authorization,
             Err(error) => {
@@ -1848,12 +1862,15 @@ fn execute_install_workflow(
                     );
                     cleanup_warning = Some(tr!(
                         "XP/2003 系统已安装完成，但临时分区未能清理；请手动重启后处理: {}",
-                        error
+                        format!("{error:#}")
                     ));
                 }
             }
         } else if let Some(authorization) = auto_staging {
-            match DiskManager::cleanup_authenticated_auto_staging(&authorization) {
+            match DiskManager::cleanup_authenticated_auto_staging(
+                &authorization,
+                Some(staging_hint),
+            ) {
                 Ok(_) => {}
                 Err(error) => {
                     log::warn!(
@@ -1861,7 +1878,7 @@ fn execute_install_workflow(
                     );
                     cleanup_warning = Some(tr!(
                         "XP/2003 系统已安装完成，但临时分区未能清理；请手动重启后处理: {}",
-                        error
+                        format!("{error:#}")
                     ));
                 }
             }
@@ -1978,6 +1995,12 @@ fn execute_install_workflow(
     let _ = tx.send(WorkerMessage::SetProgress(100));
 
     let mut completion_warnings = Vec::new();
+    if !full_disk_layout_warnings.is_empty() {
+        completion_warnings.push(tr!(
+            "全盘重装时有可选的数据分区未能创建，对应空间保持未分配，可在新系统的磁盘管理中新建分区: {}",
+            full_disk_layout_warnings.join("; ")
+        ));
+    }
     // A boot-path coverage failure is discovered after the image has already been applied. Keep
     // it pending while the workflow completes BCDBoot and the minimum offline-system setup; only
     // then publish a terminal failure and preserve the authenticated staging data for recovery.
@@ -2703,6 +2726,7 @@ fn execute_install_workflow(
     let mut cleanup_verified = true;
     authenticated_task.remove_scatter_payload();
     remove_reassembled_image(&target_partition);
+    let staging_hint = authenticated_task.data_volume_identity();
     let auto_staging = match authenticated_task.into_install_cleanup_authorization() {
         Ok(authorization) => authorization,
         Err(error) => {
@@ -2729,13 +2753,13 @@ fn execute_install_workflow(
                 );
                 completion_warnings.push(tr!(
                     "系统已安装完成，但临时分区未能清理；请手动重启后处理: {}",
-                    error
+                    format!("{error:#}")
                 ));
                 cleanup_verified = false;
             }
         }
     } else if let Some(authorization) = auto_staging {
-        match DiskManager::cleanup_authenticated_auto_staging(&authorization) {
+        match DiskManager::cleanup_authenticated_auto_staging(&authorization, Some(staging_hint)) {
             Ok(_) => {}
             Err(error) => {
                 log::warn!(
@@ -2743,7 +2767,7 @@ fn execute_install_workflow(
                 );
                 completion_warnings.push(tr!(
                     "系统已安装完成，但临时分区未能清理；请手动重启后处理: {}",
-                    error
+                    format!("{error:#}")
                 ));
                 cleanup_verified = false;
             }

@@ -5278,24 +5278,38 @@ impl ProductionInstallBackend {
                 });
             lr_core::custom_install::validate_full_disk_plan(plan)
                 .map_err(|error| Self::error("validate_full_disk_staging_plan", error))?;
-            // PE rebuilds a disk that also holds the staging volume only in front of that volume.
-            // Check that range now, in normal Windows, instead of failing after the reboot.
+            // PE rebuilds a disk that also holds the staging volume around that volume (in front of
+            // it and, when needed, behind it). Check the same staging-aware layout now, in normal
+            // Windows, instead of failing after the reboot.
             if let Some(staging_disk) = plan
                 .disks
                 .iter()
                 .find(|disk| disk.diagnostic_disk_number == staging.disk_number)
             {
-                lr_core::custom_install::plan_full_disk_layout(
+                let staging_end = staging
+                    .offset_bytes
+                    .saturating_add(staging.extent_length_bytes);
+                // A capacity query failure only makes this pre-check conservative (nothing is
+                // planned behind the staging volume); PE plans again with its own reading.
+                let disk_capacity =
+                    lr_core::windows_storage::disk_layout_snapshot(staging.disk_number)
+                        .map(|snapshot| snapshot.disk_size_bytes)
+                        .or_else(|_| lr_core::windows_storage::vds_disk_size(staging.disk_number))
+                        .unwrap_or(staging_end)
+                        .max(staging_end);
+                lr_core::custom_install::plan_full_disk_layout_around_staging(
                     staging_disk.style,
                     staging_disk.role,
+                    disk_capacity,
                     staging.offset_bytes,
+                    staging.extent_length_bytes,
                     plan.windows_partition_bytes,
                 )
                 .map_err(|error| {
                     InstallBackendError::new(
                         "full_disk_staging_leaves_no_room",
                         format!(
-                            "安装文件暂存分区位于要清空的硬盘上，它前面的空间不足以建立新的系统分区（{error}）。请把安装文件暂存到其它硬盘或 U 盘后再试"
+                            "安装文件暂存分区位于要清空的硬盘上，除去暂存分区后剩余空间不足以建立新的系统分区（{error}）。请把安装文件暂存到其它硬盘或 U 盘后再试"
                         ),
                     )
                 })?;

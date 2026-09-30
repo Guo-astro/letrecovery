@@ -165,115 +165,217 @@ impl DiskManager {
         Ok((extent, root))
     }
 
-    /// Resolve the current unique drive letter for a canonical extent.  Drive letters are output
-    /// aliases only: authorization is established by `resolve_canonical_volume_root`, and every
-    /// candidate letter is compared with that exact extent before it is returned.
-    pub fn resolve_canonical_drive_letter(
-        canonical: &lr_core::install_handoff::CanonicalInstallTargetV2,
-    ) -> Result<char> {
-        let (expected, _) = Self::resolve_canonical_volume_root(canonical)?;
-        let matches = (b'A'..=b'Z')
-            .filter_map(|value| {
-                let letter = value as char;
-                lr_core::windows_storage::volume_identity(letter)
-                    .ok()
-                    .filter(|actual| {
-                        lr_core::windows_storage::same_volume_identity(*actual, expected)
-                    })
-                    .map(|_| letter)
-            })
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [letter] => Ok(*letter),
-            [] => anyhow::bail!("canonical handoff extent has no current drive-letter access path"),
-            _ => anyhow::bail!(
-                "canonical handoff extent has multiple drive-letter access paths: {:?}",
-                matches
-            ),
-        }
-    }
-
     /// Delete only the manifest-authenticated temporary extent and return the complete
     /// provider-reclaimed tail (including legal free gaps on either side of the temporary
     /// partition) to the authenticated source's exact pre-shrink boundary.
-    /// No marker or drive-letter scan participates in
-    /// authorization; both full canonical layouts are rechecked immediately before the checked
-    /// topology mutation.
+    ///
+    /// The work is retried with a fresh view of the disk, and every attempt resumes where an
+    /// earlier one stopped (temporary partition already deleted, source already extended).
+    /// `staging_hint` is the temporary volume's extent as located through this session's random
+    /// data marker. It binds the disk when unrelated layout details (for example an MBR active flag
+    /// written by BCDBoot) no longer match the normal-endpoint digest; the exact source and
+    /// temporary extents and GPT partition IDs are still verified.
     pub fn cleanup_authenticated_auto_staging(
         authorization: &lr_core::handoff_manifest::AutoStagingAuthorization,
+        staging_hint: Option<lr_core::windows_storage::VolumeIdentity>,
     ) -> Result<lr_core::windows_storage::VolumeIdentity> {
-        let (source_extent, _) = Self::resolve_canonical_volume_root(&authorization.source)?;
-        let (temporary_extent, _) = Self::resolve_canonical_volume_root(&authorization.temporary)?;
-        if source_extent.disk_number != temporary_extent.disk_number {
-            anyhow::bail!("authenticated auto-staging extents are on different disks");
+        use crate::core::custom_install::{
+            post_install_cleanup_retry_delay, POST_INSTALL_CLEANUP_ATTEMPTS,
+        };
+        let mut last_error = None;
+        for attempt in 1..=POST_INSTALL_CLEANUP_ATTEMPTS {
+            match Self::cleanup_auto_staging_attempt(authorization, staging_hint) {
+                Ok(identity) => {
+                    log::info!(
+                        "[AUTO STAGING] temporary staging cleanup completed on attempt {attempt}/{POST_INSTALL_CLEANUP_ATTEMPTS}"
+                    );
+                    return Ok(identity);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[AUTO STAGING] temporary staging cleanup attempt {attempt}/{POST_INSTALL_CLEANUP_ATTEMPTS} failed: {error:#}"
+                    );
+                    last_error = Some(error);
+                    if attempt < POST_INSTALL_CLEANUP_ATTEMPTS {
+                        std::thread::sleep(post_install_cleanup_retry_delay(attempt));
+                    }
+                }
+            }
         }
-        let source_end = source_extent
-            .offset_bytes
-            .checked_add(source_extent.extent_length_bytes)
-            .ok_or_else(|| anyhow::anyhow!("authenticated source extent end overflows"))?;
-        if source_end > temporary_extent.offset_bytes {
-            anyhow::bail!("authenticated temporary extent overlaps the source extent");
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("temporary staging cleanup did not run")))
+    }
+
+    fn gpt_partition_id_matches(
+        partition: &lr_core::windows_storage::DiskLayoutPartitionSnapshot,
+        expected: Option<[u8; 16]>,
+    ) -> bool {
+        match (expected, partition.token) {
+            (
+                Some(expected),
+                lr_core::windows_storage::DiskLayoutPartitionToken::Gpt { partition_id, .. },
+            ) => expected == partition_id,
+            (None, lr_core::windows_storage::DiskLayoutPartitionToken::Mbr { .. }) => true,
+            _ => false,
         }
-        let layout = lr_core::windows_storage::disk_layout_snapshot(source_extent.disk_number)?;
-        if !authorization.source.matches_snapshot(&layout)
-            || !authorization.temporary.matches_snapshot(&layout)
+    }
+
+    fn bind_auto_staging_disk(
+        authorization: &lr_core::handoff_manifest::AutoStagingAuthorization,
+        staging_hint: Option<lr_core::windows_storage::VolumeIdentity>,
+    ) -> Result<u32> {
+        let error = match Self::resolve_canonical_volume_root(&authorization.source) {
+            Ok((extent, _)) => return Ok(extent.disk_number),
+            Err(error) => error,
+        };
+        let Some(hint) = staging_hint else {
+            return Err(error).context("bind the automatic staging disk");
+        };
+        log::warn!(
+            "[AUTO STAGING] the normal-endpoint layout digest no longer matches; binding the disk through this session's data marker: {error:#}"
+        );
+        if hint.offset_bytes != authorization.temporary.partition_offset_bytes
+            || hint.extent_length_bytes != authorization.temporary.partition_length_bytes
         {
-            anyhow::bail!("disk layout changed before authenticated staging cleanup");
+            anyhow::bail!("the session data marker is not on the authenticated temporary extent");
         }
+        let layout = lr_core::windows_storage::disk_layout_snapshot(hint.disk_number)
+            .context("read the automatic staging disk")?;
+        let source_matches = layout.partitions.iter().any(|partition| {
+            partition.offset_bytes == authorization.source.partition_offset_bytes
+                && Self::gpt_partition_id_matches(partition, authorization.source.gpt_partition_id)
+        });
+        if !source_matches {
+            anyhow::bail!("the authenticated source extent is absent from the marker disk");
+        }
+        Ok(hint.disk_number)
+    }
+
+    fn resolve_partition_letter(
+        disk_number: u32,
+        offset_bytes: u64,
+    ) -> Result<(char, lr_core::windows_storage::VolumeIdentity)> {
+        let letters = lr_core::windows_storage::assigned_drive_letters_for_partition(
+            disk_number,
+            offset_bytes,
+        )
+        .context("find the current drive letter of the automatic staging source")?;
+        for letter in letters {
+            if let Ok(identity) = lr_core::windows_storage::volume_identity(letter) {
+                if identity.disk_number == disk_number && identity.offset_bytes == offset_bytes {
+                    return Ok((letter, identity));
+                }
+            }
+        }
+        anyhow::bail!("the automatic staging source volume has no current drive letter")
+    }
+
+    fn cleanup_auto_staging_attempt(
+        authorization: &lr_core::handoff_manifest::AutoStagingAuthorization,
+        staging_hint: Option<lr_core::windows_storage::VolumeIdentity>,
+    ) -> Result<lr_core::windows_storage::VolumeIdentity> {
         let reclaim_length = authorization.reclaim_length_bytes()?;
-        let original_source_end = source_extent
-            .offset_bytes
+        let source_offset = authorization.source.partition_offset_bytes;
+        let temporary_offset = authorization.temporary.partition_offset_bytes;
+        let temporary_length = authorization.temporary.partition_length_bytes;
+        let temporary_end = temporary_offset
+            .checked_add(temporary_length)
+            .ok_or_else(|| anyhow::anyhow!("authenticated temporary extent end overflows"))?;
+        let original_source_end = source_offset
             .checked_add(authorization.source_length_before_bytes)
             .ok_or_else(|| anyhow::anyhow!("authenticated original source extent end overflows"))?;
-        let temporary_end = temporary_extent
+        let disk_number = Self::bind_auto_staging_disk(authorization, staging_hint)?;
+
+        // Only the start of the source extent must match: an earlier attempt may already have
+        // returned part or all of the temporary space.
+        let (source_letter, source) = Self::resolve_partition_letter(disk_number, source_offset)?;
+        let source_end = source
             .offset_bytes
-            .checked_add(temporary_extent.extent_length_bytes)
-            .ok_or_else(|| anyhow::anyhow!("authenticated temporary extent end overflows"))?;
-        let current_free =
-            lr_core::windows_storage::current_free_extents(source_extent.disk_number)?;
-        let range_is_free = |start: u64, end: u64| {
-            start == end
-                || current_free.iter().any(|extent| {
-                    extent.offset_bytes <= start
-                        && extent
-                            .offset_bytes
-                            .checked_add(extent.length_bytes)
-                            .is_some_and(|free_end| free_end >= end)
-                })
-        };
-        let gap_length = temporary_extent
-            .offset_bytes
-            .checked_sub(source_end)
-            .ok_or_else(|| anyhow::anyhow!("authenticated staging gap underflows"))?;
-        if gap_length != 0 && !range_is_free(source_end, temporary_extent.offset_bytes) {
-            anyhow::bail!(
-                "provider no longer reports the authenticated gap before staging as free"
+            .checked_add(source.extent_length_bytes)
+            .ok_or_else(|| anyhow::anyhow!("authenticated source extent end overflows"))?;
+        if source_end >= original_source_end {
+            log::info!("[AUTO STAGING] {source_letter}: already has its original extent back");
+            return Ok(source);
+        }
+        if source_end > temporary_offset {
+            anyhow::bail!("the source volume overlaps the authenticated temporary extent");
+        }
+
+        let layout = lr_core::windows_storage::disk_layout_snapshot(disk_number)
+            .context("read the automatic staging disk before cleanup")?;
+        let mut temporary_present = false;
+        for partition in &layout.partitions {
+            if partition.offset_bytes == source_offset || partition.size_bytes == 0 {
+                continue;
+            }
+            if partition.offset_bytes == temporary_offset
+                && partition.size_bytes == temporary_length
+                && Self::gpt_partition_id_matches(
+                    partition,
+                    authorization.temporary.gpt_partition_id,
+                )
+            {
+                temporary_present = true;
+                continue;
+            }
+            if crate::core::custom_install::is_mbr_container(partition)
+                && crate::core::custom_install::partition_contains_range(
+                    partition,
+                    temporary_offset,
+                    temporary_end,
+                )
+            {
+                continue;
+            }
+            let overlaps = lr_core::custom_install::ranges_overlap(
+                partition.offset_bytes,
+                partition.size_bytes,
+                source_end,
+                original_source_end - source_end,
+            )
+            .unwrap_or(true);
+            if overlaps {
+                anyhow::bail!(
+                    "a partition that this task did not create lies inside the source's original extent"
+                );
+            }
+        }
+        if temporary_present {
+            crate::core::custom_install::delete_disposable_partition(disk_number, temporary_offset)
+                .context("delete the authenticated temporary staging partition")?;
+        } else {
+            log::info!(
+                "[AUTO STAGING] the temporary staging partition is already gone; continuing with the source extension"
             );
         }
-        if !range_is_free(temporary_end, original_source_end) {
-            anyhow::bail!("provider no longer reports the authenticated gap after staging as free");
-        }
-        let target_letter = Self::resolve_canonical_drive_letter(&authorization.source)?;
-        let target_identity = lr_core::windows_storage::stable_volume_identity(target_letter)?;
-        if !lr_core::windows_storage::same_volume_identity(target_identity.extent, source_extent) {
-            anyhow::bail!("authenticated source volume changed before staging cleanup");
-        }
-        lr_core::windows_storage::delete_partition_checked(
-            temporary_extent.disk_number,
-            temporary_extent.offset_bytes,
-            true,
-            &layout,
+        crate::core::custom_install::delete_empty_mbr_containers_over(
+            disk_number,
+            temporary_offset,
+            temporary_end,
         )?;
-        lr_core::windows_storage::extend_volume_stable_checked(
-            target_letter,
-            target_identity,
-            reclaim_length,
-        )?;
-        let expected_length = authorization.source_length_before_bytes;
-        let actual = lr_core::windows_storage::volume_identity(target_letter)?;
-        if actual.disk_number != source_extent.disk_number
-            || actual.offset_bytes != source_extent.offset_bytes
-            || actual.extent_length_bytes != expected_length
+        let authorized_end = lr_core::windows_storage::adjacent_free_end_after_volume(source)
+            .context("read the free range behind the automatic staging source")?;
+        if authorized_end < original_source_end {
+            anyhow::bail!("the original source extent is not completely free after the cleanup");
+        }
+        log::info!(
+            "[AUTO STAGING] returning {} bytes to {source_letter}: (authenticated reclaim {} bytes)",
+            original_source_end - source_end,
+            reclaim_length
+        );
+        lr_core::windows_storage::extend_volume_checked(
+            source_letter,
+            source,
+            original_source_end - source_end,
+        )
+        .context("return the temporary staging space to the source volume")?;
+        let actual = lr_core::windows_storage::volume_identity(source_letter)?;
+        let actual_end = actual
+            .offset_bytes
+            .checked_add(actual.extent_length_bytes)
+            .ok_or_else(|| anyhow::anyhow!("final source extent end overflows"))?;
+        if actual.disk_number != disk_number
+            || actual.offset_bytes != source_offset
+            || actual_end < original_source_end
         {
             anyhow::bail!(
                 "temporary extent was removed but final source extent readback is inconsistent"

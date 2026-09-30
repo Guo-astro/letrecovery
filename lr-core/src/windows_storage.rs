@@ -6490,6 +6490,7 @@ mod platform {
             observed.created.offset_bytes,
             false,
             Some(&current),
+            false,
         )
     }
 
@@ -6864,6 +6865,7 @@ mod platform {
         offset_bytes: u64,
         force_protected: bool,
         expected: Option<&DiskLayoutSnapshot>,
+        disposable: bool,
     ) -> Result<(), StorageError> {
         if offset_bytes == 0 {
             return Err(StorageError::new(
@@ -6872,7 +6874,16 @@ mod platform {
             ));
         }
         let vds = Vds::connect()?;
-        vds.refresh()?;
+        if let Err(error) = vds.refresh() {
+            if !disposable {
+                return Err(error);
+            }
+            // The canonical IOCTL snapshot below remains the authorization gate. A failed VDS
+            // cache refresh only means the provider answers from its current cache.
+            log::warn!(
+                "[STORAGE] VDS refresh before a disposable partition deletion failed; canonical verification continues: {error}"
+            );
+        }
         if let Some(expected) = expected {
             verify_disk_layout_snapshot(
                 disk_number,
@@ -6888,11 +6899,23 @@ mod platform {
         let result = (Interface::vtable(&advanced).DeletePartition)(
             Interface::as_raw(&advanced),
             offset_bytes,
-            BOOL::from(false),
+            // bForce: a disposable extent (post-install staging, or a partition of a disk the user
+            // confirmed for a complete wipe) must not survive only because some process still has
+            // a handle open on its volume. VDS then dismounts that volume itself.
+            BOOL::from(disposable),
             BOOL::from(force_protected),
         );
         let warning = classify_delete_partition_result(result)?;
-        let postcheck = vds.refresh().and_then(|_| {
+        let refreshed = match vds.refresh() {
+            Err(error) if disposable => {
+                log::warn!(
+                    "[STORAGE] VDS refresh after a disposable partition deletion failed; the canonical layout decides the result: {error}"
+                );
+                Ok(())
+            }
+            other => other,
+        };
+        let postcheck = refreshed.and_then(|_| {
             if let Some(expected) = expected {
                 verify_partition_deleted(disk_number, expected, offset_bytes)
             } else {
@@ -6912,6 +6935,15 @@ mod platform {
             }
         });
         if let Some(warning) = warning {
+            if disposable && postcheck.is_ok() {
+                // For example an access path that could not be removed. The exact deletion is
+                // proven by the canonical partition table, which is all a disposable extent needs.
+                log::warn!(
+                    "[STORAGE] VDS returned success warning 0x{:08X} for a disposable partition deletion; the exact deletion is confirmed by the canonical layout",
+                    warning.0 as u32
+                );
+                return Ok(());
+            }
             let state = match postcheck {
                 Ok(()) => "the authorized deletion is visible after refresh".to_string(),
                 Err(error) => format!("post-operation state could not be confirmed: {error}"),
@@ -6932,7 +6964,7 @@ mod platform {
         offset_bytes: u64,
         force_protected: bool,
     ) -> Result<(), StorageError> {
-        delete_partition_impl(disk_number, offset_bytes, force_protected, None)
+        delete_partition_impl(disk_number, offset_bytes, force_protected, None, false)
     }
 
     pub unsafe fn delete_partition_checked(
@@ -6941,7 +6973,96 @@ mod platform {
         force_protected: bool,
         expected: &DiskLayoutSnapshot,
     ) -> Result<(), StorageError> {
-        delete_partition_impl(disk_number, offset_bytes, force_protected, Some(expected))
+        delete_partition_impl(
+            disk_number,
+            offset_bytes,
+            force_protected,
+            Some(expected),
+            false,
+        )
+    }
+
+    pub unsafe fn delete_disposable_partition_checked(
+        disk_number: u32,
+        offset_bytes: u64,
+        force_protected: bool,
+        expected: &DiskLayoutSnapshot,
+    ) -> Result<(), StorageError> {
+        delete_partition_impl(
+            disk_number,
+            offset_bytes,
+            force_protected,
+            Some(expected),
+            true,
+        )
+    }
+
+    /// Flush, lock (bounded retries) and dismount the ordinary volume on one exact partition.
+    ///
+    /// Returns `Ok(None)` when no volume object maps to the partition (hidden, RAW or already
+    /// gone), otherwise whether the exclusive lock was obtained before the dismount. The dismount
+    /// is issued even without the lock: it invalidates every remaining handle, which is exactly
+    /// what a following deletion of a disposable partition needs.
+    pub unsafe fn force_dismount_partition_volume(
+        disk_number: u32,
+        offset_bytes: u64,
+    ) -> Result<Option<bool>, StorageError> {
+        use windows::Win32::Storage::FileSystem::FlushFileBuffers;
+        use windows::Win32::System::Ioctl::{FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME};
+        use windows::Win32::System::IO::DeviceIoControl;
+
+        let Some(volume_name) = try_volume_guid_path_for_partition(disk_number, offset_bytes)?
+        else {
+            return Ok(None);
+        };
+        let path = wide(volume_name.trim_end_matches('\\'));
+        let handle = CreateFileW(
+            PCWSTR(path.as_ptr()),
+            0x8000_0000 | 0x4000_0000,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            Default::default(),
+            None,
+        )
+        .map(OwnedHandle)
+        .map_err(|error| api_error("open volume for forced dismount", error))?;
+        if let Err(error) = FlushFileBuffers(handle.0) {
+            log::warn!("[STORAGE] flushing volume {volume_name} before dismount failed: {error}");
+        }
+        let mut locked = false;
+        for attempt in 1..=8_u64 {
+            let mut returned = 0_u32;
+            if DeviceIoControl(
+                handle.0,
+                FSCTL_LOCK_VOLUME,
+                None,
+                0,
+                None,
+                0,
+                Some(&mut returned),
+                None,
+            )
+            .is_ok()
+            {
+                locked = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150 * attempt));
+        }
+        let mut returned = 0_u32;
+        DeviceIoControl(
+            handle.0,
+            FSCTL_DISMOUNT_VOLUME,
+            None,
+            0,
+            None,
+            0,
+            Some(&mut returned),
+            None,
+        )
+        .map_err(|error| api_error("dismount volume", error))?;
+        Ok(Some(locked))
     }
 
     pub unsafe fn format_drive(
@@ -10793,6 +10914,49 @@ pub fn delete_partition_checked(
     unsafe {
         platform::delete_partition_checked(disk_number, offset_bytes, force_protected, expected)
     }
+}
+
+/// Delete an exact partition whose content is disposable: the post-install staging extent or a
+/// partition of a disk the user confirmed for a complete wipe.
+///
+/// The same canonical snapshot gate as [`delete_partition_checked`] applies, but a volume that is
+/// still in use is dismounted by VDS instead of failing, a failed VDS cache refresh is not fatal,
+/// and a VDS success warning is accepted once the canonical layout proves the exact deletion.
+#[cfg(windows)]
+pub fn delete_disposable_partition_checked(
+    disk_number: u32,
+    offset_bytes: u64,
+    force_protected: bool,
+    expected: &DiskLayoutSnapshot,
+) -> Result<(), StorageError> {
+    unsafe {
+        platform::delete_disposable_partition_checked(
+            disk_number,
+            offset_bytes,
+            force_protected,
+            expected,
+        )
+    }
+}
+
+/// Best-effort preparation for [`delete_disposable_partition_checked`]: flush, lock and dismount
+/// the ordinary volume on one exact partition. `Ok(None)` means no volume maps to it.
+#[cfg(windows)]
+pub fn force_dismount_partition_volume(
+    disk_number: u32,
+    offset_bytes: u64,
+) -> Result<Option<bool>, StorageError> {
+    unsafe { platform::force_dismount_partition_volume(disk_number, offset_bytes) }
+}
+
+/// End of the contiguous canonical range behind `expected` (the next partition or the disk end).
+///
+/// Read-only. It lets a caller size a following [`extend_volume_checked`] from the real partition
+/// table instead of a possibly stale VDS free-extent cache.
+#[cfg(windows)]
+pub fn adjacent_free_end_after_volume(expected: VolumeIdentity) -> Result<u64, StorageError> {
+    let snapshot = disk_layout_snapshot(expected.disk_number)?;
+    canonical_adjacent_authorized_end(&snapshot, expected)
 }
 
 #[cfg(windows)]
