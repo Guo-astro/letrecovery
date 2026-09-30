@@ -20,9 +20,8 @@ use windows::Win32::Graphics::Gdi::{
     TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
-    DrawThemeTextEx, OpenThemeData, SetWindowTheme, DRAWITEMSTRUCT, DTTOPTS,
-    DTT_COMPOSITED, DTT_TEXTCOLOR, ODA_FOCUS, ODS_DISABLED, ODS_FOCUS, ODS_HOTLIGHT, ODS_SELECTED,
-    WM_MOUSELEAVE,
+    DrawThemeTextEx, OpenThemeData, SetWindowTheme, DRAWITEMSTRUCT, DTTOPTS, DTT_COMPOSITED,
+    DTT_TEXTCOLOR, ODA_FOCUS, ODS_DISABLED, ODS_FOCUS, ODS_HOTLIGHT, ODS_SELECTED, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
@@ -95,7 +94,8 @@ pub(crate) fn after_layout_commit(work: impl FnOnce() + 'static) {
 
 unsafe fn is_drop_down_combo(hwnd: HWND) -> bool {
     let mut class = [0u16; 16];
-    let length = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class).max(0) as usize;
+    let length =
+        windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut class).max(0) as usize;
     String::from_utf16_lossy(&class[..length]).eq_ignore_ascii_case("ComboBox")
         && matches!(GetWindowLongPtrW(hwnd, GWL_STYLE) & 0x0003, 0x0002 | 0x0003)
 }
@@ -164,7 +164,7 @@ unsafe fn publish_layout_batch() {
                 let _ = SetPropW(
                     request.hwnd,
                     LIST_VIEW_INTERNAL_LAYOUT_PROPERTY,
-                    HANDLE(1 as *mut _),
+                    HANDLE(std::ptr::dangling_mut()),
                 );
                 framed_lists.push((request.hwnd, frame, request.width, request.height, dpi));
             }
@@ -808,7 +808,7 @@ unsafe fn alpha_blend_through_cached_surface(
         let mut slot = cell.try_borrow_mut().ok()?;
         if slot
             .as_ref()
-            .map_or(true, |surface| surface.width < width || surface.height < height)
+            .is_none_or(|surface| surface.width < width || surface.height < height)
         {
             let (grow_width, grow_height) = slot
                 .as_ref()
@@ -867,7 +867,12 @@ unsafe fn alpha_blend_through_cached_surface(
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        Some(AlphaBlend(dc, x, y, width, height, surface.dc, 0, 0, width, height, blend).as_bool())
+        Some(
+            AlphaBlend(
+                dc, x, y, width, height, surface.dc, 0, 0, width, height, blend,
+            )
+            .as_bool(),
+        )
     })
 }
 
@@ -1439,8 +1444,15 @@ pub(crate) unsafe fn fill_round_rect_antialiased_with_border(
     border: COLORREF,
     background: COLORREF,
 ) {
-    if !try_fill_round_rect_opaque_gdi(dc, rect, radius, border_width.max(1), fill, border, background)
-    {
+    if !try_fill_round_rect_opaque_gdi(
+        dc,
+        rect,
+        radius,
+        border_width.max(1),
+        fill,
+        border,
+        background,
+    ) {
         fill_round_rect(dc, rect, radius, fill, border);
     }
 }
@@ -1507,7 +1519,10 @@ unsafe fn fill_round_rect_fast(
 ) {
     let width = (rect.right - rect.left).max(0);
     let height = (rect.bottom - rect.top).max(0);
-    let radius = radius.max(1).min((width / 2).max(1)).min((height / 2).max(1));
+    let radius = radius
+        .max(1)
+        .min((width / 2).max(1))
+        .min((height / 2).max(1));
     fill_solid_rect(dc, &rect, fill);
     draw_antialiased_control_frame(
         dc,
@@ -1549,7 +1564,14 @@ unsafe fn render_round_rect_supersampled(
     // whose "compatible" bitmap would be monochrome.
     let info = top_down_bgra_bitmap_info(high_width, high_height);
     let mut bits = std::ptr::null_mut::<c_void>();
-    let bitmap = match CreateDIBSection(memory_dc, &info, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0) {
+    let bitmap = match CreateDIBSection(
+        memory_dc,
+        &info,
+        DIB_RGB_COLORS,
+        &mut bits,
+        HANDLE::default(),
+        0,
+    ) {
         Ok(bitmap) if !bitmap.is_invalid() => bitmap,
         _ => {
             let _ = DeleteDC(memory_dc);
@@ -1707,14 +1729,23 @@ fn round_rect_is_cached(key: RoundRectKey) -> bool {
 }
 
 /// Renders one surface with the original supersampled renderer into its own 32-bit bitmap.
-unsafe fn render_round_rect_bitmap(key: RoundRectKey) -> Option<windows::Win32::Graphics::Gdi::HBITMAP> {
+unsafe fn render_round_rect_bitmap(
+    key: RoundRectKey,
+) -> Option<windows::Win32::Graphics::Gdi::HBITMAP> {
     let render_dc = CreateCompatibleDC(HDC::default());
     if render_dc.is_invalid() {
         return None;
     }
     let info = top_down_bgra_bitmap_info(key.width, key.height);
     let mut bits = std::ptr::null_mut::<c_void>();
-    let bitmap = match CreateDIBSection(render_dc, &info, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0) {
+    let bitmap = match CreateDIBSection(
+        render_dc,
+        &info,
+        DIB_RGB_COLORS,
+        &mut bits,
+        HANDLE::default(),
+        0,
+    ) {
         Ok(bitmap) if !bitmap.is_invalid() => bitmap,
         _ => {
             let _ = DeleteDC(render_dc);
@@ -1949,11 +1980,14 @@ unsafe fn draw_antialiased_control_frame_impl(
     }
 }
 
+/// A cached frame-corner coverage, keyed by (radius, border width).
+type FrameCornerCoverageEntry = ((i32, i32), std::rc::Rc<Vec<(u32, u32)>>);
+
 /// Supersampled coverage (inner, outer) of every pixel of one unflipped frame corner. The frame
 /// geometry depends only on DPI, so each (radius, border) pair is computed once per session.
 fn frame_corner_coverage(radius: i32, border_width: i32) -> std::rc::Rc<Vec<(u32, u32)>> {
     thread_local! {
-        static COVERAGE: RefCell<Vec<((i32, i32), std::rc::Rc<Vec<(u32, u32)>>)>> =
+        static COVERAGE: RefCell<Vec<FrameCornerCoverageEntry>> =
             const { RefCell::new(Vec::new()) };
     }
     const SAMPLES: i32 = 8;
@@ -2012,6 +2046,9 @@ thread_local! {
     static CORNER_PATCH_SURFACE: RefCell<Option<CornerPatchSurface>> = const { RefCell::new(None) };
 }
 
+/// One frame corner: its top-left origin and whether it is mirrored horizontally / vertically.
+type FrameCorner = ((i32, i32), (bool, bool));
+
 /// Draws the four antialiased corners with four AlphaBlend calls from one cached premultiplied
 /// patch. Pixels that must keep the underlying content (fully interior samples) have alpha 0 and
 /// every other pixel alpha 255, so each screen pixel is written exactly once with its final
@@ -2019,7 +2056,7 @@ thread_local! {
 unsafe fn paint_antialiased_frame_corners_blended(
     dc: HDC,
     geometry: (i32, i32),
-    corners: &[((i32, i32), (bool, bool)); 4],
+    corners: &[FrameCorner; 4],
     vertical_interiors: (COLORREF, COLORREF),
     border: COLORREF,
     exterior: CornerExterior,
@@ -2040,7 +2077,7 @@ unsafe fn paint_antialiased_frame_corners_blended(
         let needed_width = radius * 4;
         if slot
             .as_ref()
-            .map_or(true, |surface| surface.width < needed_width || surface.height < radius)
+            .is_none_or(|surface| surface.width < needed_width || surface.height < radius)
         {
             if let Some(old) = slot.take() {
                 let _ = SelectObject(old.dc, old.previous);
@@ -2091,8 +2128,8 @@ unsafe fn paint_antialiased_frame_corners_blended(
             for y in 0..radius {
                 for x in 0..radius {
                     let (inner, outer) = coverage[(y * radius + x) as usize];
-                    let patch_x = corner_index as i32 * radius
-                        + if flip.0 { radius - 1 - x } else { x };
+                    let patch_x =
+                        corner_index as i32 * radius + if flip.0 { radius - 1 - x } else { x };
                     let patch_y = if flip.1 { radius - 1 - y } else { y };
                     let pixel = surface
                         .bits
@@ -2713,17 +2750,17 @@ fn keep_clear_of_frame_arcs(
     };
     let radius = geometry.radius;
     let border = geometry.side_band.max(1);
-    let gap = inner
-        .y
-        .min(outer_height - (inner.y + inner.height))
-        .max(0);
+    let gap = inner.y.min(outer_height - (inner.y + inner.height)).max(0);
     if gap >= radius {
         return;
     }
     let safe = radius - border - 1;
     let distance = radius - gap;
     let needed = if safe > 0 && distance <= safe {
-        radius - (f64::from(safe * safe - distance * distance)).sqrt().floor() as i32
+        radius
+            - (f64::from(safe * safe - distance * distance))
+                .sqrt()
+                .floor() as i32
     } else {
         radius
     };
@@ -2908,8 +2945,8 @@ unsafe extern "system" fn list_view_layout_proc(
     _subclass_id: usize,
     _reference_data: usize,
 ) -> LRESULT {
-    let _profile = (message == WM_WINDOWPOSCHANGING)
-        .then(|| super::redraw::profile_scope("列表外框跟随移动"));
+    let _profile =
+        (message == WM_WINDOWPOSCHANGING).then(|| super::redraw::profile_scope("列表外框跟随移动"));
     match message {
         WM_WINDOWPOSCHANGING
             if lparam.0 != 0 && GetPropW(hwnd, LIST_VIEW_INTERNAL_LAYOUT_PROPERTY).is_invalid() =>

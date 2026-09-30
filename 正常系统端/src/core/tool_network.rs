@@ -5,53 +5,110 @@
 use crate::tr;
 use crate::utils::cmd::create_command;
 
-/// Select adapters that can carry PE networking.  Hyper-V/VMware host-only, Clash/TUN and
-/// loopback interfaces are deliberately excluded by description/type; a connected adapter must
-/// also have at least one assigned address.  The selector is pure so the same policy can be used
-/// by the normal endpoint and its tests without probing or mutating the network stack.
+/// Physical network source that can carry PE networking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeNetworkSource {
+    Wired,
+    Wireless,
+    /// USB tethering from a phone (Android RNDIS/NCM, Apple Mobile Device Ethernet).
+    PhoneTethering,
+}
+
+/// Name/description fragments of adapters that are not a physical network source: proxy, VPN and
+/// tunnel adapters (Clash/Mihomo/sing-box TUN, Wintun, WireGuard, TAP, ZeroTier, Tailscale ...),
+/// host-side virtual switches of VMware, Hyper-V and VirtualBox, and Bluetooth PAN, for which
+/// WinPE has no stack. Guest NICs inside a virtual machine ("Microsoft Hyper-V Network Adapter",
+/// "vmxnet3 Ethernet Adapter", "Intel(R) 82574L", "Red Hat VirtIO") are real sources and stay.
+const NON_PHYSICAL_ADAPTER_HINTS: &[&str] = &[
+    "virtual",
+    "vethernet",
+    "default switch",
+    "host-only",
+    "loopback",
+    "clash",
+    "mihomo",
+    "sing-box",
+    "singbox",
+    "tun",
+    "tap-",
+    "wireguard",
+    "tailscale",
+    "zerotier",
+    "openvpn",
+    "vpn",
+    "hamachi",
+    "npcap",
+    "miniport",
+    "bluetooth",
+    "teredo",
+    "isatap",
+];
+
+/// Description fragments of USB tethering adapters exposed by phones.
+const PHONE_TETHERING_HINTS: &[&str] = &[
+    "remote ndis",
+    "rndis",
+    "usbncm",
+    "apple mobile device ethernet",
+];
+
+const WIRELESS_TYPE_HINTS: &[&str] = &["wireless", "wi-fi", "wlan", "802.11"];
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+/// Classify one adapter as a PE network source, or `None` when it cannot carry PE networking.
+///
+/// The displayed type and status come from `tr!`, so they are compared with both the Chinese
+/// source text and the active UI language; the former exact Chinese comparison rejected every
+/// adapter whenever LetRecovery ran in English, Japanese, Korean, French or German. The former
+/// "hyper-v" hint also rejected the only NIC of a Hyper-V guest, not just the host vSwitch.
+pub fn pe_network_source(
+    adapter: &crate::core::hardware_info::NetworkAdapterInfo,
+) -> Option<PeNetworkSource> {
+    let haystack = format!("{} {}", adapter.name, adapter.description).to_ascii_lowercase();
+    let adapter_type = adapter.adapter_type.as_str();
+    let type_lower = adapter_type.to_ascii_lowercase();
+    let wired = adapter_type == "以太网"
+        || adapter_type == tr!("以太网")
+        || type_lower.contains("ethernet");
+    let wireless = adapter_type == "无线网络"
+        || adapter_type == tr!("无线网络")
+        || contains_any(&type_lower, WIRELESS_TYPE_HINTS);
+    let connected = adapter.status == "已连接" || adapter.status == tr!("已连接");
+    let non_physical = contains_any(&haystack, NON_PHYSICAL_ADAPTER_HINTS);
+    if non_physical || !connected || adapter.ip_addresses.is_empty() {
+        return None;
+    }
+    if wired && contains_any(&haystack, PHONE_TETHERING_HINTS) {
+        Some(PeNetworkSource::PhoneTethering)
+    } else if wireless {
+        Some(PeNetworkSource::Wireless)
+    } else if wired {
+        Some(PeNetworkSource::Wired)
+    } else {
+        None
+    }
+}
+
+/// Select adapters that can carry PE networking: the connected physical source of the current
+/// network (Ethernet, Wi-Fi, USB phone tethering, or the NIC of a VMware / Hyper-V / KVM guest).
+/// The selector is pure so the same policy can be used by the normal endpoint and its tests
+/// without probing or mutating the network stack.
 pub fn select_pe_network_adapters(
     adapters: &[crate::core::hardware_info::NetworkAdapterInfo],
 ) -> Vec<crate::core::hardware_info::NetworkAdapterInfo> {
     adapters
         .iter()
-        .filter(|adapter| {
-            let haystack = format!("{} {}", adapter.name, adapter.description).to_ascii_lowercase();
-            let virtual_hint = [
-                "clash",
-                "tun",
-                "tap",
-                "vmware virtual",
-                "vmware host",
-                "hyper-v",
-                "hyper v",
-                "default switch",
-                "loopback",
-                "vethernet",
-                "virtualbox host",
-            ]
-            .iter()
-            .any(|needle| haystack.contains(needle));
-            let physical_kind = matches!(adapter.adapter_type.as_str(), "以太网" | "无线网络")
-                || adapter
-                    .adapter_type
-                    .to_ascii_lowercase()
-                    .contains("ethernet")
-                || adapter
-                    .adapter_type
-                    .to_ascii_lowercase()
-                    .contains("wireless");
-            !virtual_hint
-                && physical_kind
-                && adapter.status == "已连接"
-                && !adapter.ip_addresses.is_empty()
-        })
+        .filter(|adapter| pe_network_source(adapter).is_some())
         .cloned()
         .collect()
 }
 
 #[cfg(test)]
 mod pe_network_tests {
-    use super::select_pe_network_adapters;
+    use super::{pe_network_source, select_pe_network_adapters, PeNetworkSource};
     use crate::core::hardware_info::NetworkAdapterInfo;
 
     fn adapter(name: &str, description: &str, kind: &str) -> NetworkAdapterInfo {
@@ -82,6 +139,88 @@ mod pe_network_tests {
         assert!(selected
             .iter()
             .all(|item| item.name == "Ethernet" || item.name == "Wi-Fi"));
+    }
+
+    #[test]
+    fn keeps_real_sources_including_virtual_machine_nics_and_phone_tethering() {
+        let candidates = vec![
+            adapter("以太网", "Microsoft Hyper-V Network Adapter", "以太网"),
+            adapter("Ethernet0", "vmxnet3 Ethernet Adapter", "以太网"),
+            adapter(
+                "Ethernet1",
+                "Intel(R) 82574L Gigabit Network Connection",
+                "以太网",
+            ),
+            adapter("Ethernet 2", "Red Hat VirtIO Ethernet Adapter", "以太网"),
+            adapter("WLAN", "Intel(R) Wi-Fi 6 AX201 160MHz", "无线网络"),
+            adapter(
+                "以太网 3",
+                "Remote NDIS based Internet Sharing Device",
+                "以太网",
+            ),
+            adapter("Ethernet 4", "Apple Mobile Device Ethernet", "以太网"),
+        ];
+        let expected = [
+            PeNetworkSource::Wired,
+            PeNetworkSource::Wired,
+            PeNetworkSource::Wired,
+            PeNetworkSource::Wired,
+            PeNetworkSource::Wireless,
+            PeNetworkSource::PhoneTethering,
+            PeNetworkSource::PhoneTethering,
+        ];
+        for (adapter, source) in candidates.iter().zip(expected) {
+            assert_eq!(pe_network_source(adapter), Some(source));
+        }
+        assert_eq!(
+            select_pe_network_adapters(&candidates).len(),
+            candidates.len()
+        );
+    }
+
+    #[test]
+    fn rejects_proxy_vpn_tunnel_host_switch_and_bluetooth_adapters() {
+        let candidates = vec![
+            adapter(
+                "vEthernet (Default Switch)",
+                "Hyper-V Virtual Ethernet Adapter",
+                "以太网",
+            ),
+            adapter(
+                "VMware Network Adapter VMnet8",
+                "VMware Virtual Ethernet Adapter for VMnet8",
+                "以太网",
+            ),
+            adapter(
+                "VirtualBox Host-Only Network",
+                "VirtualBox Host-Only Ethernet Adapter",
+                "以太网",
+            ),
+            adapter("Meta", "Meta Tunnel", "以太网"),
+            adapter("Mihomo", "Mihomo", "以太网"),
+            adapter("wg0", "WireGuard Tunnel", "以太网"),
+            adapter("ZeroTier One", "ZeroTier Virtual Port", "以太网"),
+            adapter("以太网 5", "TAP-Windows Adapter V9", "以太网"),
+            adapter(
+                "蓝牙网络连接",
+                "Bluetooth Device (Personal Area Network)",
+                "以太网",
+            ),
+        ];
+        for adapter in &candidates {
+            assert_eq!(pe_network_source(adapter), None);
+        }
+        assert!(select_pe_network_adapters(&candidates).is_empty());
+    }
+
+    #[test]
+    fn requires_a_connected_adapter_with_an_address() {
+        let mut disconnected = adapter("Ethernet", "Intel Ethernet Controller", "以太网");
+        disconnected.status = "已断开".into();
+        let mut unaddressed = adapter("WLAN", "Intel(R) Wi-Fi 6 AX201", "无线网络");
+        unaddressed.ip_addresses.clear();
+        assert_eq!(pe_network_source(&disconnected), None);
+        assert_eq!(pe_network_source(&unaddressed), None);
     }
 }
 

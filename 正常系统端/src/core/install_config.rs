@@ -78,6 +78,7 @@ pub struct InstallConfigTransaction {
     private_wifi_profile: Option<Vec<u8>>,
     protected_administrator_secret: Option<zeroize::Zeroizing<Vec<u8>>>,
     protected_bitlocker_secret: Option<zeroize::Zeroizing<Vec<u8>>>,
+    pe_network_payload: Option<super::pe_network::PeNetworkBootPayload>,
 }
 
 /// Exact files changed while preparing a PE expansion handoff.
@@ -154,6 +155,17 @@ impl InstallConfigTransaction {
     }
     pub(crate) fn take_private_wifi_profile(&mut self) -> Option<Vec<u8>> {
         self.private_wifi_profile.take()
+    }
+    pub(crate) fn attach_pe_network_payload(
+        &mut self,
+        network: super::pe_network::PeNetworkBootPayload,
+    ) {
+        self.pe_network_payload = Some(network);
+    }
+    pub(crate) fn take_pe_network_payload(
+        &mut self,
+    ) -> Option<super::pe_network::PeNetworkBootPayload> {
+        self.pe_network_payload.take()
     }
     pub(crate) fn take_protected_administrator_secret(
         &mut self,
@@ -417,6 +429,9 @@ pub struct InstallConfig {
     pub wifi_profile_sha256: String,
     /// Authenticated policy: allow PE to attempt the optional network runtime.
     pub pe_network_enabled: bool,
+    /// Authenticated length/hash of the optional PE network payload (0/empty when absent).
+    pub pe_network_payload_length: u64,
+    pub pe_network_payload_sha256: String,
     /// Authenticated automatic feedback policy (disabled, normal, normal_and_pe).
     pub automatic_feedback_mode: String,
 
@@ -921,6 +936,7 @@ impl ConfigFileManager {
             private_wifi_profile,
             protected_administrator_secret,
             protected_bitlocker_secret,
+            pe_network_payload: None,
         };
         if let Err(error) = write_atomic_file(&target_marker_path, &target_marker_bytes) {
             if let Err(rollback) = transaction.rollback() {
@@ -1366,7 +1382,7 @@ impl ConfigFileManager {
             .custom_install_plan
             .to_json()
             .context("serialize authenticated custom installation plan")?;
-        let wifi_binding = if config.migrate_wifi {
+        let mut wifi_binding = if config.migrate_wifi {
             let sha256 = config.wifi_profile_sha256.trim().to_ascii_lowercase();
             if config.wifi_profile_length == 0
                 || config.wifi_profile_length > lr_core::first_logon::PRIVATE_WIFI_PROFILE_MAX_BYTES
@@ -1385,6 +1401,19 @@ impl ConfigFileManager {
         } else {
             String::new()
         };
+        if config.pe_network_payload_length > 0 {
+            let sha256 = config.pe_network_payload_sha256.trim().to_ascii_lowercase();
+            if config.pe_network_payload_length > lr_core::pe_network::PAYLOAD_MAX_BYTES
+                || sha256.len() != 64
+                || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                anyhow::bail!("PE network payload binding is invalid");
+            }
+            wifi_binding.push_str(&format!(
+                "PeNetworkPayloadLength={}\r\nPeNetworkPayloadSha256={}\r\n",
+                config.pe_network_payload_length, sha256
+            ));
+        }
         let mut source_verification_binding = if config.source_image_verified {
             "SourceImageVerified=true\r\n".to_owned()
         } else {
@@ -1686,6 +1715,15 @@ Language={}
                     "MigrateWifi" => config.migrate_wifi = value.parse().unwrap_or(false),
                     "WifiProfileLength" => config.wifi_profile_length = value.parse().unwrap_or(0),
                     "WifiProfileSha256" => config.wifi_profile_sha256 = value.to_string(),
+                    "PeNetworkEnabled" => {
+                        config.pe_network_enabled = value.parse().unwrap_or(false)
+                    }
+                    "PeNetworkPayloadLength" => {
+                        config.pe_network_payload_length = value.parse().unwrap_or(0)
+                    }
+                    "PeNetworkPayloadSha256" => {
+                        config.pe_network_payload_sha256 = value.to_string()
+                    }
                     "RemoveShortcutArrow" => {
                         config.remove_shortcut_arrow = value.parse().unwrap_or(false)
                     }
@@ -1771,6 +1809,19 @@ Language={}
                 config.migrate_wifi = false;
                 config.wifi_profile_length = 0;
                 config.wifi_profile_sha256.clear();
+            }
+        }
+        match lr_core::pe_network::PeNetworkPayloadBinding::from_config_text(content)? {
+            Some(binding) => {
+                if config.pe_network_payload_length != binding.length_bytes
+                    || config.pe_network_payload_sha256 != binding.sha256
+                {
+                    anyhow::bail!("PE network binding fields were not parsed consistently");
+                }
+            }
+            None => {
+                config.pe_network_payload_length = 0;
+                config.pe_network_payload_sha256.clear();
             }
         }
         if config.preserve_personal_files {

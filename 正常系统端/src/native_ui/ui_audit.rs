@@ -116,8 +116,7 @@ impl Drop for Measure {
 
 fn shown(text: &[u16]) -> String {
     String::from_utf16_lossy(text)
-        .replace('\r', " ")
-        .replace('\n', " ")
+        .replace(['\r', '\n'], " ")
         .replace('&', "")
 }
 
@@ -231,7 +230,9 @@ unsafe fn audit_combo(hwnd: HWND, findings: &mut Vec<String>) {
         return;
     };
     let available = width - scale(34, dpi);
-    let count = SendMessageW(hwnd, CB_GETCOUNT, WPARAM(0), LPARAM(0)).0.max(0) as usize;
+    let count = SendMessageW(hwnd, CB_GETCOUNT, WPARAM(0), LPARAM(0))
+        .0
+        .max(0) as usize;
     let selected = SendMessageW(hwnd, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
     for index in 0..count.min(64) {
         let length = SendMessageW(hwnd, CB_GETLBTEXTLEN, WPARAM(index), LPARAM(0)).0;
@@ -252,7 +253,11 @@ unsafe fn audit_combo(hwnd: HWND, findings: &mut Vec<String>) {
         if needed > available {
             findings.push(format!(
                 "ComboBox 选项{} \"{}\" 需要 {needed}px，只有 {}px",
-                if index as isize == selected { "(当前)" } else { "" },
+                if index as isize == selected {
+                    "(当前)"
+                } else {
+                    ""
+                },
                 shown(&text),
                 available.max(0)
             ));
@@ -289,8 +294,8 @@ unsafe fn audit_list_view(hwnd: HWND, findings: &mut Vec<String>) {
         Measure::new(header, header)
     };
     for column in 0..columns {
-        let width = SendMessageW(hwnd, LVM_GETCOLUMNWIDTH, WPARAM(column as usize), LPARAM(0))
-            .0 as i32;
+        let width =
+            SendMessageW(hwnd, LVM_GETCOLUMNWIDTH, WPARAM(column as usize), LPARAM(0)).0 as i32;
         if width <= 0 {
             continue;
         }
@@ -389,11 +394,18 @@ unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> BOOL {
 /// Audits every visible descendant of `root` and logs what does not fit.
 pub(crate) unsafe fn audit_surface(root: HWND, surface: &str) {
     if std::env::var_os("LETRECOVERY_UI_AUDIT_DUMP").is_some() {
-        unsafe extern "system" fn dump(window: HWND, _lparam: LPARAM) -> windows::Win32::Foundation::BOOL {
+        unsafe extern "system" fn dump(
+            window: HWND,
+            _lparam: LPARAM,
+        ) -> windows::Win32::Foundation::BOOL {
             let mut class = [0u16; 32];
-            let class_length = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(window, &mut class).max(0) as usize;
+            let class_length =
+                windows::Win32::UI::WindowsAndMessaging::GetClassNameW(window, &mut class).max(0)
+                    as usize;
             let mut text = [0u16; 64];
-            let text_length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(window, &mut text).max(0) as usize;
+            let text_length =
+                windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(window, &mut text).max(0)
+                    as usize;
             let mut rect = windows::Win32::Foundation::RECT::default();
             let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(window, &mut rect);
             log::info!(
@@ -401,13 +413,17 @@ pub(crate) unsafe fn audit_surface(root: HWND, surface: &str) {
                 window.0,
                 String::from_utf16_lossy(&class[..class_length]),
                 String::from_utf16_lossy(&text[..text_length]),
-                rect.left, rect.top, rect.right, rect.bottom,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom,
                 windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(window).as_bool(),
                 windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(window).as_bool(),
             );
             windows::Win32::Foundation::BOOL(1)
         }
-        let _ = windows::Win32::UI::WindowsAndMessaging::EnumChildWindows(root, Some(dump), LPARAM(0));
+        let _ =
+            windows::Win32::UI::WindowsAndMessaging::EnumChildWindows(root, Some(dump), LPARAM(0));
     }
     if !enabled() {
         return;

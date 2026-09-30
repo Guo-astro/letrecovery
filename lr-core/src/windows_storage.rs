@@ -835,8 +835,18 @@ fn same_stable_partition_token(
         (StablePartitionIdentity::Mbr { .. }, StablePartitionIdentity::Mbr { .. }) => true,
         // `Mbr { partition_number: 0 }` is the volume-only fallback's "partition token unknown";
         // the strict path never produces partition number zero.
-        (StablePartitionIdentity::Mbr { partition_number: 0 }, _)
-        | (_, StablePartitionIdentity::Mbr { partition_number: 0 }) => true,
+        (
+            StablePartitionIdentity::Mbr {
+                partition_number: 0,
+            },
+            _,
+        )
+        | (
+            _,
+            StablePartitionIdentity::Mbr {
+                partition_number: 0,
+            },
+        ) => true,
         _ => false,
     }
 }
@@ -1240,7 +1250,9 @@ mod platform {
         handle: HANDLE,
     ) -> Result<Option<(u32, &'static str)>, StorageError> {
         if super::simulate_restricted_storage() {
-            return Err(simulated_invalid_function("read opened disk path device number"));
+            return Err(simulated_invalid_function(
+                "read opened disk path device number",
+            ));
         }
         use windows::Win32::System::Ioctl::{
             IOCTL_STORAGE_GET_DEVICE_NUMBER, IOCTL_STORAGE_GET_DEVICE_NUMBER_EX,
@@ -1651,7 +1663,9 @@ mod platform {
                 .collect::<Vec<_>>(),
             Err(error) => {
                 super::warn_storage_once("present-interfaces", || {
-                    format!("[STORAGE] SetupAPI 磁盘枚举失败，改用 PhysicalDriveN 兼容路径: {error}")
+                    format!(
+                        "[STORAGE] SetupAPI 磁盘枚举失败，改用 PhysicalDriveN 兼容路径: {error}"
+                    )
                 });
                 Vec::new()
             }
@@ -3566,11 +3580,13 @@ mod platform {
             Ok(_) => Err("IOCTL_DISK_GET_LENGTH_INFO returned zero".to_owned()),
             Err(error) => Err(error.to_string()),
         }
-        .or_else(|length_error| match disk_geometry_length_from_raw_handle(handle) {
-            Ok(length) if length > 0 => Ok(length),
-            Ok(_) => Err(format!("{length_error}; GEOMETRY_EX returned zero")),
-            Err(error) => Err(format!("{length_error}; {error}")),
-        });
+        .or_else(
+            |length_error| match disk_geometry_length_from_raw_handle(handle) {
+                Ok(length) if length > 0 => Ok(length),
+                Ok(_) => Err(format!("{length_error}; GEOMETRY_EX returned zero")),
+                Err(error) => Err(format!("{length_error}; {error}")),
+            },
+        );
         let (disk_size_bytes, disk_size_estimated) = match exact_length {
             Ok(length) => (length, false),
             Err(detail) => {
@@ -3579,7 +3595,9 @@ mod platform {
                 // (or of the last partition) as a conservative bound and mark it as estimated.
                 let partition_end = partitions
                     .iter()
-                    .filter_map(|partition| partition.offset_bytes.checked_add(partition.size_bytes))
+                    .filter_map(|partition| {
+                        partition.offset_bytes.checked_add(partition.size_bytes)
+                    })
                     .max()
                     .unwrap_or(0);
                 let usable_end = if matches!(disk, StableDiskIdentity::Gpt { .. }) {
@@ -3599,11 +3617,14 @@ mod platform {
                         format!("physical disk capacity is unavailable and the partition table gives no bound: {detail}"),
                     ));
                 }
-                super::warn_storage_once(&format!("estimated-size:{estimate}:{}", partitions.len()), || {
-                    format!(
+                super::warn_storage_once(
+                    &format!("estimated-size:{estimate}:{}", partitions.len()),
+                    || {
+                        format!(
                         "[STORAGE] 磁盘容量查询被拒绝（{detail}），改用分区表推算的容量 {estimate} 字节（仅用于边界检查，交接指纹不含容量）"
                     )
-                });
+                    },
+                );
                 (estimate, true)
             }
         };
@@ -3727,7 +3748,9 @@ mod platform {
     /// Raw `DRIVE_LAYOUT_INFORMATION_EX` bytes of one openable disk path, used only to bind an
     /// unnumbered SetupAPI interface to its `PhysicalDriveN` alias.
     unsafe fn raw_layout_bytes_for_path(path: &str) -> Option<Vec<u8>> {
-        let handle = open_present_disk_interface_path(path, GENERIC_READ.0, "read layout for alias binding").ok()?;
+        let handle =
+            open_present_disk_interface_path(path, GENERIC_READ.0, "read layout for alias binding")
+                .ok()?;
         let (storage, returned) = read_drive_layout_from_raw_handle(handle.0).ok()?;
         let available = (returned as usize).min(storage.len() * size_of::<u64>());
         let bytes = std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), available);
@@ -3810,7 +3833,10 @@ mod platform {
         for _ in 0..4 {
             if let Ok(id) = device_instance_id(current) {
                 let upper = id.to_ascii_uppercase();
-                if upper.contains("VEN_NVME") || upper.starts_with("NVME\\") || upper.contains("\\NVME&") {
+                if upper.contains("VEN_NVME")
+                    || upper.starts_with("NVME\\")
+                    || upper.contains("\\NVME&")
+                {
                     return true;
                 }
             }
@@ -3944,7 +3970,9 @@ mod platform {
                     if partition_id != [0; 16] {
                         StablePartitionIdentity::Gpt { partition_id }
                     } else {
-                        StablePartitionIdentity::Mbr { partition_number: 0 }
+                        StablePartitionIdentity::Mbr {
+                            partition_number: 0,
+                        }
                     },
                 )
             }
@@ -3958,7 +3986,9 @@ mod platform {
             ),
             _ => (
                 raw_disk.unwrap_or(StableDiskIdentity::Raw),
-                StablePartitionIdentity::Mbr { partition_number: 0 },
+                StablePartitionIdentity::Mbr {
+                    partition_number: 0,
+                },
             ),
         };
         StableVolumeIdentity {
@@ -4039,11 +4069,14 @@ mod platform {
             Ok(identity) => Ok(identity),
             Err(error) => {
                 super::mark_disk_degraded(extent.disk_number);
-                super::warn_storage_once(&format!("volume-only-identity:{volume_guid_root}"), || {
-                    format!(
+                super::warn_storage_once(
+                    &format!("volume-only-identity:{volume_guid_root}"),
+                    || {
+                        format!(
                         "[STORAGE] {volume_guid_root} 的完整磁盘身份读取失败，改用卷级身份: {error}"
                     )
-                });
+                    },
+                );
                 Ok(volume_only_stable_identity(
                     volume_guid_root.trim_end_matches('\\'),
                     extent,
@@ -4514,7 +4547,9 @@ mod platform {
 
     unsafe fn disk_length_from_raw_handle(handle: HANDLE) -> Result<u64, StorageError> {
         if super::simulate_restricted_storage() {
-            return Err(simulated_invalid_function("read retained physical disk length"));
+            return Err(simulated_invalid_function(
+                "read retained physical disk length",
+            ));
         }
         use windows::Win32::System::Ioctl::{GET_LENGTH_INFORMATION, IOCTL_DISK_GET_LENGTH_INFO};
         use windows::Win32::System::IO::DeviceIoControl;
@@ -4582,7 +4617,9 @@ mod platform {
     /// bus-specific properties.
     unsafe fn disk_bus_type_from_handle(handle: HANDLE) -> Result<DiskBusType, StorageError> {
         if super::simulate_restricted_storage() {
-            return Err(simulated_invalid_function("query physical disk descriptor size"));
+            return Err(simulated_invalid_function(
+                "query physical disk descriptor size",
+            ));
         }
         use windows::Win32::Storage::FileSystem::BusTypeNvme;
         use windows::Win32::System::Ioctl::{
@@ -4723,7 +4760,9 @@ mod platform {
         use windows::Win32::System::IO::DeviceIoControl;
 
         if super::simulate_restricted_storage() {
-            return Err(simulated_invalid_function("query physical disk sector geometry"));
+            return Err(simulated_invalid_function(
+                "query physical disk sector geometry",
+            ));
         }
         let (handle, _) = open_trusted_present_disk(
             disk_number,
@@ -5257,6 +5296,43 @@ mod platform {
         })
     }
 
+    /// Partition alignment VDS applies for `ulAlign == 0` on every disk larger than 4 GiB. Smaller
+    /// disks use 64 KiB, which any 1 MiB boundary also satisfies.
+    const VDS_DEFAULT_ALIGNMENT_BYTES: u64 = 1024 * 1024;
+
+    /// Largest capacity whose provider-rounded extent still ends inside the caller envelope, or
+    /// `None` when the requested capacity is already safe (or no smaller capacity is acceptable).
+    ///
+    /// Real VDS evidence (VMware NVMe, GPT, 512-byte sectors): `CreatePartitionEx(offset =
+    /// 129119551488, size = 7492857344, ulAlign = 0)` returned a 7493124096-byte partition. The
+    /// provider rounded the END up to the next 1 MiB boundary, 266752 bytes past an envelope that
+    /// ended at the non-MiB-aligned end of the just-shrunk source volume. Canonical readback then
+    /// correctly refused that extent and the whole dual-boot preparation failed. Requesting whole
+    /// MiB up to the last complete boundary inside the envelope keeps even a start-and-end rounded
+    /// extent authorized; the caller's hard minimum still decides whether that is acceptable.
+    fn provider_alignment_safe_size(
+        selected: SelectedFreeExtent,
+        sector: u64,
+        minimum: u64,
+    ) -> Option<u64> {
+        let granularity = VDS_DEFAULT_ALIGNMENT_BYTES;
+        let align_up = |value: u64| -> Option<u64> {
+            value
+                .checked_add(granularity - 1)
+                .map(|value| value - value % granularity)
+        };
+        let aligned_start = align_up(selected.offset_bytes)?;
+        let worst_case_end = align_up(aligned_start.checked_add(selected.requested_size)?)?;
+        if worst_case_end <= selected.authorized_end_bytes {
+            return None;
+        }
+        let envelope_end = selected.authorized_end_bytes;
+        let aligned_end = envelope_end - envelope_end % granularity;
+        let safe = aligned_end.checked_sub(aligned_start)?;
+        let safe = safe - safe % sector.max(1);
+        (safe > 0 && safe >= minimum && safe < selected.requested_size).then_some(safe)
+    }
+
     fn logical_sector_create_attempt_sizes(
         selected: SelectedFreeExtent,
         logical_sector_bytes: u32,
@@ -5304,6 +5380,15 @@ mod platform {
                 "prepare VDS partition geometry",
                 "the authorized range cannot contain the caller minimum in whole logical sectors",
             ));
+        }
+        if let Some(provider_safe) = provider_alignment_safe_size(selected, sector, minimum) {
+            // The first real attempt must already keep VDS's default end rounding inside the
+            // caller envelope. The sector-rounded minimum stays the bounded E_INVALIDARG fallback.
+            let mut sizes = vec![provider_safe];
+            if provider_safe != minimum {
+                sizes.push(minimum);
+            }
+            return Ok(sizes);
         }
 
         let desired_remainder = selected.requested_size % sector;
@@ -5457,17 +5542,25 @@ mod platform {
                 ),
             ));
         };
-        if let Some(violation) =
-            created_extent_selection_violation(created, selected, expected_role)
-        {
+        if let Some(role) = partition_role_violation(created.token, expected_role) {
+            // A partition with a different role cannot be attributed to this request.
             return Err(StorageError::new(
                 primary.operation,
                 format!(
                     "{}; partition creation produced an unauthorized or uncontained extent (partial state): {}",
-                    primary.detail, violation
+                    primary.detail, role
                 ),
             ));
         }
+        let violation = created_extent_selection_violation(created, selected, expected_role);
+        // `created_partition_delta` proved this is the only change against the pre-create
+        // baseline and its role matches the request, so it is the provider's answer to exactly this
+        // `CreatePartitionEx`, even when VDS placed or rounded it outside the envelope (observed:
+        // end rounded up to 1 MiB, 266752 bytes past a non-aligned envelope end). Keeping such an
+        // extent on disk stranded every caller rollback behind an "unowned" partition.
+        let rejected = violation
+            .map(|detail| format!(" (rejected provider extent: {detail})"))
+            .unwrap_or_default();
         let created = ObservedCreatedPartition {
             created: CreatedPartition {
                 offset_bytes: created.offset_bytes,
@@ -5479,15 +5572,15 @@ mod platform {
             Ok(()) => Err(StorageError::new(
                 primary.operation,
                 format!(
-                    "{}; exact provider-created partition was rolled back",
-                    primary.detail
+                    "{}; exact provider-created partition was rolled back{}",
+                    primary.detail, rejected
                 ),
             )),
             Err(cleanup) => Err(StorageError::new(
                 primary.operation,
                 format!(
-                    "{}; exact provider-created partition rollback failed (partial state): {}",
-                    primary.detail, cleanup
+                    "{}; exact provider-created partition rollback failed (partial state){}: {}",
+                    primary.detail, rejected, cleanup
                 ),
             )),
         }
@@ -6523,8 +6616,15 @@ mod platform {
             let geometry = physical_disk_sector_geometry(request.disk_number)?;
             logical_sector_create_attempt_sizes(selected, geometry.logical_sector_bytes)?
         } else {
-            let mut sizes = vec![selected.requested_size];
-            if selected.minimum_size < selected.requested_size {
+            // An explicit MBR envelope is subject to the same provider end rounding as GPT.
+            let first = if authorization.is_some() {
+                provider_alignment_safe_size(selected, 1, selected.minimum_size)
+                    .unwrap_or(selected.requested_size)
+            } else {
+                selected.requested_size
+            };
+            let mut sizes = vec![first];
+            if selected.minimum_size < first {
                 sizes.push(selected.minimum_size);
             }
             sizes
@@ -7796,13 +7896,8 @@ mod platform {
     pub unsafe fn query_max_reclaimable_bytes(drive_letter: char) -> Result<u64, StorageError> {
         let expected = volume_identity(drive_letter)?;
         let vds = Vds::connect()?;
-        let volume = find_checked_volume(
-            &vds,
-            drive_letter,
-            expected,
-            None,
-            "query shrink capacity",
-        )?;
+        let volume =
+            find_checked_volume(&vds, drive_letter, expected, None, "query shrink capacity")?;
         let shrink = volume
             .cast::<IVdsVolumeShrink>()
             .map_err(|error| api_error("open VDS volume shrink interface", error))?;
@@ -9470,6 +9565,62 @@ mod platform {
         }
 
         #[test]
+        fn caller_authorized_create_keeps_provider_rounded_end_inside_non_aligned_envelope() {
+            // Exact dual-boot staging request from a real VMware NVMe failure log.
+            let selected = SelectedFreeExtent {
+                offset_bytes: 129_119_551_488,
+                requested_size: 7_492_857_344,
+                minimum_size: 5_345_728_653,
+                authorized_start_bytes: 129_119_551_488,
+                raw_offset_bytes: 129_119_551_488,
+                raw_size_bytes: 7_492_857_344,
+                provider_offset_bytes: 129_119_551_488,
+                provider_size_bytes: 7_492_857_344,
+                authorized_end_bytes: 136_612_408_832,
+            };
+            let sizes = logical_sector_create_attempt_sizes(selected, 512).unwrap();
+            assert_eq!(sizes, vec![7_492_075_520, 5_345_729_024]);
+            let mib = VDS_DEFAULT_ALIGNMENT_BYTES;
+            for size in sizes {
+                let provider_end = (selected.offset_bytes + size).div_ceil(mib) * mib;
+                assert!(provider_end <= selected.authorized_end_bytes);
+                assert!(size >= selected.minimum_size);
+            }
+
+            // An envelope that already ends on a provider boundary keeps the exact request.
+            let aligned_envelope = SelectedFreeExtent {
+                authorized_end_bytes: 136_612_675_584,
+                ..selected
+            };
+            let first = logical_sector_create_attempt_sizes(aligned_envelope, 512).unwrap()[0];
+            assert_eq!(first, selected.requested_size);
+
+            // The Windows volume of the same transaction starts unaligned but has room for the
+            // provider rounding, so its confirmed capacity is unchanged.
+            let windows_volume = SelectedFreeExtent {
+                offset_bytes: 43_219_850_240,
+                requested_size: 85_899_345_920,
+                minimum_size: 85_899_345_920,
+                authorized_start_bytes: 43_219_850_240,
+                raw_offset_bytes: 43_219_850_240,
+                raw_size_bytes: 88_046_829_939,
+                provider_offset_bytes: 43_219_850_240,
+                provider_size_bytes: 88_046_829_939,
+                authorized_end_bytes: 131_266_680_179,
+            };
+            let windows_sizes = logical_sector_create_attempt_sizes(windows_volume, 512).unwrap();
+            assert_eq!(windows_sizes, vec![85_899_345_920]);
+
+            // A smaller aligned capacity below the caller minimum is never substituted.
+            let tight = SelectedFreeExtent {
+                minimum_size: 7_492_857_344,
+                ..selected
+            };
+            let tight_sizes = logical_sector_create_attempt_sizes(tight, 512).unwrap();
+            assert_eq!(tight_sizes, vec![7_492_857_344]);
+        }
+
+        #[test]
         fn access_path_allows_only_the_documented_no_drive_letter_attribute_delta() {
             let created = CreatedPartition {
                 offset_bytes: 449_839_104,
@@ -10404,6 +10555,88 @@ mod platform {
                 })
             );
             assert!(error.to_string().contains("was rolled back"));
+        }
+
+        #[test]
+        fn reconciliation_rolls_back_a_provider_extent_rounded_past_the_envelope() {
+            let mib = 1024 * 1024;
+            let offset = 100 * mib;
+            let authorized_end = offset + 7 * mib + 700_416;
+            let requested = gpt_partition(offset, authorized_end - offset, [1; 16], [2; 16], 0);
+            // VDS rounded the end up to the next 1 MiB boundary, past the caller envelope.
+            let provider_actual = gpt_partition(offset, 8 * mib, [1; 16], [3; 16], 0);
+            let baseline = gpt_snapshot(Vec::new());
+            let current = gpt_snapshot(vec![provider_actual]);
+            let mut observed = None;
+
+            let error = reconcile_started_partition_creation(
+                StorageError::new("verify created partition", "mock bounds rejection"),
+                &baseline,
+                SelectedFreeExtent {
+                    offset_bytes: offset,
+                    requested_size: authorized_end - offset,
+                    minimum_size: 5 * mib,
+                    authorized_start_bytes: offset,
+                    raw_offset_bytes: offset,
+                    raw_size_bytes: authorized_end - offset,
+                    provider_offset_bytes: offset,
+                    provider_size_bytes: authorized_end - offset,
+                    authorized_end_bytes: authorized_end,
+                },
+                expected_partition_role(requested.token, false),
+                || Ok(current),
+                |actual| {
+                    observed = Some(actual);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+            assert_eq!(
+                observed.map(|actual| actual.created),
+                Some(CreatedPartition {
+                    offset_bytes: offset,
+                    size_bytes: 8 * mib,
+                })
+            );
+            let message = error.to_string();
+            assert!(message.contains("was rolled back"));
+            assert!(message.contains("ends after the authorized range"));
+        }
+
+        #[test]
+        fn reconciliation_keeps_a_foreign_role_extent_for_diagnosis() {
+            let requested = gpt_partition(8192, 64 * 1024, [1; 16], [2; 16], 0);
+            let foreign = gpt_partition(8192, 64 * 1024, [5; 16], [3; 16], 0);
+            let baseline = gpt_snapshot(Vec::new());
+            let current = gpt_snapshot(vec![foreign]);
+            let mut deleted = false;
+
+            let error = reconcile_started_partition_creation(
+                StorageError::new("verify created partition", "mock role mismatch"),
+                &baseline,
+                SelectedFreeExtent {
+                    offset_bytes: 8192,
+                    requested_size: 64 * 1024,
+                    minimum_size: 64 * 1024,
+                    authorized_start_bytes: 8192,
+                    raw_offset_bytes: 8192,
+                    raw_size_bytes: 64 * 1024,
+                    provider_offset_bytes: 8192,
+                    provider_size_bytes: 64 * 1024,
+                    authorized_end_bytes: 8192 + 64 * 1024,
+                },
+                expected_partition_role(requested.token, false),
+                || Ok(current),
+                |_| {
+                    deleted = true;
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+            assert!(!deleted);
+            assert!(error.to_string().contains("partial state"));
         }
 
         #[test]
@@ -11828,7 +12061,22 @@ mod tests {
             expected,
             stable_mbr(2, Some([8; 32]))
         ));
-        assert!(!same_stable_volume_identity(expected, stable_mbr(2, None)));
+        // The device identifier is optional evidence (`same_optional_device_id`): filter drivers
+        // and some WinPE stacks expose it on one side only, so a missing value is "unknown", not
+        // a mismatch. Only two present and different identifiers separate the volumes.
+        assert!(same_stable_volume_identity(expected, stable_mbr(2, None)));
+        assert!(same_stable_volume_identity(stable_mbr(2, None), expected));
+        // A missing identifier still requires the same MBR disk signature.
+        assert!(!same_stable_volume_identity(
+            expected,
+            StableVolumeIdentity {
+                disk: StableDiskIdentity::Mbr {
+                    signature: 0x8765_4321,
+                },
+                device_id_hash: None,
+                ..expected
+            }
+        ));
         assert!(!same_stable_volume_identity(
             expected,
             StableVolumeIdentity {

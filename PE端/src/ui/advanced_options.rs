@@ -259,9 +259,7 @@ pub fn apply_advanced_options(
                 "",
             )?;
         } else {
-            log::warn!(
-                "[ADVANCED] DEFAULT hive 不可用，经典右键菜单只写入系统级设置，安装继续"
-            );
+            log::warn!("[ADVANCED] DEFAULT hive 不可用，经典右键菜单只写入系统级设置，安装继续");
         }
         // 同时在 SOFTWARE 中设置（系统级）
         OfflineRegistry::create_key(

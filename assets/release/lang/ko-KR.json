@@ -2573,7 +2573,7 @@
         "写入自定义无人值守文件失败": "사용자 지정 무인 응답 파일을 쓰지 못했습니다",
         "读取原备份标记文件失败": "원래 백업 표시 파일을 읽지 못했습니다",
         "正在启动镜像释放引擎...": "이미지 적용 엔진을 시작하는 중...",
-        "未找到可用的 dism.exe。请确保系统已安装 DISM 或将 dism.exe 放置于程序目录的 bin\\Dism\\ 下\n已搜索路径:\n- {程序目录}\\bin\\Dism\\dism.exe\n- Windows API 返回的实际 System32\\Dism.exe\n- X:\\Windows\\System32\\dism.exe (常见 PE 环境)": "사용할 수 있는 dism.exe를 찾지 못했습니다. 시스템에 DISM이 설치되어 있는지 확인하거나 dism.exe를 프로그램 폴더의 bin\\Dism\\ 아래에 두세요\n검색한 경로:\n- {프로그램 폴더}\\bin\\Dism\\dism.exe\n- Windows API가 반환한 실제 System32\\Dism.exe\n- X:\\Windows\\System32\\dism.exe (일반적인 PE 환경)",
+        "未找到可用的 dism.exe。请确保系统已安装 DISM 或将 dism.exe 放置于程序目录的 bin\\Dism\\ 下\n已搜索路径:\n- {程序目录}\\bin\\Dism\\dism.exe\n- Windows API 返回的实际 System32\\Dism.exe\n- X:\\Windows\\System32\\dism.exe (常见 PE 环境)": "사용할 수 있는 dism.exe를 찾지 못했습니다. 시스템에 DISM이 설치되어 있는지 확인하거나 dism.exe를 프로그램 폴더의 bin\\Dism\\ 아래에 두세요\n검색한 경로:\n- <프로그램 폴더>\\bin\\Dism\\dism.exe\n- Windows API가 반환한 실제 System32\\Dism.exe\n- X:\\Windows\\System32\\dism.exe (일반적인 PE 환경)",
         "{}失败，退出代码: {}，详情: {}": "{} 실패, 종료 코드: {}, 자세한 내용: {}",
         "无法获取 DISM stdout": "DISM 표준 출력을 가져올 수 없습니다",
         "无法获取 DISM stderr": "DISM 표준 오류 출력을 가져올 수 없습니다",

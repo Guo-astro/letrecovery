@@ -37,7 +37,8 @@ pub struct AppConfig {
     #[serde(default = "default_automatic_feedback_mode")]
     pub automatic_feedback_mode: String,
 
-    /// 将当前正常端可用网络交接给支持网络运行时的 PE；默认关闭。
+    /// 将当前 Wi-Fi 配置和本机无线网卡驱动交接给支持网络运行时的 PE（需换用带 Wi-Fi 的 PE WIM）；
+    /// 默认关闭。
     #[serde(default)]
     pub pe_network_enabled: bool,
 
@@ -412,6 +413,7 @@ mod tests {
         assert!(enabled.pe_network_enabled);
     }
 
+    #[test]
     fn download_threads_are_normalized_to_supported_tiers() {
         assert_eq!(normalize_download_threads(0), 8);
         assert_eq!(normalize_download_threads(8), 8);

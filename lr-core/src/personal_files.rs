@@ -1601,9 +1601,10 @@ pub fn delete_old_system_in_place(target_root: &Path) -> Result<InPlaceDeletionR
                     Err(fallback) if fallback.kind() == std::io::ErrorKind::NotFound => {
                         report.deleted_roots += 1
                     }
-                    Err(fallback) => report
-                        .failures
-                        .push(format!("{}: {error:#}; fallback: {fallback}", path.display())),
+                    Err(fallback) => report.failures.push(format!(
+                        "{}: {error:#}; fallback: {fallback}",
+                        path.display()
+                    )),
                 }
             }
         }
@@ -1621,9 +1622,10 @@ pub fn delete_old_system_in_place(target_root: &Path) -> Result<InPlaceDeletionR
             Err(error) => match std::fs::remove_file(&path) {
                 Ok(()) => report.deleted_roots += 1,
                 Err(fallback) if fallback.kind() == std::io::ErrorKind::NotFound => {}
-                Err(fallback) => report
-                    .failures
-                    .push(format!("{}: {error:#}; fallback: {fallback}", path.display())),
+                Err(fallback) => report.failures.push(format!(
+                    "{}: {error:#}; fallback: {fallback}",
+                    path.display()
+                )),
             },
         }
     }

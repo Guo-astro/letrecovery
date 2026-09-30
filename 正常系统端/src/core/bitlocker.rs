@@ -1561,6 +1561,22 @@ fn get_volume_info(_drive: &str) -> (String, u64) {
     (String::new(), 0)
 }
 
+/// manage-bde.exe resolved independently of PATH. A 32-bit build on 64-bit Windows must use
+/// Sysnative, because manage-bde.exe exists only in the native System32 directory.
+fn manage_bde_path() -> std::path::PathBuf {
+    let windows = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    for directory in ["Sysnative", "System32"] {
+        let candidate = windows.join(directory).join("manage-bde.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    std::path::PathBuf::from("manage-bde")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1663,20 +1679,4 @@ Volume C: []
 "#;
         assert_eq!(get_encryption_percentage(fully_decrypted), Some(0));
     }
-}
-
-/// manage-bde.exe resolved independently of PATH. A 32-bit build on 64-bit Windows must use
-/// Sysnative, because manage-bde.exe exists only in the native System32 directory.
-fn manage_bde_path() -> std::path::PathBuf {
-    let windows = std::env::var_os("SystemRoot")
-        .or_else(|| std::env::var_os("windir"))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
-    for directory in ["Sysnative", "System32"] {
-        let candidate = windows.join(directory).join("manage-bde.exe");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    std::path::PathBuf::from("manage-bde")
 }

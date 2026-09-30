@@ -1045,12 +1045,11 @@ pub fn expand_c_drive(
         .collect();
     carried.sort_by_key(|p| p.offset);
     if carried.len() != config.expected_moved_partitions.len()
-        || carried
-            .iter()
-            .zip(&config.expected_moved_partitions)
-            .any(|(p, &(number, offset, length))| {
+        || carried.iter().zip(&config.expected_moved_partitions).any(
+            |(p, &(number, offset, length))| {
                 p.number != number || p.offset != offset || p.length != length
-            })
+            },
+        )
     {
         bail!("{}", tr!("重启后磁盘或相邻分区身份/几何已变化，拒绝写盘"));
     }
@@ -1118,13 +1117,15 @@ pub fn expand_c_drive(
     for p in &carried {
         let recovery = is_gpt_recovery(gpt, p);
         if p.is_special && !recovery {
-            bail!("{}", tr!("C 盘和供体分区之间有不能移动的系统分区，拒绝操作"));
+            bail!(
+                "{}",
+                tr!("C 盘和供体分区之间有不能移动的系统分区，拒绝操作")
+            );
         }
         let letter = letter_for(disk, p.offset);
         if !recovery {
-            let letter = letter.ok_or_else(|| {
-                anyhow!("{}", tr!("要一起挪动的分区没有盘符，无法安全移动"))
-            })?;
+            let letter = letter
+                .ok_or_else(|| anyhow!("{}", tr!("要一起挪动的分区没有盘符，无法安全移动")))?;
             let file_system = volume_file_system(letter).map_err(|error| {
                 anyhow!(
                     "{}",
@@ -1435,13 +1436,14 @@ pub fn expand_c_drive(
         let carry_layout = lr_core::windows_storage::disk_layout_snapshot(disk)?;
         let lock = match letter {
             Some(letter) => Some(unsafe { lock_dismount_volume(*letter) }?),
-            None => match lr_core::windows_storage::try_volume_guid_path_for_partition(
-                disk, p.offset,
-            )? {
-                Some(path) => Some(unsafe { lock_dismount_volume_path(&path) }?),
-                // Not mounted as a volume: no file system can write to it meanwhile.
-                None => None,
-            },
+            None => {
+                match lr_core::windows_storage::try_volume_guid_path_for_partition(disk, p.offset)?
+                {
+                    Some(path) => Some(unsafe { lock_dismount_volume_path(&path) }?),
+                    // Not mounted as a volume: no file system can write to it meanwhile.
+                    None => None,
+                }
+            }
         };
         let report = |done: u64, total: u64| {
             let percent = if total == 0 {
@@ -1459,7 +1461,8 @@ pub fn expand_c_drive(
             );
         };
         report(0, p.length);
-        let moved = unsafe { raw_move_right(disk, p.offset, p.length, shift, &carry_layout, &report) };
+        let moved =
+            unsafe { raw_move_right(disk, p.offset, p.length, shift, &carry_layout, &report) };
         if let Some(handle) = lock {
             unsafe {
                 let _ = CloseHandle(handle);
@@ -1576,7 +1579,10 @@ pub fn expand_c_drive(
     // partition GUID, which the recreated entry keeps).
     if !moved_recovery.is_empty() {
         match update_winre_location(data_partition, &moved_recovery) {
-            Ok(changed) => journal(data_partition, &format!("WINRE location updated: {changed}")),
+            Ok(changed) => journal(
+                data_partition,
+                &format!("WINRE location updated: {changed}"),
+            ),
             Err(error) => {
                 journal(data_partition, &format!("WINRE UPDATE FAILED: {error}"));
                 log::warn!("[EXPAND-MOVE] ReAgent.xml update failed: {error}");
@@ -1659,7 +1665,10 @@ unsafe fn lock_dismount_volume_path(volume_path: &str) -> Result<HANDLE> {
     }
     let mut returned: u32 = 0;
     for (control, failure) in [
-        (FSCTL_LOCK_VOLUME, tr!("锁定卷 {} 失败（可能有句柄占用）", path)),
+        (
+            FSCTL_LOCK_VOLUME,
+            tr!("锁定卷 {} 失败（可能有句柄占用）", path),
+        ),
         (FSCTL_DISMOUNT_VOLUME, tr!("卸载卷 {} 失败", path)),
     ] {
         if DeviceIoControl(handle, control, None, 0, None, 0, Some(&mut returned), None).is_err() {

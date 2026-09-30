@@ -16,10 +16,9 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowTextLengthW, GetWindowTextW, MoveWindow, SendMessageW,
-    ShowWindow, BS_OWNERDRAW, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT,
-    CB_SETCURSEL, ES_AUTOHSCROLL, ES_PASSWORD, ES_READONLY, SW_HIDE, SW_SHOW, WM_SETFONT,
-    WS_BORDER, WS_TABSTOP,
+    GetClientRect, GetWindowTextLengthW, GetWindowTextW, MoveWindow, SendMessageW, ShowWindow,
+    BS_OWNERDRAW, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL,
+    ES_AUTOHSCROLL, ES_PASSWORD, ES_READONLY, SW_HIDE, SW_SHOW, WM_SETFONT, WS_BORDER, WS_TABSTOP,
 };
 
 use super::super::controls::{child, wide};

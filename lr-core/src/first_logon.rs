@@ -687,7 +687,10 @@ exit $finalExitCode
 /// LF-only files. Rust normalizes the literal to LF, so the staged launcher is written with the
 /// Windows CRLF line endings cmd.exe expects.
 fn launcher_file_bytes() -> Vec<u8> {
-    LAUNCHER.replace("\r\n", "\n").replace('\n', "\r\n").into_bytes()
+    LAUNCHER
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n")
+        .into_bytes()
 }
 
 pub fn stage(target_partition: &str) -> Result<PathBuf> {
@@ -1855,6 +1858,11 @@ struct PersonalRestoreProgressWindow {
     session_id: String,
     phase: PersonalRestoreProgressPhase,
     animation_tick: u32,
+    /// Timer tick at which the phase identified by `progress_phase_rank` started.
+    phase_started_tick: u32,
+    progress_phase_rank: u8,
+    /// Last painted percentage. The bar never moves below it.
+    displayed_percent: u8,
     dpi: u32,
     preview: bool,
     background: windows::Win32::Graphics::Gdi::HBRUSH,
@@ -2005,29 +2013,90 @@ unsafe fn draw_progress_shell_text(
     let _ = SelectObject(dc, old_font);
 }
 
+/// Timer period of the native progress Shell window.
+#[cfg(windows)]
+const PERSONAL_RESTORE_PROGRESS_TICK_MS: u32 = 250;
+
+/// Time-based, never-decreasing estimate for one personal-file restore phase.
+///
+/// The privileged worker publishes phase receipts only, never byte counts, so the bar cannot
+/// show real progress. It must still never move backwards: the former triangle-wave animation
+/// ran the bar from the phase minimum to its maximum and back down again every ~28 seconds,
+/// which users read as restored files being lost. The estimate approaches the phase maximum
+/// hyperbolically (`span * t / (t + half_life)`): half of the span after one half-life, three
+/// quarters after three, and never the maximum itself while the phase is still running.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn monotonic_phase_progress(
+    minimum: u8,
+    maximum: u8,
+    ticks_in_phase: u32,
+    half_life_ticks: u32,
+) -> u8 {
+    let span = u64::from(maximum.saturating_sub(minimum));
+    if span == 0 {
+        return minimum;
+    }
+    let elapsed = u64::from(ticks_in_phase);
+    let half_life = u64::from(half_life_ticks.max(1));
+    let offset = (span * elapsed / (elapsed + half_life)).min(span - 1);
+    minimum.saturating_add(offset as u8)
+}
+
+#[cfg(windows)]
+fn personal_restore_phase_rank(phase: &PersonalRestoreProgressPhase) -> u8 {
+    match phase {
+        PersonalRestoreProgressPhase::Restoring => 0,
+        PersonalRestoreProgressPhase::Verifying => 1,
+        PersonalRestoreProgressPhase::StartingDesktop => 2,
+        PersonalRestoreProgressPhase::Failed(_) => 3,
+    }
+}
+
 #[cfg(windows)]
 fn personal_restore_progress_percent(
     phase: &PersonalRestoreProgressPhase,
-    animation_tick: u32,
+    ticks_in_phase: u32,
+    previous: u8,
 ) -> u8 {
-    if matches!(phase, PersonalRestoreProgressPhase::Failed(_)) {
-        return 100;
+    let ticks_per_second = 1000 / PERSONAL_RESTORE_PROGRESS_TICK_MS;
+    let estimate = match phase {
+        PersonalRestoreProgressPhase::Failed(_) => return 100,
+        PersonalRestoreProgressPhase::Restoring => {
+            monotonic_phase_progress(14, 70, ticks_in_phase, 60 * ticks_per_second)
+        }
+        PersonalRestoreProgressPhase::Verifying => {
+            monotonic_phase_progress(74, 88, ticks_in_phase, 10 * ticks_per_second)
+        }
+        PersonalRestoreProgressPhase::StartingDesktop => {
+            monotonic_phase_progress(92, 98, ticks_in_phase, 5 * ticks_per_second)
+        }
+    };
+    // A late or repeated receipt may briefly report an earlier phase; the bar keeps its place.
+    estimate.max(previous)
+}
+
+/// Advance the displayed percentage by one timer tick, restarting the estimate on phase change.
+#[cfg(windows)]
+fn advance_personal_restore_progress(state: &mut PersonalRestoreProgressWindow) {
+    let rank = personal_restore_phase_rank(&state.phase);
+    if rank != state.progress_phase_rank {
+        state.progress_phase_rank = rank;
+        state.phase_started_tick = state.animation_tick;
     }
-    let (minimum, maximum) = match phase {
-        PersonalRestoreProgressPhase::Restoring => (14_u32, 70_u32),
-        PersonalRestoreProgressPhase::Verifying => (74, 88),
-        PersonalRestoreProgressPhase::StartingDesktop => (92, 98),
-        PersonalRestoreProgressPhase::Failed(_) => unreachable!(),
-    };
-    let distance = maximum - minimum;
-    let cycle = distance.saturating_mul(2).max(1);
-    let position = (animation_tick / 2) % cycle;
-    let offset = if position <= distance {
-        position
+    state.displayed_percent = personal_restore_progress_percent(
+        &state.phase,
+        state.animation_tick.wrapping_sub(state.phase_started_tick),
+        state.displayed_percent,
+    );
+}
+
+#[cfg(windows)]
+fn personal_restore_displayed_percent(state: &PersonalRestoreProgressWindow) -> u8 {
+    if matches!(state.phase, PersonalRestoreProgressPhase::Failed(_)) {
+        100
     } else {
-        cycle - position
-    };
-    (minimum + offset) as u8
+        state.displayed_percent
+    }
 }
 
 #[cfg(windows)]
@@ -2203,7 +2272,7 @@ unsafe fn paint_personal_restore_progress_surface(
                 right: bar_rect.right + offset_x,
                 bottom: bar_rect.bottom + offset_y,
             },
-            personal_restore_progress_percent(&state.phase, state.animation_tick),
+            personal_restore_displayed_percent(state),
         );
     }
 }
@@ -2241,6 +2310,7 @@ unsafe extern "system" fn personal_restore_progress_window_proc(
                 let _ = GetClientRect(hwnd, &mut client);
                 let (_, bar) = personal_restore_progress_layout(client, state.dpi);
                 if state.preview {
+                    advance_personal_restore_progress(state);
                     let _ = InvalidateRect(hwnd, Some(&bar), false);
                     return LRESULT(0);
                 }
@@ -2251,6 +2321,7 @@ unsafe extern "system" fn personal_restore_progress_window_proc(
                         let _ = DestroyWindow(hwnd);
                     }
                     Ok(false) => {
+                        advance_personal_restore_progress(state);
                         let failed_after =
                             matches!(state.phase, PersonalRestoreProgressPhase::Failed(_));
                         let _ = InvalidateRect(
@@ -2445,6 +2516,13 @@ fn run_personal_restore_progress_window(
         session_id,
         phase: PersonalRestoreProgressPhase::Restoring,
         animation_tick: 0,
+        phase_started_tick: 0,
+        progress_phase_rank: 0,
+        displayed_percent: personal_restore_progress_percent(
+            &PersonalRestoreProgressPhase::Restoring,
+            0,
+            0,
+        ),
         dpi: initial_dpi,
         preview,
         background: unsafe { CreateSolidBrush(COLORREF(0x002b_2b2b)) },
@@ -2498,7 +2576,7 @@ fn run_personal_restore_progress_window(
         )
     }
     .context("CreateWindowExW(progress Shell)")?;
-    if unsafe { SetTimer(hwnd, 1, 250, None) } == 0 {
+    if unsafe { SetTimer(hwnd, 1, PERSONAL_RESTORE_PROGRESS_TICK_MS, None) } == 0 {
         // The production window itself is already visible. Keep a permanent failure page rather
         // than destroying the only Shell UI and falling back to a black desktop.
         state.phase = PersonalRestoreProgressPhase::Failed(format!(
@@ -3653,6 +3731,30 @@ mod tests {
         )));
         assert!(!command.contains("powershell.exe"));
         assert!(!command.contains("&amp;"));
+    }
+
+    #[test]
+    fn personal_restore_progress_estimate_never_moves_backwards() {
+        let phases = [(14_u8, 70_u8, 240_u32), (74, 88, 40), (92, 98, 20)];
+        for (minimum, maximum, half_life) in phases {
+            let mut previous = minimum;
+            for tick in 0..20_000_u32 {
+                let value = monotonic_phase_progress(minimum, maximum, tick, half_life);
+                assert!(value >= previous, "tick {tick}");
+                assert!(value >= minimum, "tick {tick}");
+                assert!(value < maximum, "tick {tick}");
+                previous = value;
+            }
+        }
+        assert_eq!(monotonic_phase_progress(14, 70, 0, 240), 14);
+        assert_eq!(monotonic_phase_progress(14, 70, 240, 240), 42);
+        assert_eq!(monotonic_phase_progress(92, 98, u32::MAX, 20), 97);
+        assert_eq!(monotonic_phase_progress(50, 50, 10, 20), 50);
+        // Every later phase starts above the highest value the previous phase can reach.
+        let restoring_ceiling = monotonic_phase_progress(14, 70, u32::MAX, 240);
+        let verifying_ceiling = monotonic_phase_progress(74, 88, u32::MAX, 40);
+        assert!(monotonic_phase_progress(74, 88, 0, 40) > restoring_ceiling);
+        assert!(monotonic_phase_progress(92, 98, 0, 20) > verifying_ceiling);
     }
 
     #[test]

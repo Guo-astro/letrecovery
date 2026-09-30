@@ -615,8 +615,9 @@ impl BackupPage {
         );
         let detail_x = (label_width + format_width + s(10)).min(width);
         // A long format description wraps instead of being cut off; the row grows with it.
-        let hint_height = crate::native_ui::layout::control_wrapped_height(h.format_hint, width - detail_x)
-            .max(metrics.label_height);
+        let hint_height =
+            crate::native_ui::layout::control_wrapped_height(h.format_hint, width - detail_x)
+                .max(metrics.label_height);
         let format_row_height = format_row_height.max(hint_height);
         move_control(
             h.format_hint,
@@ -715,8 +716,15 @@ impl BackupPage {
             );
         } else {
             // A longer translation gets its own row below the options instead of being cut off.
-            let height = crate::native_ui::layout::control_wrapped_height(h.warning, width).max(s(20));
-            move_control(h.warning, left, options_top + row_height + s(6), width, height);
+            let height =
+                crate::native_ui::layout::control_wrapped_height(h.warning, width).max(s(20));
+            move_control(
+                h.warning,
+                left,
+                options_top + row_height + s(6),
+                width,
+                height,
+            );
         }
     }
 

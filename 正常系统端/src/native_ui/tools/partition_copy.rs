@@ -18,9 +18,9 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, MoveWindow, SendMessageW, CBS_DROPDOWNLIST, CB_ADDSTRING,
-    CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
-    WM_SETFONT, WS_BORDER, WS_TABSTOP, WS_VSCROLL,
+    GetClientRect, MoveWindow, SendMessageW, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL,
+    CB_RESETCONTENT, CB_SETCURSEL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, WM_SETFONT,
+    WS_BORDER, WS_TABSTOP, WS_VSCROLL,
 };
 
 use super::super::controls::{child, combo_inventory_index, wide, NO_COMBO_SELECTION};

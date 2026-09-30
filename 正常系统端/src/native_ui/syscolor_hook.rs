@@ -26,7 +26,12 @@ static ORIGINAL_GET_SYS_COLOR_BRUSH: AtomicUsize = AtomicUsize::new(0);
 
 #[link(name = "kernel32")]
 extern "system" {
-    fn VirtualProtect(address: *mut core::ffi::c_void, size: usize, protect: u32, old: *mut u32) -> i32;
+    fn VirtualProtect(
+        address: *mut core::ffi::c_void,
+        size: usize,
+        protect: u32,
+        old: *mut u32,
+    ) -> i32;
 }
 
 #[link(name = "user32")]
@@ -119,7 +124,11 @@ pub(crate) unsafe fn install() {
         if name == 0 && first_thunk == 0 {
             break;
         }
-        let names = if original_first_thunk != 0 { original_first_thunk } else { first_thunk };
+        let names = if original_first_thunk != 0 {
+            original_first_thunk
+        } else {
+            first_thunk
+        };
         let mut index = 0usize;
         loop {
             let thunk = read::<u64>(base, names + index * 8);
@@ -137,10 +146,9 @@ pub(crate) unsafe fn install() {
                     bytes.push(byte);
                 }
                 let replacement = match bytes.as_slice() {
-                    b"GetSysColor" => Some((
-                        hooked_get_sys_color as usize,
-                        &ORIGINAL_GET_SYS_COLOR,
-                    )),
+                    b"GetSysColor" => {
+                        Some((hooked_get_sys_color as usize, &ORIGINAL_GET_SYS_COLOR))
+                    }
                     b"GetSysColorBrush" => Some((
                         hooked_get_sys_color_brush as usize,
                         &ORIGINAL_GET_SYS_COLOR_BRUSH,

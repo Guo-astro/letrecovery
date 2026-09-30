@@ -19,22 +19,25 @@ use std::cell::RefCell;
 use std::time::Instant;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, ClientToScreen, CreateFontIndirectW, CreateSolidBrush, DeleteObject, DrawTextW,
     EndPaint, FillRect, SelectObject, SetBkMode, SetTextColor, BLENDFUNCTION, DT_END_ELLIPSIS,
     DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetCapture, ReleaseCapture, SetCapture, SetFocus,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor, GetCaretPos,
     GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, LoadCursorW,
     PostQuitMessage, RegisterClassExW, SendMessageW, ShowWindow, TranslateMessage,
     UpdateLayeredWindow, GA_ROOT, GWL_STYLE, HMENU, IDC_ARROW, MSG, NONCLIENTMETRICSW,
-    SW_SHOWNOACTIVATE, ULW_ALPHA,
-    WINDOW_EX_STYLE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    SW_SHOWNOACTIVATE, ULW_ALPHA, WINDOW_EX_STYLE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use super::combo_popup::{cached_mask, compose_outline, work_area, Surface};
@@ -92,7 +95,9 @@ unsafe fn system_menu_font(dpi: u32) -> Option<HFONT> {
     let size = metrics.cbSize;
     let mut logfont = None;
     if let Ok(user32) = GetModuleHandleW(w!("user32.dll")) {
-        if let Some(procedure) = GetProcAddress(user32, windows::core::s!("SystemParametersInfoForDpi")) {
+        if let Some(procedure) =
+            GetProcAddress(user32, windows::core::s!("SystemParametersInfoForDpi"))
+        {
             let function: SystemParametersInfoForDpiFn = std::mem::transmute(procedure);
             let pointer = (&mut metrics as *mut NONCLIENTMETRICSW).cast::<core::ffi::c_void>();
             if function(SPI_GETNONCLIENTMETRICS, size, pointer, 0, dpi) != 0 {
@@ -108,7 +113,11 @@ unsafe fn system_menu_font(dpi: u32) -> Option<HFONT> {
             let system = i64::from(GetDpiForSystem().max(96));
             let height = i64::from(font.lfHeight);
             let scaled = (height.abs() * i64::from(dpi.max(96)) + system / 2) / system;
-            font.lfHeight = if height < 0 { -scaled as i32 } else { scaled as i32 };
+            font.lfHeight = if height < 0 {
+                -scaled as i32
+            } else {
+                scaled as i32
+            };
             logfont = Some(font);
         }
     }
@@ -245,15 +254,40 @@ pub(crate) unsafe fn show_for_edit(edit: HWND, lparam: LPARAM, palette: Palette)
         let can_paste = IsClipboardFormatAvailable(CF_UNICODETEXT) != 0;
         items.push(item(crate::tr!("撤销"), 'U', can_undo, EditCommand::Undo));
         items.push(separator_item());
-        items.push(item(crate::tr!("剪切"), 'T', has_selection && !password, EditCommand::Cut));
-        items.push(item(crate::tr!("复制"), 'R', has_selection && !password, EditCommand::Copy));
+        items.push(item(
+            crate::tr!("剪切"),
+            'T',
+            has_selection && !password,
+            EditCommand::Cut,
+        ));
+        items.push(item(
+            crate::tr!("复制"),
+            'R',
+            has_selection && !password,
+            EditCommand::Copy,
+        ));
         items.push(item(crate::tr!("粘贴"), 'P', can_paste, EditCommand::Paste));
-        items.push(item(crate::tr!("删除"), 'D', has_selection, EditCommand::Delete));
+        items.push(item(
+            crate::tr!("删除"),
+            'D',
+            has_selection,
+            EditCommand::Delete,
+        ));
     } else {
-        items.push(item(crate::tr!("复制"), 'R', has_selection && !password, EditCommand::Copy));
+        items.push(item(
+            crate::tr!("复制"),
+            'R',
+            has_selection && !password,
+            EditCommand::Copy,
+        ));
     }
     items.push(separator_item());
-    items.push(item(crate::tr!("全选"), 'A', has_text, EditCommand::SelectAll));
+    items.push(item(
+        crate::tr!("全选"),
+        'A',
+        has_text,
+        EditCommand::SelectAll,
+    ));
     // Mouse: at the pointer. Keyboard (Shift+F10, Menu key, lParam -1): at the caret.
     let mut at = POINT::default();
     if lparam.0 == -1 {
@@ -270,10 +304,10 @@ pub(crate) unsafe fn show_for_edit(edit: HWND, lparam: LPARAM, palette: Palette)
     let chosen = track(edit, at, items, palette, font);
     if let Some(command) = chosen {
         let message = match command {
-            EditCommand::Undo => 0x0304,  // WM_UNDO
-            EditCommand::Cut => 0x0300,   // WM_CUT
-            EditCommand::Copy => 0x0301,  // WM_COPY
-            EditCommand::Paste => 0x0302, // WM_PASTE
+            EditCommand::Undo => 0x0304,   // WM_UNDO
+            EditCommand::Cut => 0x0300,    // WM_CUT
+            EditCommand::Copy => 0x0301,   // WM_COPY
+            EditCommand::Paste => 0x0302,  // WM_PASTE
             EditCommand::Delete => 0x0303, // WM_CLEAR
             EditCommand::SelectAll => {
                 let _ = SendMessageW(edit, 0x00b1, WPARAM(0), LPARAM(-1)); // EM_SETSEL
@@ -307,19 +341,28 @@ unsafe fn track(
     let measure = |text: &str| -> SIZE {
         let mut size = SIZE::default();
         if !text.is_empty() {
-            let _ =
-                windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(screen, &wide(text), &mut size);
+            let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(
+                screen,
+                &wide(text),
+                &mut size,
+            );
         }
         size
     };
-    let widest_label = items.iter().map(|item| measure(&item.label).cx).max().unwrap_or(0);
+    let widest_label = items
+        .iter()
+        .map(|item| measure(&item.label).cx)
+        .max()
+        .unwrap_or(0);
     let text_line = measure("Ag\u{4e2d}").cy;
     if let Some(previous) = previous {
         let _ = SelectObject(screen, previous);
     }
     let _ = windows::Win32::Graphics::Gdi::ReleaseDC(HWND::default(), screen);
     let (radius, border) = rounded_control_frame_geometry(s(170), s(200), dpi)
-        .map_or((s(5), s(1).max(1)), |geometry| (geometry.radius, geometry.side_band.max(1)));
+        .map_or((s(5), s(1).max(1)), |geometry| {
+            (geometry.radius, geometry.side_band.max(1))
+        });
     // Native rows (never lower than the text plus the native breathing room for a larger
     // system menu font), native separators and native insets inside LetRecovery's frame.
     let row_height = native(NATIVE_ROW, dpi).max(text_line + native(11, dpi));
@@ -332,14 +375,26 @@ unsafe fn track(
     let mut y = padding + vertical_pad;
     for item in &items {
         tops.push(y);
-        y += if item.separator { separator_height } else { row_height };
+        y += if item.separator {
+            separator_height
+        } else {
+            row_height
+        };
     }
     tops.push(y);
     let height = y + vertical_pad + padding;
     // Keep the whole menu on the monitor: open left of / above the point when needed.
     let work = work_area(owner);
-    let x = if at.x + width > work.right { (at.x - width).max(work.left) } else { at.x };
-    let y = if at.y + height > work.bottom { (at.y - height).max(work.top) } else { at.y };
+    let x = if at.x + width > work.right {
+        (at.x - width).max(work.left)
+    } else {
+        at.x
+    };
+    let y = if at.y + height > work.bottom {
+        (at.y - height).max(work.top)
+    } else {
+        at.y
+    };
     let origin = POINT { x, y };
     let Ok(hwnd) = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
@@ -413,7 +468,7 @@ unsafe fn track(
     // Modal loop, like TrackPopupMenu: keys are handled here, the mouse by the menu window.
     let mut message = MSG::default();
     loop {
-        let finished = MENU.with(|cell| cell.borrow().as_ref().map_or(true, |menu| menu.done));
+        let finished = MENU.with(|cell| cell.borrow().as_ref().is_none_or(|menu| menu.done));
         if finished {
             break;
         }
@@ -450,7 +505,10 @@ unsafe fn track(
     menu.surface.release();
     release_font();
     let chosen = menu.chosen?;
-    menu.items.get(chosen).filter(|item| item.enabled).and_then(|item| item.command)
+    menu.items
+        .get(chosen)
+        .filter(|item| item.enabled)
+        .and_then(|item| item.command)
 }
 
 unsafe fn close_menu(chosen: Option<usize>) {

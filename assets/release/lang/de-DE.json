@@ -2573,7 +2573,7 @@
         "写入自定义无人值守文件失败": "Die benutzerdefinierte Antwortdatei konnte nicht geschrieben werden",
         "读取原备份标记文件失败": "Die ursprüngliche Sicherungsmarkierungsdatei konnte nicht gelesen werden",
         "正在启动镜像释放引擎...": "Abbild-Anwendungsmodul wird gestartet...",
-        "未找到可用的 dism.exe。请确保系统已安装 DISM 或将 dism.exe 放置于程序目录的 bin\\Dism\\ 下\n已搜索路径:\n- {程序目录}\\bin\\Dism\\dism.exe\n- Windows API 返回的实际 System32\\Dism.exe\n- X:\\Windows\\System32\\dism.exe (常见 PE 环境)": "Es wurde keine verwendbare dism.exe gefunden. Stellen Sie sicher, dass DISM im System installiert ist, oder legen Sie dism.exe unter bin\\Dism\\ im Programmordner ab\nDurchsuchte Pfade:\n- {Programmordner}\\bin\\Dism\\dism.exe\n- Die von der Windows-API gelieferte tatsächliche System32\\Dism.exe\n- X:\\Windows\\System32\\dism.exe (übliche PE-Umgebung)",
+        "未找到可用的 dism.exe。请确保系统已安装 DISM 或将 dism.exe 放置于程序目录的 bin\\Dism\\ 下\n已搜索路径:\n- {程序目录}\\bin\\Dism\\dism.exe\n- Windows API 返回的实际 System32\\Dism.exe\n- X:\\Windows\\System32\\dism.exe (常见 PE 环境)": "Es wurde keine verwendbare dism.exe gefunden. Stellen Sie sicher, dass DISM im System installiert ist, oder legen Sie dism.exe unter bin\\Dism\\ im Programmordner ab\nDurchsuchte Pfade:\n- <Programmordner>\\bin\\Dism\\dism.exe\n- Die von der Windows-API gelieferte tatsächliche System32\\Dism.exe\n- X:\\Windows\\System32\\dism.exe (übliche PE-Umgebung)",
         "{}失败，退出代码: {}，详情: {}": "{} fehlgeschlagen, Exitcode: {}, Details: {}",
         "无法获取 DISM stdout": "DISM-Standardausgabe nicht verfügbar",
         "无法获取 DISM stderr": "DISM-Fehlerausgabe nicht verfügbar",

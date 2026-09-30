@@ -340,10 +340,12 @@ fn field_rule(key: &str) -> Option<(&'static str, ValueKind)> {
         "CanonicalPartitionOffsetBytes"
         | "CanonicalPartitionLengthBytes"
         | "WifiProfileLength"
+        | "PeNetworkPayloadLength"
         | "ImageChunkedLength"
         | "ImageExpandedBytes" => ("Install", ValueKind::U64),
         "ImageChunkedSha256" => ("Install", ValueKind::Hex { bytes: 32 }),
         "WifiProfileSha256" => ("Install", ValueKind::Hex { bytes: 32 }),
+        "PeNetworkPayloadSha256" => ("Install", ValueKind::Hex { bytes: 32 }),
         "CanonicalDiskStyle" => ("Install", ValueKind::CanonicalStyle),
         "CanonicalGptPartitionId" => ("Install", ValueKind::CanonicalGptId),
         "HandoffManifestVersion" => ("HandoffManifest", ValueKind::U8 { max: 1 }),

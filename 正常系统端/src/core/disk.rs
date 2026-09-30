@@ -435,7 +435,11 @@ impl PreparedDualBootTransaction {
             .source_offset_bytes
             .checked_add(self.plan.source_length_after_bytes)
             .context("dual-boot rollback tail offset overflow")?;
+        let tail_end = tail_offset
+            .checked_add(reclaimed)
+            .context("dual-boot rollback tail end overflow")?;
         let records = lr_core::windows_storage::partitions(self.source_disk_number)?;
+        let mut created_offsets = Vec::new();
         for record in &records {
             let overlap = lr_core::custom_install::ranges_overlap(
                 record.offset_bytes,
@@ -444,44 +448,31 @@ impl PreparedDualBootTransaction {
                 reclaimed,
             )
             .map_err(anyhow::Error::msg)?;
-            let owned_target = record.offset_bytes == self.plan.target_offset_bytes
-                && record.size_bytes == self.plan.target_length_bytes
-                && record.kind == lr_core::windows_storage::PartitionKind::BasicData;
-            let owned_data = self.plan.data_offset_bytes.is_some_and(|offset| {
-                record.offset_bytes == offset
-                    && record.size_bytes == self.plan.data_length_bytes
-                    && record.kind == lr_core::windows_storage::PartitionKind::BasicData
-            });
-            if overlap && !owned_target && !owned_data {
+            if !overlap {
+                continue;
+            }
+            // Every byte of the reclaimed tail belonged to the source volume until this
+            // transaction's Shrink committed, so a basic-data partition that STARTS inside it can
+            // only have been created by this attempt. That includes an extent whose end VDS
+            // rounded past the tail (observed: to the next 1 MiB boundary), which the former
+            // exact offset+length ownership test reported as "unowned" and left on disk together
+            // with the shrunk source volume.
+            let start = record.offset_bytes;
+            let starts_in_tail = start >= tail_offset && start < tail_end;
+            let basic_data = record.kind == lr_core::windows_storage::PartitionKind::BasicData;
+            if !starts_in_tail || !basic_data {
                 anyhow::bail!("dual-boot rollback tail contains an unowned partition");
             }
+            created_offsets.push(record.offset_bytes);
         }
-        if let Some(offset) = self.plan.data_offset_bytes {
-            if records.iter().any(|record| {
-                record.offset_bytes == offset
-                    && record.size_bytes == self.plan.data_length_bytes
-                    && record.kind == lr_core::windows_storage::PartitionKind::BasicData
-            }) {
-                let snapshot =
-                    lr_core::windows_storage::disk_layout_snapshot(self.source_disk_number)?;
-                lr_core::windows_storage::delete_partition_checked(
-                    self.source_disk_number,
-                    offset,
-                    false,
-                    &snapshot,
-                )?;
-            }
-        }
-        let records = lr_core::windows_storage::partitions(self.source_disk_number)?;
-        if records.iter().any(|record| {
-            record.offset_bytes == self.plan.target_offset_bytes
-                && record.size_bytes == self.plan.target_length_bytes
-                && record.kind == lr_core::windows_storage::PartitionKind::BasicData
-        }) {
+        // Delete the later (data/staging) extent before the Windows target, each against a fresh
+        // canonical layout snapshot.
+        created_offsets.sort_unstable_by(|left, right| right.cmp(left));
+        for offset in created_offsets {
             let snapshot = lr_core::windows_storage::disk_layout_snapshot(self.source_disk_number)?;
             lr_core::windows_storage::delete_partition_checked(
                 self.source_disk_number,
-                self.plan.target_offset_bytes,
+                offset,
                 false,
                 &snapshot,
             )?;
@@ -621,6 +612,32 @@ fn logical_sector_capacity_ceiling(bytes: u64, logical_sector_bytes: u32) -> Res
     bytes
         .checked_add(sector - remainder)
         .context("sector-rounded Shrink capacity overflow")
+}
+
+/// Extra bytes a dual-boot Shrink reclaims so VDS can align the partitions it creates.
+///
+/// `CreatePartitionEx(ulAlign = 0)` moves the start of every new partition up to the next 1 MiB
+/// boundary (and rounds its size up to whole MiB). The reclaimed tail starts and ends wherever
+/// the source volume did, which is normally not on a MiB boundary, so reclaiming exactly
+/// "Windows + data" left no room for that rounding. VMware NVMe evidence: an 80 GiB request at
+/// offset 50713062912 was created at 50713329664 and ended 266752 bytes past the tail; the create
+/// was correctly rejected and rolled back, so dual-boot could never succeed on that layout. One
+/// unit for the start and one for the end always fit the full confirmed capacities; the unused
+/// remainder simply stays unallocated behind the new partitions.
+const DUAL_BOOT_ALIGNMENT_RESERVE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Provider Shrink request for a dual-boot plan: the confirmed Windows and data capacities plus
+/// the alignment reserve, rounded up to whole logical sectors.
+fn dual_boot_shrink_request(
+    target_length_bytes: u64,
+    data_length_bytes: u64,
+    logical_sector_bytes: u32,
+) -> Result<u64> {
+    let requested = target_length_bytes
+        .checked_add(data_length_bytes)
+        .and_then(|value| value.checked_add(DUAL_BOOT_ALIGNMENT_RESERVE_BYTES))
+        .context("dual-boot requested size overflow")?;
+    logical_sector_capacity_ceiling(requested, logical_sector_bytes)
 }
 
 /// A VDS Shrink may already be committed when a later refresh or identity readback reports an
@@ -897,14 +914,18 @@ impl DiskManager {
             lr_core::windows_storage::physical_disk_sector_geometry(source.disk_number)
                 .map_err(anyhow::Error::from)
                 .context("read dual-boot source disk sector geometry")?;
-        let shrink_request =
-            logical_sector_capacity_ceiling(requested, sector_geometry.logical_sector_bytes)?;
+        let shrink_request = dual_boot_shrink_request(
+            plan.target_length_bytes,
+            plan.data_length_bytes,
+            sector_geometry.logical_sector_bytes,
+        )?;
         log::info!(
-            "dual-boot Shrink capacity plan: requested={} logical_sector={} provider_request={} overhead={}",
+            "dual-boot Shrink capacity plan: requested={} logical_sector={} provider_request={} overhead={} alignment_reserve={}",
             requested,
             sector_geometry.logical_sector_bytes,
             shrink_request,
-            shrink_request - requested
+            shrink_request - requested,
+            DUAL_BOOT_ALIGNMENT_RESERVE_BYTES
         );
         let _provider_reported_reclaimed = match lr_core::windows_storage::shrink_volume_checked(
             source_letter,
@@ -1178,7 +1199,9 @@ impl DiskManager {
         // exact extent, then take the role from the partition table when it is readable, or
         // from volume-level evidence when it is not.
         for partition in &mut partitions {
-            if partition.partition_offset_bytes.is_some() && partition.partition_size_bytes.is_some() {
+            if partition.partition_offset_bytes.is_some()
+                && partition.partition_size_bytes.is_some()
+            {
                 continue;
             }
             let Some(identity) = partition.stable_identity else {
@@ -1200,12 +1223,20 @@ impl DiskManager {
                             && candidate.size_bytes == identity.extent.extent_length_bytes
                     })
                     .copied()
-                    .map(|candidate| (candidate, layout.disk_size_bytes, layout.disk_size_estimated))
+                    .map(|candidate| {
+                        (
+                            candidate,
+                            layout.disk_size_bytes,
+                            layout.disk_size_estimated,
+                        )
+                    })
             });
             if let Some((candidate, disk_size_bytes, estimated)) = canonical {
                 partition.partition_kind = Some(partition_kind_from_token(candidate.token));
                 partition.install_target_eligible =
-                    lr_core::windows_storage::partition_token_is_installable_user_data(candidate.token);
+                    lr_core::windows_storage::partition_token_is_installable_user_data(
+                        candidate.token,
+                    );
                 if !estimated {
                     partition.disk_size_bytes = Some(disk_size_bytes);
                 }
@@ -1217,11 +1248,14 @@ impl DiskManager {
             }
             let letter = partition.letter.clone();
             let eligible = partition.install_target_eligible;
-            lr_core::windows_storage::warn_storage_once(&format!("inventory-fallback:{letter}"), || {
-                format!(
+            lr_core::windows_storage::warn_storage_once(
+                &format!("inventory-fallback:{letter}"),
+                || {
+                    format!(
                     "[DISK INVENTORY] {letter} 的物理磁盘信息不可用，已用卷自身的精确范围补全（可作为安装目标: {eligible}）"
                 )
-            });
+                },
+            );
         }
 
         Ok(partitions)
@@ -2364,9 +2398,9 @@ impl DiskManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_shrink_target_is_safe, classify_staging_drive_type, logical_sector_capacity_ceiling,
-        observed_shrink_bytes, preferred_install_partition_index, reclaimed_tail,
-        validate_created_in_reclaimed_tail, validate_formatted_payload_capacity,
+        auto_shrink_target_is_safe, classify_staging_drive_type, dual_boot_shrink_request,
+        logical_sector_capacity_ceiling, observed_shrink_bytes, preferred_install_partition_index,
+        reclaimed_tail, validate_created_in_reclaimed_tail, validate_formatted_payload_capacity,
         vds_aligned_reclaim_bytes, vds_alignment_value_for_disk_size, Partition, PartitionStyle,
         StagingDriveKind, DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
     };
@@ -2401,6 +2435,25 @@ mod tests {
             storage_media: media,
             stable_identity: None,
             bitlocker_status: VolumeStatus::NotEncrypted,
+        }
+    }
+
+    #[test]
+    fn dual_boot_shrink_reserves_room_for_provider_partition_alignment() {
+        let mib = 1024 * 1024_u64;
+        let target = 85_899_345_920_u64;
+        let shrink = dual_boot_shrink_request(target, 0, 512).unwrap();
+        assert_eq!(shrink, target + 2 * mib);
+        let with_data = dual_boot_shrink_request(target, 7_493_212_301, 512).unwrap();
+        assert_eq!(with_data % 512, 0);
+        assert!(with_data >= target + 7_493_212_301 + 2 * mib);
+        // VMware NVMe evidence: the source volume ended off a MiB boundary and VDS moved the start
+        // of the new partition up to the next MiB. With the reserve the full 80 GiB still fits.
+        let end = 136_612_408_832_u64;
+        for source_end in [end, end + 512, end + 1_048_064] {
+            let tail_start = source_end - shrink;
+            let provider_start = tail_start.div_ceil(mib) * mib;
+            assert!(provider_start + target <= source_end);
         }
     }
 

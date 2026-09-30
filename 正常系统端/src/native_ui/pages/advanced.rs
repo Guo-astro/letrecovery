@@ -568,6 +568,9 @@ pub struct AdvancedPageContext {
     pub preinstall_catalogue_available: bool,
     pub vmware_tools_available: bool,
     pub target_capabilities: AdvancedOptionCapabilities,
+    /// Whether "keep personal files" can run for the current target/image/install mode. The
+    /// install controller rejects the option otherwise, so it is hidden instead of offered.
+    pub personal_files_available: bool,
 }
 
 impl Default for AdvancedPageContext {
@@ -579,6 +582,7 @@ impl Default for AdvancedPageContext {
             preinstall_catalogue_available: false,
             vmware_tools_available: false,
             target_capabilities: AdvancedOptionCapabilities::unknown(),
+            personal_files_available: false,
         }
     }
 }
@@ -1162,7 +1166,8 @@ impl AdvancedPage {
     /// intentionally session-only even though the remaining compatible fields may be persisted.
     pub unsafe fn read_into(&self, data: &mut AdvancedOptionsData) {
         let h = &self.handles;
-        data.preserve_personal_files = is_checked(h.preserve_personal_files);
+        data.preserve_personal_files =
+            self.context.personal_files_available && is_checked(h.preserve_personal_files);
         data.update_supported_system_options(
             self.context.target_capabilities,
             h.system_checks.map(|control| is_checked(control)),
@@ -1426,13 +1431,15 @@ impl AdvancedPage {
             grid.column_width,
             dpi,
         );
-        layout_check(
-            h.preserve_personal_files,
-            x,
-            &mut bottoms[column],
-            grid.column_width,
-            dpi,
-        );
+        if self.context.personal_files_available {
+            layout_check(
+                h.preserve_personal_files,
+                x,
+                &mut bottoms[column],
+                grid.column_width,
+                dpi,
+            );
+        }
         for (index, check) in h.system_checks.into_iter().enumerate() {
             if self
                 .context
@@ -1837,6 +1844,20 @@ impl AdvancedPage {
     unsafe fn apply_context(&self) {
         let h = &self.handles;
         let unattended = self.context.unattended_enabled;
+        let personal_files_available = self.context.personal_files_available;
+        let _ = ShowWindow(
+            h.preserve_personal_files,
+            if personal_files_available {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+        let _ = EnableWindow(h.preserve_personal_files, personal_files_available);
+        if !personal_files_available {
+            // Hidden means unavailable, never "still selected but invisible".
+            set_checked(h.preserve_personal_files, false);
+        }
         for (index, control) in h.system_checks.into_iter().enumerate() {
             let supported = self
                 .context
@@ -3157,6 +3178,7 @@ mod tests {
         assert!(context.unattended_enabled);
         assert!(context.builtin_administrator_available);
         assert!(!context.wifi_available);
+        assert!(!context.personal_files_available);
         assert_eq!(
             context.target_capabilities,
             AdvancedOptionCapabilities::unknown()

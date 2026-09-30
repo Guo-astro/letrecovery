@@ -116,8 +116,8 @@ fn run_handoff(
         .map_err(|error| error.to_string())?;
     // The adjacent space is exact layout. The move maximum also depends on the donor's free space,
     // which changes whenever a file is written there, so the donor is pinned by identity below.
-    let strict_snapshot_changed = request.strict_analysis_snapshot
-        && fresh.no_move_max_mb != request.analyzed_no_move_max_mb;
+    let strict_snapshot_changed =
+        request.strict_analysis_snapshot && fresh.no_move_max_mb != request.analyzed_no_move_max_mb;
     let target_identity_changed = request
         .expected_disk
         .as_ref()

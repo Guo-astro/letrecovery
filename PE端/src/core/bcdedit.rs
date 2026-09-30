@@ -250,8 +250,7 @@ impl BootManager {
                             .ok()?
                             .into_iter()
                             .find(|partition| {
-                                partition.kind
-                                    == lr_core::windows_storage::PartitionKind::EfiSystem
+                                partition.kind == lr_core::windows_storage::PartitionKind::EfiSystem
                                     && partition.size_bytes >= MIN_FALLBACK_ESP_BYTES
                             })
                             .map(|esp| (candidate, esp))

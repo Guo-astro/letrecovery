@@ -451,8 +451,9 @@ impl DialogState {
             let mut right = primary_rect.x;
             for extra in extras.iter().rev() {
                 let mut text = [0u16; 128];
-                let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(*extra, &mut text)
-                    .max(0) as usize;
+                let length =
+                    windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(*extra, &mut text)
+                        .max(0) as usize;
                 let width = measured_button_width(
                     self.hwnd,
                     self.font,
@@ -827,9 +828,15 @@ impl DialogShell {
         }
         if audit {
             let title = {
-                let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(self.state.hwnd).max(0) as usize;
+                let length =
+                    windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(self.state.hwnd)
+                        .max(0) as usize;
                 let mut buffer = vec![0u16; length + 1];
-                let copied = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(self.state.hwnd, &mut buffer).max(0) as usize;
+                let copied = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(
+                    self.state.hwnd,
+                    &mut buffer,
+                )
+                .max(0) as usize;
                 String::from_utf16_lossy(&buffer[..copied])
             };
             super::ui_audit::audit_surface(self.state.hwnd, &format!("工具窗口/{title}"));

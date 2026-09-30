@@ -532,6 +532,19 @@ impl NativeInstallState {
             advanced_options.wifi_profile_xml.clear();
             advanced_options.wifi_ssid.clear();
         }
+        let builtin_unattend =
+            self.prefs.unattended_install && self.custom_unattend_path.trim().is_empty();
+        if advanced_options.migrate_wifi && !builtin_unattend {
+            // The profile is imported only by LetRecovery's own first-logon finalizer, which is
+            // staged exclusively with the built-in answer file. Without it the XML (including its
+            // plaintext key) would stay in LetRecovery_Scripts on the new system and never be
+            // imported. Skip the optional migration instead of shipping the secret.
+            let reason = "built_in_unattend_not_used";
+            log::warn!("[ADVANCED WIFI] status=skipped reason={reason}; installation continues");
+            advanced_options.migrate_wifi = false;
+            advanced_options.wifi_profile_xml.clear();
+            advanced_options.wifi_ssid.clear();
+        }
         // Windows 7 compatibility payloads are bundled, locked and selected by hardware policy.
         // They are not user-supplied advanced options: USB3 is considered for every identified
         // Windows 7 image, while the NVMe hotfix pair is allowed only for x64 plus a positively
@@ -681,6 +694,8 @@ impl StartInstallIntent {
             wifi_profile_length: 0,
             wifi_profile_sha256: String::new(),
             pe_network_enabled: crate::core::app_config::AppConfig::load().pe_network_enabled(),
+            pe_network_payload_length: 0,
+            pe_network_payload_sha256: String::new(),
             automatic_feedback_mode: crate::core::app_config::AppConfig::load()
                 .automatic_feedback_mode()
                 .to_owned(),
@@ -1001,6 +1016,30 @@ mod tests {
     }
 
     #[test]
+    fn wifi_migration_requires_the_built_in_first_logon_finalizer() {
+        for (unattended, custom_unattend) in [(false, ""), (true, r"D:\custom.xml")] {
+            let mut state = base_state();
+            let target = state.target.as_mut().unwrap();
+            target.is_current_system = true;
+            target.has_windows = true;
+            state.pe_available = true;
+            state.prefs.unattended_install = unattended;
+            state.custom_unattend_path = custom_unattend.to_string();
+            state.prefs.advanced_options.migrate_wifi = true;
+            state.prefs.advanced_options.wifi_profile_xml = "<WLANProfile />".to_string();
+            state.prefs.advanced_options.wifi_ssid = "current-network".to_string();
+
+            let intent = state
+                .start_intent()
+                .expect("an optional Wi-Fi migration must not block the installation");
+
+            assert!(!intent.options.advanced_options.migrate_wifi);
+            assert!(intent.options.advanced_options.wifi_profile_xml.is_empty());
+            assert!(intent.options.advanced_options.wifi_ssid.is_empty());
+        }
+    }
+
+    #[test]
     fn wifi_migration_is_preserved_for_via_pe_private_handoff() {
         let mut state = base_state();
         let target = state.target.as_mut().unwrap();
@@ -1252,7 +1291,10 @@ mod tests {
         let extent = stable_identity.unwrap().extent;
         assert_eq!(intent.target_disk_number, extent.disk_number);
         assert_eq!(intent.target_partition_offset_bytes, extent.offset_bytes);
-        assert_eq!(intent.target_partition_size_bytes, extent.extent_length_bytes);
+        assert_eq!(
+            intent.target_partition_size_bytes,
+            extent.extent_length_bytes
+        );
         assert_eq!(intent.target_disk_size_bytes, 0);
     }
 

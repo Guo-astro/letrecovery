@@ -694,7 +694,8 @@ impl DiskManager {
             _ => {}
         }
         let detail = Self::get_partition_style(target_partition);
-        if matches!(detail.style, PartitionStyle::MBR) && Self::mbr_target_boots_uefi(target_partition)
+        if matches!(detail.style, PartitionStyle::MBR)
+            && Self::mbr_target_boots_uefi(target_partition)
         {
             log::info!(
                 "[BOOT] 自动模式：目标 MBR 磁盘带有 EFI 系统分区且当前为 UEFI 启动，使用 UEFI"
@@ -711,7 +712,11 @@ impl DiskManager {
         if !matches!(Self::detect_uefi_mode(), Ok(true)) {
             return false;
         }
-        let Some(letter) = target_partition.trim_end_matches([':', '\\']).chars().next() else {
+        let Some(letter) = target_partition
+            .trim_end_matches([':', '\\'])
+            .chars()
+            .next()
+        else {
             return false;
         };
         let Ok(target) = lr_core::windows_storage::volume_identity(letter) else {

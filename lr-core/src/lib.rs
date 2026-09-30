@@ -44,6 +44,7 @@ pub mod onedrive_removal;
 pub mod operation;
 pub mod pca_compat;
 pub mod pca_preflight;
+pub mod pe_network;
 pub mod personal_files;
 pub mod progress_raster;
 pub mod reboot;

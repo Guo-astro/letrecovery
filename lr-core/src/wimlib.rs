@@ -1090,7 +1090,9 @@ impl WimlibManager {
             let actual = std::fs::canonicalize(first_part)
                 .map_err(|error| format!("canonicalize selected split WIM part: {error}"))?;
             if expected != actual {
-                return Err("the selected split WIM part is not the first authenticated part".into());
+                return Err(
+                    "the selected split WIM part is not the first authenticated part".into(),
+                );
             }
             if let Some(missing) = exact_resource_files.iter().find(|path| !path.is_file()) {
                 return Err(format!("split WIM part is missing: {}", missing.display()));

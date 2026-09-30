@@ -1171,7 +1171,10 @@ fn remove_uncommitted_in_place_payload(directory: &Path) {
             _ => std::fs::remove_file(&path),
         };
         match result {
-            Ok(()) => log::info!("[SCATTER] 安装未交接给 PE，已删除系统盘上的暂存条目 {}", path.display()),
+            Ok(()) => log::info!(
+                "[SCATTER] 安装未交接给 PE，已删除系统盘上的暂存条目 {}",
+                path.display()
+            ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => log::warn!(
                 "[SCATTER] 删除系统盘上的暂存条目 {} 失败，可以手动删除: {error}",
@@ -1709,9 +1712,16 @@ impl ProductionInstallBackend {
             ));
         }
 
-        let client = reqwest::blocking::Client::builder()
+        let builder = reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(60 * 60))
+            .timeout(std::time::Duration::from_secs(60 * 60));
+        // The unit tests serve packages from an in-process loopback listener. On a machine with a
+        // system proxy (Clash, v2rayN, WinINET/PAC settings) reqwest sent those requests to the
+        // proxy, the listener never saw them and the test blocked in `accept` until it was killed.
+        // Production downloads keep using the system proxy.
+        #[cfg(test)]
+        let builder = builder.no_proxy();
+        let client = builder
             .build()
             .map_err(|error| Self::error("build_preinstalled_software_client", error))?;
         let mut total = 0_u64;
@@ -1926,7 +1936,8 @@ impl ProductionInstallBackend {
         let packages = &intent.options.advanced_options.preinstalled_software;
         lr_core::software_install::validate_selected_packages(packages)
             .map_err(|error| Self::error("validate_preinstalled_software", error))?;
-        if !intent.options.unattended_install || !intent.options.custom_unattend_path.trim().is_empty()
+        if !intent.options.unattended_install
+            || !intent.options.custom_unattend_path.trim().is_empty()
         {
             // The applications are installed by LetRecovery's own first-logon finalizer, which
             // exists only with the built-in answer file. Skip them instead of refusing the whole
@@ -2076,8 +2087,9 @@ impl ProductionInstallBackend {
         for directory in scatter.existing_data_dirs() {
             let old = directory.join("preinstalled_software");
             if old.exists() {
-                std::fs::remove_dir_all(&old)
-                    .map_err(|error| Self::error("clear_preinstalled_software_destination", error))?;
+                std::fs::remove_dir_all(&old).map_err(|error| {
+                    Self::error("clear_preinstalled_software_destination", error)
+                })?;
             }
         }
         let mut total = 0_u64;
@@ -2103,8 +2115,8 @@ impl ProductionInstallBackend {
             std::fs::create_dir_all(&directory)
                 .map_err(|error| Self::error("create_preinstalled_software_destination", error))?;
             let target = directory.join(&package.filename);
-            let mut input =
-                File::open(&source).map_err(|error| Self::error("open_prepared_software", error))?;
+            let mut input = File::open(&source)
+                .map_err(|error| Self::error("open_prepared_software", error))?;
             let mut output = OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -2375,6 +2387,16 @@ impl ProductionInstallBackend {
             Some(secret) => payload
                 .with_bitlocker_secret(secret)
                 .map_err(|error| Self::error("bind_protected_bitlocker_boot_secret", error))?,
+            None => payload,
+        };
+        let pe_network_payload = self
+            .install_config_transaction
+            .as_mut()
+            .and_then(|transaction| transaction.take_pe_network_payload());
+        let payload = match pe_network_payload {
+            Some(network) => payload
+                .with_pe_network_payload(network)
+                .map_err(|error| Self::error("bind_pe_network_boot_payload", error))?,
             None => payload,
         };
         let result = super::pe::PeManager::new()
@@ -2934,7 +2956,8 @@ impl ProductionInstallBackend {
             .map(|letter| letter.to_ascii_uppercase());
         let target_size = target_letter
             .and_then(super::scattered_staging::volume_total_bytes)
-            .or((intent.target_partition_size_bytes != 0).then_some(intent.target_partition_size_bytes));
+            .or((intent.target_partition_size_bytes != 0)
+                .then_some(intent.target_partition_size_bytes));
         match target_size {
             Some(size) if size < required => {
                 log::warn!(
@@ -3114,7 +3137,10 @@ impl ProductionInstallBackend {
             .next()
             .map(|letter| letter.to_ascii_uppercase())
             .ok_or_else(|| {
-                InstallBackendError::new("no_data_partition", "target partition has no drive letter")
+                InstallBackendError::new(
+                    "no_data_partition",
+                    "target partition has no drive letter",
+                )
             })?;
         let target_free = super::scattered_staging::volume_free_bytes(letter).unwrap_or(0);
         let old_system = Self::target_old_system_bytes(intent);
@@ -3196,9 +3222,7 @@ impl ProductionInstallBackend {
                 );
             }
             Err(error) => {
-                log::warn!(
-                    "[SCATTER] 导出当前系统驱动失败，本次安装继续但不恢复旧驱动: {error:#}"
-                );
+                log::warn!("[SCATTER] 导出当前系统驱动失败，本次安装继续但不恢复旧驱动: {error:#}");
                 self.scattered_drivers_unavailable = true;
                 if let Some(scatter) = self.scattered_staging.as_ref() {
                     for directory in scatter.existing_data_dirs() {
@@ -3261,7 +3285,8 @@ impl ProductionInstallBackend {
             .map(|letter| letter.to_ascii_uppercase())
             .context("target partition has no drive letter")?;
         let target_free = super::scattered_staging::volume_free_bytes(target_letter).unwrap_or(0);
-        if target_free < estimate.saturating_add(lr_core::data_staging::SCATTER_SECONDARY_RESERVE_BYTES)
+        if target_free
+            < estimate.saturating_add(lr_core::data_staging::SCATTER_SECONDARY_RESERVE_BYTES)
         {
             let (letter, _, _) = candidates
                 .iter()
@@ -3346,9 +3371,7 @@ impl ProductionInstallBackend {
         let name = lr_core::driver::STORAGE_DRIVER_REQUIREMENTS_FILE;
         let source = exported.join(name);
         if !source.is_file() {
-            log::warn!(
-                "[SCATTER] 驱动导出目录中没有 {name}，PE 将无法确认启动存储驱动覆盖情况"
-            );
+            log::warn!("[SCATTER] 驱动导出目录中没有 {name}，PE 将无法确认启动存储驱动覆盖情况");
             return Ok(());
         }
         std::fs::create_dir_all(primary_drivers)?;
@@ -4202,12 +4225,11 @@ impl ProductionInstallBackend {
             if cancellation.is_cancelled() {
                 return Err(cancelled());
             }
-            let best = scatter
-                .candidates(false)
-                .into_iter()
-                .max_by_key(|(letter, available, max_file)| {
+            let best = scatter.candidates(false).into_iter().max_by_key(
+                |(letter, available, max_file)| {
                     ((*available).min(*max_file), std::cmp::Reverse(*letter))
-                });
+                },
+            );
             let length = best.and_then(|(_, available, max_file)| {
                 lr_core::data_staging::next_image_chunk_len(remaining, available, max_file)
             });
@@ -4271,9 +4293,9 @@ impl ProductionInstallBackend {
                         verify_progress = progress.percentage;
                     }
                 }
-                let copy_percent =
-                    (copied.saturating_add(written).saturating_mul(100) / total.max(1)).min(100)
-                        as u16;
+                let copy_percent = (copied.saturating_add(written).saturating_mul(100)
+                    / total.max(1))
+                .min(100) as u16;
                 let percentage = if verify_progress_rx.is_some() {
                     ((copy_percent + u16::from(verify_progress)) * 90 / 200) as u8
                 } else {
@@ -4958,7 +4980,10 @@ impl ProductionInstallBackend {
             let old = directory.join("user_drivers");
             if old.exists() {
                 if let Err(error) = std::fs::remove_dir_all(&old) {
-                    log::warn!("[SCATTER] 清理旧用户驱动目录 {} 失败: {error}", old.display());
+                    log::warn!(
+                        "[SCATTER] 清理旧用户驱动目录 {} 失败: {error}",
+                        old.display()
+                    );
                 }
             }
         }
@@ -4976,9 +5001,15 @@ impl ProductionInstallBackend {
                 }
             }
             let entries = match std::fs::read_dir(&source) {
-                Ok(entries) => entries.filter_map(Result::ok).map(|entry| entry.path()).collect::<Vec<_>>(),
+                Ok(entries) => entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect::<Vec<_>>(),
                 Err(error) => {
-                    log::warn!("[SCATTER] 读取用户驱动目录 {} 失败，已跳过: {error}", source.display());
+                    log::warn!(
+                        "[SCATTER] 读取用户驱动目录 {} 失败，已跳过: {error}",
+                        source.display()
+                    );
                     continue;
                 }
             };
@@ -4993,7 +5024,11 @@ impl ProductionInstallBackend {
                 vec![(source.clone(), PathBuf::new())]
             } else {
                 let mut units = Vec::new();
-                let loose = entries.iter().filter(|path| path.is_file()).cloned().collect::<Vec<_>>();
+                let loose = entries
+                    .iter()
+                    .filter(|path| path.is_file())
+                    .cloned()
+                    .collect::<Vec<_>>();
                 for path in entries.iter().filter(|path| path.is_dir()) {
                     if let Some(name) = path.file_name() {
                         units.push((path.clone(), PathBuf::from(name)));
@@ -5012,7 +5047,9 @@ impl ProductionInstallBackend {
                 let base = match scatter.data_dir_for(letter) {
                     Ok(base) => base.join("user_drivers").join(version),
                     Err(error) => {
-                        log::warn!("[SCATTER] 无法在 {letter}: 准备用户驱动目录，已跳过: {error:#}");
+                        log::warn!(
+                            "[SCATTER] 无法在 {letter}: 准备用户驱动目录，已跳过: {error:#}"
+                        );
                         continue;
                     }
                 };
@@ -5040,7 +5077,10 @@ impl ProductionInstallBackend {
         Ok(())
     }
 
-    fn stage_user_drivers(&mut self, intent: &StartInstallIntent) -> Result<(), InstallBackendError> {
+    fn stage_user_drivers(
+        &mut self,
+        intent: &StartInstallIntent,
+    ) -> Result<(), InstallBackendError> {
         if self.scattered_staging.is_some() {
             self.stage_user_drivers_scattered()?;
             // Optional user payloads go to the data directory on the same volume as their source
@@ -5275,8 +5315,7 @@ impl ProductionInstallBackend {
                 }
                 None => automatic_driver_export_has_payload(&driver_root),
             };
-            if !has_payload.map_err(|error| Self::error("verify_empty_pe_driver_backup", error))?
-            {
+            if !has_payload.map_err(|error| Self::error("verify_empty_pe_driver_backup", error))? {
                 // Older PE packages treat any existing driver directory as importable. Encode the
                 // verified empty result explicitly so they never invoke DISM on a manifest-only
                 // directory.
@@ -5346,11 +5385,11 @@ impl ProductionInstallBackend {
         };
         let receipt_matches = self.scattered_image_layout == ScatteredImageLayout::Directory
             && Self::receipt_matches_manifest_identities(
-            self.staged_source_image_receipt.as_ref(),
-            &staged_root,
-            &config,
-            &identities,
-        )?;
+                self.staged_source_image_receipt.as_ref(),
+                &staged_root,
+                &config,
+                &identities,
+            )?;
         config.source_image_verified =
             receipt_matches && self.pe_supports_source_image_verification_receipt;
         if receipt_matches && !config.source_image_verified {
@@ -5543,7 +5582,14 @@ impl ProductionInstallBackend {
             .map(super::disk::PreparedStagingTransaction::source_length_before_bytes);
         let protected_bitlocker_secret =
             super::install_config::collect_bitlocker_secret_best_effort();
-        let transaction = super::install_config::ConfigFileManager::write_install_config_transactional_with_private_payloads(
+        let mut pe_network_payload = None;
+        if let Some(pe_path) = self.pe_path.as_deref() {
+            let network = super::pe_network::PeNetworkHandoff::prepare(pe_path);
+            config.pe_network_payload_length = network.payload_length();
+            config.pe_network_payload_sha256 = network.payload_sha256();
+            pe_network_payload = network.into_boot_payload();
+        }
+        let mut transaction = super::install_config::ConfigFileManager::write_install_config_transactional_with_private_payloads(
                 &effective_target,
                 self.data_partition()?,
                 &config,
@@ -5560,6 +5606,9 @@ impl ProductionInstallBackend {
                 .map_err(|error| Self::error("write_ci_stale_driver_manifest_receipt", error))?;
         }
         self.handoff_auth_key = Some(auth_key);
+        if let Some(network) = pe_network_payload {
+            transaction.attach_pe_network_payload(network);
+        }
         self.install_config_transaction = Some(transaction);
         Ok(())
     }
@@ -5913,9 +5962,18 @@ impl ProductionInstallBackend {
         let advanced = &intent.options.advanced_options;
         let mut total = 0_u64;
         for (enabled, path) in [
-            (advanced.run_script_during_deploy, advanced.deploy_script_path.trim()),
-            (advanced.run_script_first_login, advanced.first_login_script_path.trim()),
-            (advanced.import_registry_file, advanced.registry_file_path.trim()),
+            (
+                advanced.run_script_during_deploy,
+                advanced.deploy_script_path.trim(),
+            ),
+            (
+                advanced.run_script_first_login,
+                advanced.first_login_script_path.trim(),
+            ),
+            (
+                advanced.import_registry_file,
+                advanced.registry_file_path.trim(),
+            ),
         ] {
             if enabled && !path.is_empty() {
                 total = total.saturating_add(
@@ -5935,7 +5993,10 @@ impl ProductionInstallBackend {
 
     /// "Import custom driver directory": staged below `user_drivers\custom`, which PE injects for
     /// every target version. A source on the staging volume is hard-linked, not copied again.
-    fn stage_custom_driver_directory(intent: &StartInstallIntent, root_for: &dyn Fn(&str) -> PathBuf) {
+    fn stage_custom_driver_directory(
+        intent: &StartInstallIntent,
+        root_for: &dyn Fn(&str) -> PathBuf,
+    ) {
         let advanced = &intent.options.advanced_options;
         let custom_path = advanced.custom_drivers_path.trim();
         if !advanced.import_custom_drivers || custom_path.is_empty() {
@@ -6006,7 +6067,9 @@ impl ProductionInstallBackend {
         }
         let custom_files = advanced.custom_files_path.trim();
         if advanced.import_custom_files && !custom_files.is_empty() {
-            let destination = root_for(custom_files).join("__advanced").join("custom_files");
+            let destination = root_for(custom_files)
+                .join("__advanced")
+                .join("custom_files");
             match Self::link_or_copy_directory(Path::new(custom_files), &destination) {
                 Ok(()) => log::info!("[ADVANCED INPUT] staged custom files for PE: {custom_files}"),
                 Err(error) => log::warn!(
@@ -6643,7 +6706,8 @@ impl ProductionInstallBackend {
             native_install_compat::WindowsFamily::Windows10
                 | native_install_compat::WindowsFamily::Windows11
         ) {
-            match lr_core::offline_international::read_offline_international_settings(&self.target) {
+            match lr_core::offline_international::read_offline_international_settings(&self.target)
+            {
                 Ok(settings) => Some(settings),
                 Err(error) => {
                     log::warn!(
@@ -7808,6 +7872,34 @@ mod tests {
         assert_eq!(software_download_progress(0, 1, u64::MAX, Some(1)), 99);
     }
 
+    /// Accept one loopback package request or fail after a bounded wait. A request that never
+    /// arrives (for example because a system proxy captured it) must fail the test with a reason
+    /// instead of blocking the whole test binary.
+    fn accept_within(listener: &std::net::TcpListener, seconds: u64) -> std::net::TcpStream {
+        listener
+            .set_nonblocking(true)
+            .expect("make the loopback listener non-blocking");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("restore a blocking package stream");
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "no package request reached the loopback server within {seconds} s"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept package request: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn software_download_retries_and_isolates_one_package_failure() {
         use std::io::{Read as _, Write as _};
@@ -7817,7 +7909,7 @@ mod tests {
         let address = listener.local_addr().expect("read loopback address");
         let server = std::thread::spawn(move || {
             for _ in 0..4 {
-                let (mut stream, _) = listener.accept().expect("accept package request");
+                let mut stream = accept_within(&listener, 30);
                 let mut request = [0_u8; 2048];
                 let count = stream.read(&mut request).expect("read package request");
                 let request = String::from_utf8_lossy(&request[..count]);
@@ -7893,7 +7985,7 @@ mod tests {
         let address = listener.local_addr().expect("read loopback address");
         let server = std::thread::spawn(move || {
             for _ in 0..PREINSTALLED_SOFTWARE_DOWNLOAD_ATTEMPTS {
-                let (mut stream, _) = listener.accept().expect("accept package request");
+                let mut stream = accept_within(&listener, 30);
                 let mut request = [0_u8; 2048];
                 let request_bytes = stream.read(&mut request).expect("read package request");
                 assert!(request_bytes > 0, "package request must not be empty");

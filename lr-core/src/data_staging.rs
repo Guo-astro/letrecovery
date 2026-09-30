@@ -587,10 +587,12 @@ fn is_locator_token(value: &str) -> bool {
 /// Any other form, including an unexpected token length, returns `None` so the caller keeps its
 /// historical single-volume interpretation of the path.
 pub fn split_scatter_prefix(relative_path: &str) -> Option<(&str, &str)> {
-    let without_prefix = relative_path.get(..SCATTER_DIRECTORY_PREFIX.len()).and_then(|head| {
-        head.eq_ignore_ascii_case(SCATTER_DIRECTORY_PREFIX)
-            .then(|| &relative_path[SCATTER_DIRECTORY_PREFIX.len()..])
-    })?;
+    let without_prefix = relative_path
+        .get(..SCATTER_DIRECTORY_PREFIX.len())
+        .and_then(|head| {
+            head.eq_ignore_ascii_case(SCATTER_DIRECTORY_PREFIX)
+                .then(|| &relative_path[SCATTER_DIRECTORY_PREFIX.len()..])
+        })?;
     let separator = without_prefix.find(['\\', '/'])?;
     let token = &without_prefix[..separator];
     let rest = &without_prefix[separator + 1..];
@@ -695,7 +697,9 @@ pub fn select_single_existing_volume(
     let required = required_staging_bytes(payload_bytes)?;
     volumes
         .iter()
-        .filter(|volume| volume.free_bytes >= required && volume.max_file_bytes >= largest_file_bytes)
+        .filter(|volume| {
+            volume.free_bytes >= required && volume.max_file_bytes >= largest_file_bytes
+        })
         .max_by_key(|volume| (volume.free_bytes, std::cmp::Reverse(volume.letter)))
         .map(|volume| volume.letter)
 }
@@ -768,8 +772,7 @@ pub fn target_can_host_in_place(
     }
     // After deletion the volume must still hold the applied image plus a fixed reserve; the
     // staged payload is consumed as the image is applied, so it is not double-counted here.
-    let after_delete_required = expanded_image_bytes
-        .saturating_add(IN_PLACE_TARGET_RESERVE_BYTES);
+    let after_delete_required = expanded_image_bytes.saturating_add(IN_PLACE_TARGET_RESERVE_BYTES);
     reclaimable >= after_delete_required
 }
 
@@ -833,7 +836,9 @@ pub fn plan_scattered_staging(request: &ScatterRequest) -> Result<ScatterPlan, S
     };
 
     let (image, image_reservations) = match &request.image {
-        ScatterImageDemand::PrimaryTree { .. } => (ScatterImagePlacement::Whole(primary), Vec::new()),
+        ScatterImageDemand::PrimaryTree { .. } => {
+            (ScatterImagePlacement::Whole(primary), Vec::new())
+        }
         ScatterImageDemand::SingleFile { bytes, chunkable } => {
             if let Some(letter) = best_fit(&capacity, *bytes, *bytes) {
                 take(&mut capacity, letter, *bytes);
@@ -868,7 +873,8 @@ pub fn plan_scattered_staging(request: &ScatterRequest) -> Result<ScatterPlan, S
                 ));
             }
         }
-        ScatterImageDemand::TogetherFiles { files } | ScatterImageDemand::IndependentFiles { files } => {
+        ScatterImageDemand::TogetherFiles { files }
+        | ScatterImageDemand::IndependentFiles { files } => {
             let total = files
                 .iter()
                 .try_fold(0_u64, |sum, file| sum.checked_add(*file))
@@ -894,7 +900,10 @@ pub fn plan_scattered_staging(request: &ScatterRequest) -> Result<ScatterPlan, S
                         .max_by_key(|(letter, usable, _)| (*usable, std::cmp::Reverse(*letter)))
                         .map(|(letter, _, _)| *letter)
                         .ok_or_else(|| {
-                            format!("split image part {} ({size} bytes) fits on no existing volume", index + 1)
+                            format!(
+                                "split image part {} ({size} bytes) fits on no existing volume",
+                                index + 1
+                            )
                         })?;
                     take(&mut capacity, letter, size);
                     assigned[index] = letter;
@@ -940,23 +949,44 @@ mod scatter_tests {
     #[test]
     fn scatter_prefix_round_trips_only_exact_tokens() {
         let token = "a".repeat(64);
-        let path = format!("{}\\LetRecovery_Data\\drivers\\x.inf", scatter_root_name(&token));
+        let path = format!(
+            "{}\\LetRecovery_Data\\drivers\\x.inf",
+            scatter_root_name(&token)
+        );
         assert_eq!(
             split_scatter_prefix(&path),
             Some((token.as_str(), "LetRecovery_Data\\drivers\\x.inf"))
         );
-        assert_eq!(strip_scatter_prefix(&path), "LetRecovery_Data\\drivers\\x.inf");
-        assert_eq!(strip_scatter_prefix("LetRecovery_Data\\a.wim"), "LetRecovery_Data\\a.wim");
+        assert_eq!(
+            strip_scatter_prefix(&path),
+            "LetRecovery_Data\\drivers\\x.inf"
+        );
+        assert_eq!(
+            strip_scatter_prefix("LetRecovery_Data\\a.wim"),
+            "LetRecovery_Data\\a.wim"
+        );
         assert_eq!(split_scatter_prefix("LetRecovery_Scatter_abc\\x"), None);
         let upper = format!("letrecovery_scatter_{}/y", "B".repeat(64));
-        assert_eq!(split_scatter_prefix(&upper).map(|(_, rest)| rest), Some("y"));
-        assert_eq!(split_scatter_prefix(&format!("{}\\", scatter_root_name(&token))), None);
+        assert_eq!(
+            split_scatter_prefix(&upper).map(|(_, rest)| rest),
+            Some("y")
+        );
+        assert_eq!(
+            split_scatter_prefix(&format!("{}\\", scatter_root_name(&token))),
+            None
+        );
     }
 
     #[test]
     fn fat_volumes_limit_single_files() {
-        assert_eq!(max_file_bytes_for_file_system(Some("FAT32")), FAT_MAX_FILE_BYTES);
-        assert_eq!(max_file_bytes_for_file_system(Some("fat")), FAT_MAX_FILE_BYTES);
+        assert_eq!(
+            max_file_bytes_for_file_system(Some("FAT32")),
+            FAT_MAX_FILE_BYTES
+        );
+        assert_eq!(
+            max_file_bytes_for_file_system(Some("fat")),
+            FAT_MAX_FILE_BYTES
+        );
         assert_eq!(max_file_bytes_for_file_system(Some("NTFS")), u64::MAX);
         assert_eq!(max_file_bytes_for_file_system(Some("exFAT")), u64::MAX);
         assert_eq!(max_file_bytes_for_file_system(None), u64::MAX);
@@ -967,8 +997,14 @@ mod scatter_tests {
     #[test]
     fn a_single_volume_that_holds_everything_is_preferred() {
         let volumes = [volume('D', 449), volume('E', 20)];
-        assert_eq!(select_single_existing_volume(&volumes, 10 * GIB, 5 * GIB), Some('D'));
-        assert_eq!(select_single_existing_volume(&volumes, 500 * GIB, 5 * GIB), None);
+        assert_eq!(
+            select_single_existing_volume(&volumes, 10 * GIB, 5 * GIB),
+            Some('D')
+        );
+        assert_eq!(
+            select_single_existing_volume(&volumes, 500 * GIB, 5 * GIB),
+            None
+        );
         let fat = [ScatterVolume {
             letter: 'F',
             free_bytes: 100 * GIB,
@@ -1064,17 +1100,38 @@ mod scatter_tests {
 
     #[test]
     fn unit_placement_prefers_the_requested_volume_then_the_largest() {
-        let candidates = [('D', 10 * GIB, u64::MAX), ('E', 20 * GIB, FAT_MAX_FILE_BYTES)];
-        assert_eq!(choose_volume_for_unit(&candidates, GIB, GIB, Some('D')), Some('D'));
-        assert_eq!(choose_volume_for_unit(&candidates, GIB, GIB, None), Some('E'));
-        assert_eq!(choose_volume_for_unit(&candidates, 12 * GIB, 5 * GIB, None), None);
-        assert_eq!(choose_volume_for_unit(&candidates, 5 * GIB, 5 * GIB, None), Some('D'));
+        let candidates = [
+            ('D', 10 * GIB, u64::MAX),
+            ('E', 20 * GIB, FAT_MAX_FILE_BYTES),
+        ];
+        assert_eq!(
+            choose_volume_for_unit(&candidates, GIB, GIB, Some('D')),
+            Some('D')
+        );
+        assert_eq!(
+            choose_volume_for_unit(&candidates, GIB, GIB, None),
+            Some('E')
+        );
+        assert_eq!(
+            choose_volume_for_unit(&candidates, 12 * GIB, 5 * GIB, None),
+            None
+        );
+        assert_eq!(
+            choose_volume_for_unit(&candidates, 5 * GIB, 5 * GIB, None),
+            Some('D')
+        );
     }
 
     #[test]
     fn chunk_lengths_respect_space_file_limits_and_minimum() {
-        assert_eq!(next_image_chunk_len(10 * GIB, 3 * GIB, u64::MAX), Some(3 * GIB));
-        assert_eq!(next_image_chunk_len(10 * GIB, 8 * GIB, FAT_MAX_FILE_BYTES), Some(FAT_MAX_FILE_BYTES));
+        assert_eq!(
+            next_image_chunk_len(10 * GIB, 3 * GIB, u64::MAX),
+            Some(3 * GIB)
+        );
+        assert_eq!(
+            next_image_chunk_len(10 * GIB, 8 * GIB, FAT_MAX_FILE_BYTES),
+            Some(FAT_MAX_FILE_BYTES)
+        );
         assert_eq!(next_image_chunk_len(10 * GIB, MIB, u64::MAX), None);
         assert_eq!(next_image_chunk_len(MIB, 5 * MIB, u64::MAX), Some(MIB));
         assert_eq!(next_image_chunk_len(0, 5 * MIB, u64::MAX), None);

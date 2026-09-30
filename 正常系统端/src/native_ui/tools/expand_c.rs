@@ -111,12 +111,12 @@ impl ExpandCDialogState {
         };
         // Start at the plain extension when there is adjacent space (nothing is moved); otherwise
         // at the largest size the move plan can reach. The warning explains the difference.
-        let default_target = if analysis.no_move_max_mb > analysis.current_size_mb.saturating_add(1024)
-        {
-            analysis.no_move_max_mb.min(analysis.max_size_mb)
-        } else {
-            analysis.max_size_mb
-        };
+        let default_target =
+            if analysis.no_move_max_mb > analysis.current_size_mb.saturating_add(1024) {
+                analysis.no_move_max_mb.min(analysis.max_size_mb)
+            } else {
+                analysis.max_size_mb
+            };
         self.target_size_mb = default_target;
         self.target_size_text = format_gb_value(default_target);
         self.analysis = analysis;
@@ -660,7 +660,10 @@ impl NativeExpandCDialog {
                 "—".to_owned()
             }
         };
-        set_text(self.controls.current_value, &value(analysis.current_size_mb));
+        set_text(
+            self.controls.current_value,
+            &value(analysis.current_size_mb),
+        );
         set_text(self.controls.used_value, &value(analysis.used_mb));
         set_text(self.controls.free_value, &value(analysis.free_mb));
         set_text(self.controls.max_value, &value(supported_maximum));

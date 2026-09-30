@@ -563,7 +563,8 @@ unsafe extern "system" fn combo_popup_close_subclass(
     let result = DefSubclassProc(hwnd, message, wparam, lparam);
     let hidden = match message {
         WM_WINDOWPOSCHANGED_MESSAGE if lparam.0 != 0 => {
-            let position = &*(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::WINDOWPOS);
+            let position =
+                &*(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::WINDOWPOS);
             position.flags.0 & SWP_HIDEWINDOW_FLAG != 0
         }
         WM_SHOWWINDOW_MESSAGE => wparam.0 == 0,
@@ -1006,9 +1007,8 @@ unsafe fn run_button_state_change_without_native_paint(
 ) -> LRESULT {
     let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
     let visible_bit = windows::Win32::UI::WindowsAndMessaging::WS_VISIBLE.0 as isize;
-    let suppress = style & visible_bit != 0
-        && style & BS_NOTIFY_STYLE == 0
-        && IsWindowVisible(hwnd).as_bool();
+    let suppress =
+        style & visible_bit != 0 && style & BS_NOTIFY_STYLE == 0 && IsWindowVisible(hwnd).as_bool();
     if !suppress {
         let result = DefSubclassProc(hwnd, message, wparam, lparam);
         invalidate_control_visual(hwnd);
@@ -1022,8 +1022,8 @@ unsafe fn run_button_state_change_without_native_paint(
     let _ = DefSubclassProc(hwnd, WM_SETREDRAW_MESSAGE, WPARAM(1), LPARAM(0));
     // Pointer and keyboard feedback is published at once; a programmatic change (page switch,
     // configuration load) joins the normal paint queue and is painted once with its neighbours.
-    let interactive = windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == hwnd
-        || GetFocus() == hwnd;
+    let interactive =
+        windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == hwnd || GetFocus() == hwnd;
     let _ = RedrawWindow(
         hwnd,
         None,
@@ -1110,8 +1110,13 @@ unsafe extern "system" fn check_box_subclass(
             clear_hot_tracking(hwnd, CHECK_BOX_HOT_PROPERTY);
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
-        BM_SETCHECK_MESSAGE | BM_SETSTATE_MESSAGE | WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE
-        | WM_UPDATEUISTATE_MESSAGE | WM_SETTEXT => {
+        BM_SETCHECK_MESSAGE
+        | BM_SETSTATE_MESSAGE
+        | WM_SETFOCUS
+        | WM_KILLFOCUS
+        | WM_ENABLE
+        | WM_UPDATEUISTATE_MESSAGE
+        | WM_SETTEXT => {
             if message == WM_ENABLE && wparam.0 == 0 {
                 let _ = RemovePropW(hwnd, CHECK_BOX_HOT_PROPERTY);
             }
@@ -1587,8 +1592,13 @@ unsafe extern "system" fn radio_button_subclass(
             clear_hot_tracking(hwnd, RADIO_BUTTON_HOT_PROPERTY);
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
-        BM_SETCHECK_MESSAGE | BM_SETSTATE_MESSAGE | WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE
-        | WM_UPDATEUISTATE_MESSAGE | WM_SETTEXT => {
+        BM_SETCHECK_MESSAGE
+        | BM_SETSTATE_MESSAGE
+        | WM_SETFOCUS
+        | WM_KILLFOCUS
+        | WM_ENABLE
+        | WM_UPDATEUISTATE_MESSAGE
+        | WM_SETTEXT => {
             if message == WM_ENABLE && wparam.0 == 0 {
                 let _ = RemovePropW(hwnd, RADIO_BUTTON_HOT_PROPERTY);
             }
@@ -1931,15 +1941,23 @@ struct ScrollbarColumn {
     bottom: COLORREF,
 }
 
+/// Sampled scrollbar colours (upper arrow, track, lower arrow), keyed by (report window,
+/// dark theme, scrollbar width).
+type ScrollbarColorCacheEntry = ((isize, bool, i32), (COLORREF, COLORREF, COLORREF));
+
 thread_local! {
-    static SCROLLBAR_COLOR_CACHE: std::cell::RefCell<Vec<((isize, bool, i32), (COLORREF, COLORREF, COLORREF))>> =
+    static SCROLLBAR_COLOR_CACHE: std::cell::RefCell<Vec<ScrollbarColorCacheEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Whether a settings broadcast concerns colours or theme. WM_SETTINGCHANGE also arrives for
 /// unrelated changes (environment, work area, input settings...), and re-theming every window
 /// for those is expensive; the light/dark switch arrives as "ImmersiveColorSet".
-pub(crate) unsafe fn settings_change_affects_theme(message: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
+pub(crate) unsafe fn settings_change_affects_theme(
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> bool {
     const SPI_SETHIGHCONTRAST_VALUE: usize = 0x0043;
     if message != windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE {
         return true;
@@ -1950,7 +1968,9 @@ pub(crate) unsafe fn settings_change_affects_theme(message: u32, wparam: WPARAM,
     if lparam.0 == 0 {
         return false;
     }
-    let area = PCWSTR(lparam.0 as *const u16).to_string().unwrap_or_default();
+    let area = PCWSTR(lparam.0 as *const u16)
+        .to_string()
+        .unwrap_or_default();
     ["ImmersiveColorSet", "WindowsThemeElement", "WindowMetrics"]
         .iter()
         .any(|name| area.eq_ignore_ascii_case(name))
@@ -2177,7 +2197,13 @@ unsafe fn schedule_list_column_fit(list: HWND) {
     if !list_fits_columns(list) || !GetPropW(list, LIST_FIT_PENDING_PROPERTY).is_invalid() {
         return;
     }
-    if SetPropW(list, LIST_FIT_PENDING_PROPERTY, HANDLE(std::ptr::dangling_mut())).is_ok() {
+    if SetPropW(
+        list,
+        LIST_FIT_PENDING_PROPERTY,
+        HANDLE(std::ptr::dangling_mut()),
+    )
+    .is_ok()
+    {
         let _ = PostMessageW(list, WM_FIT_LIST_COLUMNS, WPARAM(0), LPARAM(0));
     }
 }
@@ -2242,11 +2268,15 @@ unsafe fn measure_list_column_needs(list: HWND) -> Vec<i32> {
     if header.is_invalid() {
         return Vec::new();
     }
-    let columns = SendMessageW(header, HDM_GETITEMCOUNT, WPARAM(0), LPARAM(0)).0.max(0) as i32;
+    let columns = SendMessageW(header, HDM_GETITEMCOUNT, WPARAM(0), LPARAM(0))
+        .0
+        .max(0) as i32;
     if columns == 0 {
         return Vec::new();
     }
-    let rows = SendMessageW(list, LVM_GETITEMCOUNT, WPARAM(0), LPARAM(0)).0.clamp(0, 2000) as usize;
+    let rows = SendMessageW(list, LVM_GETITEMCOUNT, WPARAM(0), LPARAM(0))
+        .0
+        .clamp(0, 2000) as usize;
     let dpi = GetDpiForWindow(list).max(96);
     let dc = windows::Win32::Graphics::Gdi::GetDC(list);
     if dc.is_invalid() {
@@ -2368,7 +2398,8 @@ unsafe extern "system" fn list_view_subclass(
                 super::redraw::defer_frame_paint(hwnd);
                 return LRESULT(0);
             }
-            let _profile = super::redraw::paint_scope("列表边框/滚动条绘制", "(排版中)列表边框/滚动条绘制");
+            let _profile =
+                super::redraw::paint_scope("列表边框/滚动条绘制", "(排版中)列表边框/滚动条绘制");
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
         // Rows or columns changed: measure again once the current batch of messages is done.
@@ -2487,7 +2518,8 @@ unsafe extern "system" fn list_view_subclass(
             result
         }
         WM_NCDESTROY => {
-            let _ = windows::Win32::UI::WindowsAndMessaging::RemovePropW(hwnd, LIST_VIEW_HOLD_PROPERTY);
+            let _ =
+                windows::Win32::UI::WindowsAndMessaging::RemovePropW(hwnd, LIST_VIEW_HOLD_PROPERTY);
             let _ = RemoveWindowSubclass(hwnd, Some(list_view_subclass), LIST_VIEW_SUBCLASS_ID);
             DefSubclassProc(hwnd, message, wparam, lparam)
         }
@@ -2495,7 +2527,8 @@ unsafe extern "system" fn list_view_subclass(
     }
 }
 
-const LIST_VIEW_HOLD_PROPERTY: windows::core::PCWSTR = windows::core::w!("LetRecovery.ListViewHold");
+const LIST_VIEW_HOLD_PROPERTY: windows::core::PCWSTR =
+    windows::core::w!("LetRecovery.ListViewHold");
 
 fn list_view_hold_release_message() -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2531,7 +2564,7 @@ unsafe fn begin_list_view_hold(list: HWND) {
     if SetPropW(
         list,
         LIST_VIEW_HOLD_PROPERTY,
-        windows::Win32::Foundation::HANDLE(1 as *mut core::ffi::c_void),
+        windows::Win32::Foundation::HANDLE(std::ptr::dangling_mut::<core::ffi::c_void>()),
     )
     .is_err()
     {
@@ -2560,7 +2593,9 @@ unsafe fn end_list_view_hold(list: HWND) {
 /// Removes the report's column header from `dc`'s clip region.
 unsafe fn exclude_list_view_header(list: HWND, dc: HDC) {
     let header = HWND(SendMessageW(list, 0x101f, WPARAM(0), LPARAM(0)).0 as *mut _); // LVM_GETHEADER
-    if header.is_invalid() || !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(header).as_bool() {
+    if header.is_invalid()
+        || !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(header).as_bool()
+    {
         return;
     }
     let mut rect = RECT::default();
@@ -2568,8 +2603,14 @@ unsafe fn exclude_list_view_header(list: HWND, dc: HDC) {
         return;
     }
     let mut corners = [
-        windows::Win32::Foundation::POINT { x: rect.left, y: rect.top },
-        windows::Win32::Foundation::POINT { x: rect.right, y: rect.bottom },
+        windows::Win32::Foundation::POINT {
+            x: rect.left,
+            y: rect.top,
+        },
+        windows::Win32::Foundation::POINT {
+            x: rect.right,
+            y: rect.bottom,
+        },
     ];
     let _ = windows::Win32::Graphics::Gdi::MapWindowPoints(HWND::default(), list, &mut corners);
     let _ = windows::Win32::Graphics::Gdi::ExcludeClipRect(
@@ -2810,7 +2851,11 @@ unsafe extern "system" fn single_line_edit_subclass(
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => paint_edit_buffered(hwnd, palette_from_reference(_reference_data)),
         WM_CONTEXTMENU_MESSAGE => {
-            super::context_menu::show_for_edit(hwnd, lparam, palette_from_reference(_reference_data));
+            super::context_menu::show_for_edit(
+                hwnd,
+                lparam,
+                palette_from_reference(_reference_data),
+            );
             LRESULT(0)
         }
         WM_SETTEXT_MESSAGE if edit_text_unchanged(hwnd, lparam) => LRESULT(1),
@@ -2917,7 +2962,12 @@ unsafe fn run_single_line_edit_message(
     let result = DefSubclassProc(hwnd, message, wparam, lparam);
     if visible {
         let _ = SendMessageW(hwnd, WM_SETREDRAW, WPARAM(1), LPARAM(0));
-        let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+        let _ = RedrawWindow(
+            hwnd,
+            None,
+            None,
+            RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE,
+        );
     }
     store_edit_selection_key(hwnd);
     sync_edit_selection_caret(hwnd);
@@ -3017,12 +3067,11 @@ unsafe extern "system" fn rounded_control_subclass(
     const DLGC_WANTALLKEYS_CODE: isize = 0x0004;
     // The drop-down list is LetRecovery's own popup (see combo_popup). It closes whenever the
     // field loses focus, is disabled, hidden or destroyed.
-    if matches!(message, WM_KILLFOCUS | WM_NCDESTROY)
-        || (matches!(message, WM_ENABLE | WM_SHOWWINDOW_MESSAGE) && wparam.0 == 0)
+    if (matches!(message, WM_KILLFOCUS | WM_NCDESTROY)
+        || (matches!(message, WM_ENABLE | WM_SHOWWINDOW_MESSAGE) && wparam.0 == 0))
+        && super::combo_popup::is_open(hwnd)
     {
-        if super::combo_popup::is_open(hwnd) {
-            super::combo_popup::close(hwnd, false);
-        }
+        super::combo_popup::close(hwnd, false);
     }
     match message {
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK_MESSAGE if is_drop_down_list(hwnd) => {
@@ -3048,9 +3097,7 @@ unsafe extern "system" fn rounded_control_subclass(
         CB_GETDROPPEDSTATE_MESSAGE if is_drop_down_list(hwnd) => {
             LRESULT(isize::from(super::combo_popup::is_open(hwnd)))
         }
-        WM_GETDLGCODE_MESSAGE
-            if is_drop_down_list(hwnd) && super::combo_popup::is_open(hwnd) =>
-        {
+        WM_GETDLGCODE_MESSAGE if is_drop_down_list(hwnd) && super::combo_popup::is_open(hwnd) => {
             // While the list is open, Enter and Escape belong to it, not to the dialog buttons.
             let result = DefSubclassProc(hwnd, message, wparam, lparam);
             LRESULT(result.0 | DLGC_WANTALLKEYS_CODE)
@@ -3133,10 +3180,7 @@ unsafe extern "system" fn rounded_control_subclass(
             ensure_hot_tracking(hwnd, ROUNDED_CONTROL_HOT_PROPERTY, false);
             result
         }
-        WM_MOUSEMOVE
-        | WM_NCMOUSEMOVE_MESSAGE
-        | WM_MOUSELEAVE_MESSAGE
-        | WM_NCMOUSELEAVE_MESSAGE
+        WM_MOUSEMOVE | WM_NCMOUSEMOVE_MESSAGE | WM_MOUSELEAVE_MESSAGE | WM_NCMOUSELEAVE_MESSAGE
             if reserved_frame_band(hwnd).is_some() =>
         {
             // Read-only report with its frame in the band: hover never changes the outline and
@@ -3353,7 +3397,12 @@ unsafe fn paint_edit_buffered(hwnd: HWND, palette: Palette) -> LRESULT {
             let buffer = super::redraw::PaintBuffer::begin_opaque(target, client, area);
             let dc = buffer.dc();
             fill(dc, &client, background);
-            let _ = SendMessageW(hwnd, WM_PRINTCLIENT, WPARAM(dc.0 as usize), LPARAM(PRF_CLIENT));
+            let _ = SendMessageW(
+                hwnd,
+                WM_PRINTCLIENT,
+                WPARAM(dc.0 as usize),
+                LPARAM(PRF_CLIENT),
+            );
             overlay_edit_selection(hwnd, dc, palette);
             let caret_hidden = HideCaret(hwnd).is_ok();
             buffer.present();
@@ -3375,7 +3424,12 @@ const STATIC_TEXT_SUBCLASS_ID: usize = 0x4c52_5354;
 pub(crate) unsafe fn install_static_text_subclass(label: HWND) {
     let kind = GetWindowLongPtrW(label, GWL_STYLE) & 0x1f;
     if matches!(kind, 0x00 | 0x01 | 0x02 | 0x0b | 0x0c) {
-        let _ = SetWindowSubclass(label, Some(static_text_subclass), STATIC_TEXT_SUBCLASS_ID, 0);
+        let _ = SetWindowSubclass(
+            label,
+            Some(static_text_subclass),
+            STATIC_TEXT_SUBCLASS_ID,
+            0,
+        );
     }
 }
 
@@ -3421,7 +3475,12 @@ unsafe extern "system" fn static_text_subclass(
                             windows::Win32::Graphics::Gdi::HBRUSH(brush as *mut _),
                         );
                     }
-                    let _ = SendMessageW(hwnd, WM_PRINTCLIENT, WPARAM(dc.0 as usize), LPARAM(PRF_CLIENT));
+                    let _ = SendMessageW(
+                        hwnd,
+                        WM_PRINTCLIENT,
+                        WPARAM(dc.0 as usize),
+                        LPARAM(PRF_CLIENT),
+                    );
                     buffer.present();
                 }
             }
@@ -3474,12 +3533,14 @@ unsafe fn overlay_edit_selection(edit: HWND, dc: HDC, palette: Palette) {
     if start >= end {
         return;
     }
-    let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(edit).max(0) as usize;
+    let length =
+        windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(edit).max(0) as usize;
     if length == 0 {
         return;
     }
     let mut text = vec![0u16; length + 1];
-    let copied = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(edit, &mut text).max(0) as usize;
+    let copied =
+        windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(edit, &mut text).max(0) as usize;
     text.truncate(copied);
     let (selected_text, selected_fill) = navigation_selection_colors(palette, false);
     let font = SendMessageW(edit, WM_GETFONT, WPARAM(0), LPARAM(0));
@@ -3489,7 +3550,12 @@ unsafe fn overlay_edit_selection(edit: HWND, dc: HDC, palette: Palette) {
     let _ = windows::Win32::Graphics::Gdi::GetTextMetricsW(dc, &mut metrics);
     let line_height = metrics.tmHeight.max(1);
     let mut format = RECT::default();
-    let _ = SendMessageW(edit, EM_GETRECT, WPARAM(0), LPARAM((&mut format as *mut RECT) as isize));
+    let _ = SendMessageW(
+        edit,
+        EM_GETRECT,
+        WPARAM(0),
+        LPARAM((&mut format as *mut RECT) as isize),
+    );
     let saved = windows::Win32::Graphics::Gdi::SaveDC(dc);
     let _ = windows::Win32::Graphics::Gdi::IntersectClipRect(
         dc,
@@ -3503,8 +3569,12 @@ unsafe fn overlay_edit_selection(edit: HWND, dc: HDC, palette: Palette) {
     let multiline = style & ES_MULTILINE != 0;
     let (first_line, last_line) = if multiline {
         (
-            SendMessageW(edit, EM_LINEFROMCHAR, WPARAM(start as usize), LPARAM(0)).0.max(0),
-            SendMessageW(edit, EM_LINEFROMCHAR, WPARAM(end as usize), LPARAM(0)).0.max(0),
+            SendMessageW(edit, EM_LINEFROMCHAR, WPARAM(start as usize), LPARAM(0))
+                .0
+                .max(0),
+            SendMessageW(edit, EM_LINEFROMCHAR, WPARAM(end as usize), LPARAM(0))
+                .0
+                .max(0),
         )
     } else {
         (0, 0)
@@ -3520,7 +3590,9 @@ unsafe fn overlay_edit_selection(edit: HWND, dc: HDC, palette: Palette) {
         }
         let line_start = line_start as usize;
         let line_length = if multiline {
-            SendMessageW(edit, EM_LINELENGTH, WPARAM(line_start), LPARAM(0)).0.max(0) as usize
+            SendMessageW(edit, EM_LINELENGTH, WPARAM(line_start), LPARAM(0))
+                .0
+                .max(0) as usize
         } else {
             text.len()
         };
@@ -3582,7 +3654,11 @@ unsafe fn sync_edit_selection_caret(edit: HWND) {
     let hidden = !GetPropW(edit, EDIT_CARET_HIDDEN_PROPERTY).is_invalid();
     if want_hidden && !hidden {
         if HideCaret(edit).is_ok() {
-            let _ = SetPropW(edit, EDIT_CARET_HIDDEN_PROPERTY, HANDLE(std::ptr::dangling_mut()));
+            let _ = SetPropW(
+                edit,
+                EDIT_CARET_HIDDEN_PROPERTY,
+                HANDLE(std::ptr::dangling_mut()),
+            );
         }
     } else if !want_hidden && hidden {
         let _ = RemovePropW(edit, EDIT_CARET_HIDDEN_PROPERTY);
@@ -3606,13 +3682,18 @@ unsafe fn refresh_edit_selection_paint(edit: HWND) {
         return;
     }
     let _ = SetPropW(edit, EDIT_SELECTION_PROPERTY, HANDLE(key as *mut _));
-    let _ = RedrawWindow(edit, None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    let _ = RedrawWindow(
+        edit,
+        None,
+        None,
+        RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE,
+    );
 }
 
 fn edit_selection_message(message: u32, wparam: WPARAM) -> bool {
     match message {
-        0x0201 | 0x0202 | 0x0203 | 0x0100 | 0x0101 | 0x00b1 | 0x0113 | 0x0007 | 0x0008
-        | 0x0102 | 0x00c2 => true,
+        0x0201 | 0x0202 | 0x0203 | 0x0100 | 0x0101 | 0x00b1 | 0x0113 | 0x0007 | 0x0008 | 0x0102
+        | 0x00c2 => true,
         0x0200 => wparam.0 & 0x0001 != 0, // WM_MOUSEMOVE with the left button down
         _ => false,
     }
@@ -3621,7 +3702,8 @@ fn edit_selection_message(message: u32, wparam: WPARAM) -> bool {
 /// WM_SETTEXT with exactly the text the Edit already shows: nothing to do. Setting it again reset
 /// the caret and scroll position and repainted the whole field for every repeated status update.
 unsafe fn edit_text_unchanged(hwnd: HWND, lparam: LPARAM) -> bool {
-    let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(hwnd).max(0) as usize;
+    let length =
+        windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(hwnd).max(0) as usize;
     if lparam.0 == 0 {
         return length == 0;
     }
@@ -3631,7 +3713,8 @@ unsafe fn edit_text_unchanged(hwnd: HWND, lparam: LPARAM) -> bool {
         return false;
     }
     let mut current = vec![0u16; length + 1];
-    let copied = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut current).max(0) as usize;
+    let copied =
+        windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(hwnd, &mut current).max(0) as usize;
     current[..copied.min(length)] == *incoming
 }
 
@@ -3669,23 +3752,34 @@ unsafe fn refresh_edit_layout(edit: HWND, repaint: bool) {
     if !GetPropW(edit, EDIT_LAYOUT_BUSY_PROPERTY).is_invalid() {
         return;
     }
-    let _ = SetPropW(edit, EDIT_LAYOUT_BUSY_PROPERTY, HANDLE(std::ptr::dangling_mut()));
+    let _ = SetPropW(
+        edit,
+        EDIT_LAYOUT_BUSY_PROPERTY,
+        HANDLE(std::ptr::dangling_mut()),
+    );
     let dpi = GetDpiForWindow(edit).max(96);
     let horizontal = scale(6, dpi);
     let vertical = scale(4, dpi);
     let line = edit_line_height(edit);
     let mut client = RECT::default();
     let _ = GetClientRect(edit, &mut client);
-    let raw_lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0)).0.max(1) as i32;
+    let raw_lines = SendMessageW(edit, EM_GETLINECOUNT, WPARAM(0), LPARAM(0))
+        .0
+        .max(1) as i32;
     // A final line break adds an empty last line that is not content.
-    let length = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(edit).max(0) as usize;
+    let length =
+        windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(edit).max(0) as usize;
     let ends_with_break = length > 0 && {
         let mut text = vec![0u16; length + 1];
-        let copied =
-            windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(edit, &mut text).max(0) as usize;
+        let copied = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(edit, &mut text).max(0)
+            as usize;
         copied > 0 && text[copied - 1] == u16::from(b'\n')
     };
-    let visible_lines = if ends_with_break { (raw_lines - 1).max(1) } else { raw_lines };
+    let visible_lines = if ends_with_break {
+        (raw_lines - 1).max(1)
+    } else {
+        raw_lines
+    };
     let raw_content = raw_lines * line;
     let content = if length == 0 { 0 } else { visible_lines * line };
     let height = client.bottom - client.top;
@@ -3694,7 +3788,11 @@ unsafe fn refresh_edit_layout(edit: HWND, repaint: bool) {
         != 0;
     let fits_without_bar = raw_content <= height - vertical - line / 2;
     let needs_bar = raw_content > height - vertical;
-    let want_bar = if has_bar { !fits_without_bar } else { needs_bar };
+    let want_bar = if has_bar {
+        !fits_without_bar
+    } else {
+        needs_bar
+    };
     let mut repaint = repaint;
     if want_bar != has_bar {
         let _ = SendMessageW(edit, 0x000b, WPARAM(0), LPARAM(0)); // WM_SETREDRAW off
@@ -3765,7 +3863,11 @@ unsafe extern "system" fn framed_edit_subclass(
         WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => paint_edit_buffered(hwnd, palette_from_reference(reference_data)),
         WM_CONTEXTMENU_MESSAGE => {
-            super::context_menu::show_for_edit(hwnd, lparam, palette_from_reference(reference_data));
+            super::context_menu::show_for_edit(
+                hwnd,
+                lparam,
+                palette_from_reference(reference_data),
+            );
             LRESULT(0)
         }
         WM_SETTEXT_MESSAGE => {
@@ -3841,8 +3943,8 @@ unsafe fn band_nccalcsize(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> LRESULT
         return DefSubclassProc(hwnd, WM_NCCALCSIZE_MESSAGE, wparam, lparam);
     }
     let rect: *mut RECT = if wparam.0 != 0 {
-        &mut (*(lparam.0 as *mut windows::Win32::UI::WindowsAndMessaging::NCCALCSIZE_PARAMS))
-            .rgrc[0]
+        &mut (*(lparam.0 as *mut windows::Win32::UI::WindowsAndMessaging::NCCALCSIZE_PARAMS)).rgrc
+            [0]
     } else {
         lparam.0 as *mut RECT
     };
@@ -3963,7 +4065,10 @@ unsafe fn frame_band_layout(hwnd: HWND) -> Option<FrameBandLayout> {
         }
     }
     // The band exists only once WM_NCCALCSIZE has reserved it on every side.
-    if inner.left < side || inner.top < band || inner.right > width - side || inner.bottom > height - band
+    if inner.left < side
+        || inner.top < band
+        || inner.right > width - side
+        || inner.bottom > height - band
     {
         return None;
     }
@@ -4055,7 +4160,13 @@ unsafe fn edit_surface_color(control: HWND, palette: Palette) -> COLORREF {
         return fallback;
     }
     let _ = SetBkColor(dc, fallback);
-    let brush = SendMessageW(parent, message, WPARAM(dc.0 as usize), LPARAM(control.0 as isize)).0;
+    let brush = SendMessageW(
+        parent,
+        message,
+        WPARAM(dc.0 as usize),
+        LPARAM(control.0 as isize),
+    )
+    .0;
     let mut color = GetBkColor(dc);
     if brush != 0 {
         let mut description = LOGBRUSH::default();
@@ -4295,8 +4406,7 @@ unsafe fn set_combo_selection_field_height(hwnd: HWND, height: i32) {
     // Already at this height: setting it again made the combo recalculate and resize itself and
     // forced a frame change on every size step of the page.
     const CB_GETITEMHEIGHT: u32 = 0x0154;
-    if SendMessageW(hwnd, CB_GETITEMHEIGHT, WPARAM(SELECTION_FIELD), LPARAM(0)).0
-        == height as isize
+    if SendMessageW(hwnd, CB_GETITEMHEIGHT, WPARAM(SELECTION_FIELD), LPARAM(0)).0 == height as isize
     {
         return;
     }
@@ -4680,10 +4790,6 @@ unsafe fn call_combo_without_native_paint(
 }
 
 /// Surface colour of a closed drop-down field (the popup list uses the same colour).
-pub(crate) unsafe fn drop_down_field_color(combo: HWND, palette: Palette) -> COLORREF {
-    combo_closed_surface(combo, palette)
-}
-
 /// Publishes the closed field of a drop-down combo (used by combo_popup after open/close).
 pub(crate) unsafe fn repaint_drop_down_field(combo: HWND, palette: Palette) {
     repaint_combo_closed_now(combo, palette);
@@ -5358,13 +5464,17 @@ unsafe extern "system" fn list_box_subclass(
             set_list_box_hot_row(hwnd, None);
             result
         }
-        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK_MESSAGE | WM_LBUTTONUP | WM_KEYDOWN | WM_CHAR_MESSAGE
-        | WM_VSCROLL_MESSAGE | WM_HSCROLL_MESSAGE | WM_MOUSEWHEEL_MESSAGE => {
+        WM_LBUTTONDOWN
+        | WM_LBUTTONDBLCLK_MESSAGE
+        | WM_LBUTTONUP
+        | WM_KEYDOWN
+        | WM_CHAR_MESSAGE
+        | WM_VSCROLL_MESSAGE
+        | WM_HSCROLL_MESSAGE
+        | WM_MOUSEWHEEL_MESSAGE => {
             list_box_native_state_change(hwnd, message, wparam, lparam, true, palette)
         }
-        WM_TIMER_MESSAGE
-            if windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == hwnd =>
-        {
+        WM_TIMER_MESSAGE if windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == hwnd => {
             // Automatic scrolling while a selection is dragged outside the list.
             list_box_native_state_change(hwnd, message, wparam, lparam, true, palette)
         }
@@ -5513,8 +5623,13 @@ unsafe fn paint_list_box_surface(hwnd: HWND, dc: HDC, client: RECT, area: RECT, 
             if background != palette.edit {
                 fill(dc, &row, background);
             }
-            let length =
-                SendMessageW(hwnd, LB_GETTEXTLEN_MESSAGE, WPARAM(index as usize), LPARAM(0)).0;
+            let length = SendMessageW(
+                hwnd,
+                LB_GETTEXTLEN_MESSAGE,
+                WPARAM(index as usize),
+                LPARAM(0),
+            )
+            .0;
             if length <= 0 {
                 continue;
             }
@@ -5555,9 +5670,8 @@ unsafe fn paint_list_box_surface(hwnd: HWND, dc: HDC, client: RECT, area: RECT, 
     }
     if let Some((client_x, client_y, width, height)) = list_box_window_geometry(hwnd) {
         if let Some(geometry) = rounded_control_frame_geometry(width, height, dpi) {
-            let _ = windows::Win32::Graphics::Gdi::OffsetViewportOrgEx(
-                dc, -client_x, -client_y, None,
-            );
+            let _ =
+                windows::Win32::Graphics::Gdi::OffsetViewportOrgEx(dc, -client_x, -client_y, None);
             draw_antialiased_control_frame(
                 dc,
                 RECT {
@@ -5571,7 +5685,8 @@ unsafe fn paint_list_box_surface(hwnd: HWND, dc: HDC, client: RECT, area: RECT, 
                 palette.control_border(),
                 rounded_control_exterior(palette),
             );
-            let _ = windows::Win32::Graphics::Gdi::OffsetViewportOrgEx(dc, client_x, client_y, None);
+            let _ =
+                windows::Win32::Graphics::Gdi::OffsetViewportOrgEx(dc, client_x, client_y, None);
         }
     }
 }
@@ -5832,7 +5947,7 @@ unsafe fn paint_list_view_row(
         if subitem == 0 && state_image & LVIS_STATEIMAGEMASK as u32 != 0 {
             // Selected rows start their text where comctl32 starts it on the other rows: at the
             // label, right after the state-image slot our checkbox is painted into.
-            if let Some(label) = list_view_label_left(list, item_index as usize) {
+            if let Some(label) = list_view_label_left(list, item_index) {
                 text_rect.left = text_rect.left.max(label + scale(2, dpi));
             } else {
                 text_rect.left += scale(24, dpi);

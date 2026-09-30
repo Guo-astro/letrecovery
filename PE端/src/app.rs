@@ -1631,9 +1631,10 @@ fn execute_install_workflow(
         log::warn!(
             "[PE INSTALL] irreversible boundary entered: in-place old-system deletion started; old-system rollback is disabled"
         );
-        match lr_core::personal_files::delete_old_system_in_place(std::path::Path::new(
-            &format!("{}\\", target_partition.trim_end_matches(['\\', '/'])),
-        )) {
+        match lr_core::personal_files::delete_old_system_in_place(std::path::Path::new(&format!(
+            "{}\\",
+            target_partition.trim_end_matches(['\\', '/'])
+        ))) {
             Ok(report) => {
                 log::info!(
                     "[PE INSTALL] 原地删除旧系统完成: roots={} entries={} 未能删除={}",
@@ -1732,9 +1733,7 @@ fn execute_install_workflow(
                 return;
             }
         } else {
-            log::info!(
-                "[SCATTER] 拼回镜像与正常端完整校验过的字节 SHA-256 一致，跳过重复校验"
-            );
+            log::info!("[SCATTER] 拼回镜像与正常端完整校验过的字节 SHA-256 一致，跳过重复校验");
         }
         if config.repair_boot {
             let staged_pca_compat = match crate::core::pca_preflight::staged_config(
@@ -2289,13 +2288,19 @@ fn execute_install_workflow(
     } else if config.should_import_drivers() && !driver_path_exists {
         // Old drivers are optional. Continue with Windows' inbox drivers instead of leaving an
         // applied image without boot files.
-        log::warn!("请求自动导入驱动，但驱动目录不存在，已跳过驱动导入: {}", driver_path);
+        log::warn!(
+            "请求自动导入驱动，但驱动目录不存在，已跳过驱动导入: {}",
+            driver_path
+        );
         completion_warnings.push(tr!("没有找到暂存的驱动，已跳过旧驱动导入"));
     } else if config.has_driver_data() {
         // "Save drivers only" is a convenience copy for later manual installation. An empty or
         // unavailable export must not fail an installation whose image is already applied.
         if !driver_path_exists {
-            log::warn!("请求保留驱动，但暂存驱动目录不存在，已跳过: {}", driver_path);
+            log::warn!(
+                "请求保留驱动，但暂存驱动目录不存在，已跳过: {}",
+                driver_path
+            );
             completion_warnings.push(tr!("没有找到需要保存的驱动，已跳过保存驱动"));
         } else {
             match crate::save_only_driver_destination(&target_partition, &config.session_id) {
@@ -2514,6 +2519,16 @@ fn execute_install_workflow(
         }
     } else {
         log::info!("未启用高级选项，跳过离线注册表加载");
+    }
+    // Only LetRecovery's built-in answer file stages the first-logon finalizer that imports
+    // LR_WiFi.xml and then deletes LetRecovery_Scripts. With a custom answer file (or unattended
+    // setup disabled) the plaintext-key profile would stay on the target and never be imported.
+    let built_in_first_logon = config.unattended && config.custom_unattend_file.is_empty();
+    if private_wifi_profile.is_some() && !built_in_first_logon {
+        log::warn!(
+            "[ADVANCED WIFI] status=skipped reason=built_in_unattend_not_used; the private profile is not written to the target"
+        );
+        private_wifi_profile = None;
     }
     if let Some(profile) = private_wifi_profile.as_deref() {
         match lr_core::first_logon::stage_wifi_profile(&target_partition, profile) {
@@ -3209,7 +3224,8 @@ fn apply_authenticated_advanced_inputs(
             .filter_map(|component| component.as_os_str().to_str())
             .collect::<Vec<_>>();
         let Some(position) = components.windows(2).position(|pair| {
-            pair[0].eq_ignore_ascii_case("user_drivers") && pair[1].eq_ignore_ascii_case("__advanced")
+            pair[0].eq_ignore_ascii_case("user_drivers")
+                && pair[1].eq_ignore_ascii_case("__advanced")
         }) else {
             continue;
         };
@@ -3272,7 +3288,10 @@ fn import_registry_file_offline(
     let hives = [
         ("pc-soft", config.join("SOFTWARE")),
         ("pc-sys", config.join("SYSTEM")),
-        ("pc-default", root.join("Users").join("Default").join("NTUSER.DAT")),
+        (
+            "pc-default",
+            root.join("Users").join("Default").join("NTUSER.DAT"),
+        ),
     ];
     let mut loaded = Vec::new();
     for (name, hive) in &hives {
@@ -3512,7 +3531,6 @@ fn generate_win10_unattend_xml(
     )
 }
 
-
 /// Directory on the formatted target that receives an image rebuilt from scattered raw chunks.
 const REASSEMBLY_DIRECTORY: &str = "LetRecovery_Reassembly";
 
@@ -3637,7 +3655,10 @@ fn remove_reassembled_image(target_partition: &str) {
         REASSEMBLY_DIRECTORY
     ));
     match std::fs::remove_dir_all(&directory) {
-        Ok(()) => log::info!("[SCATTER] 已删除目标分区上拼回的镜像 {}", directory.display()),
+        Ok(()) => log::info!(
+            "[SCATTER] 已删除目标分区上拼回的镜像 {}",
+            directory.display()
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => log::warn!(
             "[SCATTER] 删除拼回的镜像 {} 失败，可以在新系统中手动删除: {error}",

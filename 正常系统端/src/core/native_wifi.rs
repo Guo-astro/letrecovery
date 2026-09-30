@@ -147,6 +147,13 @@ mod native {
     }
 
     fn connected_interfaces(client: &WlanClient) -> anyhow::Result<Vec<WLAN_INTERFACE_INFO>> {
+        Ok(all_interfaces(client)?
+            .into_iter()
+            .filter(|interface| interface.isState == wlan_interface_state_connected)
+            .collect())
+    }
+
+    fn all_interfaces(client: &WlanClient) -> anyhow::Result<Vec<WLAN_INTERFACE_INFO>> {
         let mut raw = std::ptr::null_mut::<WLAN_INTERFACE_INFO_LIST>();
         let status = unsafe { (client.1.enumerate)(client.0, std::ptr::null(), &mut raw) };
         if status != ERROR_SUCCESS.0 {
@@ -159,10 +166,34 @@ mod native {
         let list = unsafe { &*raw };
         let count = list.dwNumberOfItems as usize;
         let interfaces = unsafe { slice::from_raw_parts(list.InterfaceInfo.as_ptr(), count) };
-        Ok(interfaces
+        Ok(interfaces.to_vec())
+    }
+
+    /// Registry-style interface GUID (`{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}`).
+    fn format_guid(guid: &GUID) -> String {
+        format!(
+            "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+            guid.data1,
+            guid.data2,
+            guid.data3,
+            guid.data4[0],
+            guid.data4[1],
+            guid.data4[2],
+            guid.data4[3],
+            guid.data4[4],
+            guid.data4[5],
+            guid.data4[6],
+            guid.data4[7]
+        )
+    }
+
+    /// Interface GUIDs of every WLAN adapter, connected or not. Read-only; used to locate the
+    /// adapter's driver package for the optional Wi-Fi PE runtime.
+    pub fn wifi_interface_guids() -> anyhow::Result<Vec<String>> {
+        let client = open_client()?;
+        Ok(all_interfaces(&client)?
             .iter()
-            .copied()
-            .filter(|interface| interface.isState == wlan_interface_state_connected)
+            .map(|interface| format_guid(&interface.InterfaceGuid))
             .collect())
     }
 
@@ -213,15 +244,32 @@ mod native {
     pub fn capture_connected_wifi() -> anyhow::Result<CapturedWifiProfile> {
         let client = open_client()?;
         let interfaces = connected_interfaces(&client)?;
-        if interfaces.len() != 1 {
-            bail!(
-                "expected exactly one connected Wi-Fi interface, found {}",
-                interfaces.len()
-            );
+        if interfaces.is_empty() {
+            bail!("no connected Wi-Fi interface was found");
         }
-        let interface = &interfaces[0];
-        let (_attributes_memory, attributes) =
-            unsafe { connection_attributes(&client, interface)? };
+        // `connected_wifi_available` offers the option whenever at least one interface is
+        // connected. With two connected adapters (for example a built-in card plus a USB dongle)
+        // the former exactly-one rule refused the migration outright; use the first interface
+        // that yields a portable profile instead.
+        let mut failures = Vec::new();
+        for interface in &interfaces {
+            match capture_interface_profile(&client, interface) {
+                Ok(profile) => return Ok(profile),
+                Err(error) => failures.push(format!("{error:#}")),
+            }
+        }
+        bail!(
+            "none of the {} connected Wi-Fi interfaces returned a portable profile: {}",
+            interfaces.len(),
+            failures.join("; ")
+        )
+    }
+
+    fn capture_interface_profile(
+        client: &WlanClient,
+        interface: &WLAN_INTERFACE_INFO,
+    ) -> anyhow::Result<CapturedWifiProfile> {
+        let (_memory, attributes) = unsafe { connection_attributes(client, interface)? };
         let profile_name = utf16_array(&attributes.strProfileName)?;
         if profile_name.is_empty() {
             bail!("connected Wi-Fi has no saved profile name");
@@ -272,7 +320,13 @@ mod native {
 
     #[cfg(test)]
     mod loading_tests {
-        use super::WlanApi;
+        use super::{format_guid, WlanApi, GUID};
+
+        #[test]
+        fn interface_guid_matches_the_network_class_registry_format() {
+            let guid = GUID::from_u128(0x8c1b2a3d_4e5f_6789_abcd_ef0123456789);
+            assert_eq!(format_guid(&guid), "{8C1B2A3D-4E5F-6789-ABCD-EF0123456789}");
+        }
 
         #[test]
         fn missing_optional_library_returns_an_error_without_opening_a_wlan_session() {
@@ -335,6 +389,14 @@ pub fn capture_connected_wifi() -> anyhow::Result<CapturedWifiProfile> {
 
 #[cfg(not(feature = "non-elevated-tests"))]
 pub use native::capture_connected_wifi;
+
+#[cfg(feature = "non-elevated-tests")]
+pub fn wifi_interface_guids() -> anyhow::Result<Vec<String>> {
+    bail!("Wi-Fi interface discovery is disabled in the development build")
+}
+
+#[cfg(not(feature = "non-elevated-tests"))]
+pub use native::wifi_interface_guids;
 
 #[cfg(test)]
 mod tests {

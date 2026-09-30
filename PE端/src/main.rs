@@ -1603,6 +1603,7 @@ fn main() -> anyhow::Result<()> {
             "[PE HANDOFF] BitLocker 自动解锁材料不可用，继续交接: {error:#}"
         ),
     }
+    core::pe_network::start_from_handoff(&authenticated_handoff);
     if authenticated_handoff.purpose() == lr_core::handoff_auth::HandoffPurpose::Maintenance {
         remain_in_hidden_pe_maintenance();
     }

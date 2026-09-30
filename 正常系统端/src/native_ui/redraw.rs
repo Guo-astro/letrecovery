@@ -10,8 +10,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    RedrawWindow, REDRAW_WINDOW_FLAGS, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
-    RDW_NOCHILDREN, RDW_UPDATENOW,
+    RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RDW_NOCHILDREN,
+    RDW_UPDATENOW, REDRAW_WINDOW_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetAncestor, IsWindowVisible, SendMessageW, SystemParametersInfoW, GA_ROOT,
@@ -365,10 +365,9 @@ unsafe fn lease_surface(
         let Ok(mut surfaces) = cell.try_borrow_mut() else {
             return None;
         };
-        if let Some(index) = surfaces
-            .iter()
-            .position(|surface| !surface.in_use && surface.width >= width && surface.height >= height)
-        {
+        if let Some(index) = surfaces.iter().position(|surface| {
+            !surface.in_use && surface.width >= width && surface.height >= height
+        }) {
             surfaces[index].in_use = true;
             return Some((surfaces[index].dc, SurfaceLease::Cached(index)));
         }
@@ -692,7 +691,10 @@ pub(crate) unsafe fn show_top_level_without_flash(hwnd: HWND) {
         );
     }
     if let Some(start) = trace_start {
-        log::info!("[UI 渲染] 首次显示窗口：隐藏状态下绘制完成用时 {} ms", format_ms(micros_since(start)));
+        log::info!(
+            "[UI 渲染] 首次显示窗口：隐藏状态下绘制完成用时 {} ms",
+            format_ms(micros_since(start))
+        );
     }
 }
 
@@ -828,13 +830,12 @@ unsafe fn cover_insert_after(owner: HWND, cover: HWND) -> HWND {
 unsafe fn show_screen_cover(owner: HWND) -> Option<ScreenCover> {
     use windows::Win32::Graphics::Dwm::{DwmFlush, DwmSetWindowAttribute, DWMWINDOWATTRIBUTE};
     use windows::Win32::Graphics::Gdi::{
-        BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC,
-        DeleteObject, GdiFlush, GetDC, ReleaseDC, SelectObject, SRCCOPY,
+        BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+        GdiFlush, GetDC, ReleaseDC, SelectObject, SRCCOPY,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, GetClientRect, SetWindowLongPtrW, SetWindowPos, GWLP_USERDATA,
-        HMENU, SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-        WS_POPUP,
+        CreateWindowExW, GetClientRect, SetWindowLongPtrW, SetWindowPos, GWLP_USERDATA, HMENU,
+        SWP_NOACTIVATE, SWP_SHOWWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
     if !composition_enabled() || !register_screen_cover_class() {
         return None;
@@ -1006,8 +1007,8 @@ pub(crate) fn ui_detail_changed(hwnd: HWND, key: &'static str, text: impl FnOnce
 pub(crate) unsafe fn ui_detail_dump_children(root: HWND, label: &str) {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumChildWindows, GetClassNameW, GetParent, GetWindowLongPtrW, GetWindowRect,
-        GWL_EXSTYLE, GWL_STYLE,
+        EnumChildWindows, GetClassNameW, GetParent, GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE,
+        GWL_STYLE,
     };
     if !ui_detail_enabled() {
         return;
@@ -1039,7 +1040,11 @@ pub(crate) unsafe fn ui_detail_dump_children(root: HWND, label: &str) {
             window.bottom - window.top,
             GetWindowLongPtrW(hwnd, GWL_STYLE),
             GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
-            if has_region { format!("{region:?}") } else { "none".to_owned() }
+            if has_region {
+                format!("{region:?}")
+            } else {
+                "none".to_owned()
+            }
         ));
         BOOL(1)
     }
@@ -1124,7 +1129,12 @@ pub(crate) unsafe fn flush_deferred_frame_paints() {
     for window in windows {
         let hwnd = HWND(window as *mut _);
         if windows::Win32::UI::WindowsAndMessaging::IsWindow(hwnd).as_bool() {
-            let _ = RedrawWindow(hwnd, None, None, RDW_FRAME | RDW_INVALIDATE | windows::Win32::Graphics::Gdi::RDW_NOERASE);
+            let _ = RedrawWindow(
+                hwnd,
+                None,
+                None,
+                RDW_FRAME | RDW_INVALIDATE | windows::Win32::Graphics::Gdi::RDW_NOERASE,
+            );
         }
     }
 }
@@ -1184,7 +1194,11 @@ pub(crate) fn ui_trace_enabled() -> bool {
             let composition = unsafe { composition_enabled() };
             log::info!(
                 "[UI 渲染] 已开启界面渲染跟踪；桌面合成（DWM）：{}",
-                if composition { "已启用" } else { "未启用" }
+                if composition {
+                    "已启用"
+                } else {
+                    "未启用"
+                }
             );
         }
         enabled
@@ -1241,7 +1255,10 @@ pub(crate) fn trace_list_view_paint(start: Option<std::time::Instant>) {
         TRACE_LIST_VIEWS.fetch_add(1, Ordering::Relaxed);
         TRACE_LIST_VIEW_MICROS.fetch_add(micros, Ordering::Relaxed);
         if micros >= 16_000 {
-            log::info!("[UI 渲染] 单次列表绘制耗时 {} ms（超过一帧）", format_ms(micros));
+            log::info!(
+                "[UI 渲染] 单次列表绘制耗时 {} ms（超过一帧）",
+                format_ms(micros)
+            );
         }
     }
 }
@@ -1272,7 +1289,10 @@ impl TraceSpan {
 
     pub(crate) fn phase(&mut self, name: &'static str) {
         let now = std::time::Instant::now();
-        let micros = now.duration_since(self.last).as_micros().min(u64::MAX as u128) as u64;
+        let micros = now
+            .duration_since(self.last)
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
         self.phases.push((name, micros));
         self.last = now;
     }
@@ -1313,7 +1333,7 @@ struct ResizeStats {
 
 thread_local! {
     static RESIZE_STATS: std::cell::RefCell<Vec<(isize, ResizeStats)>> =
-        std::cell::RefCell::new(Vec::new());
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Records one size step: layout from `start` to `layout_done`, painting from then to now.
@@ -1325,7 +1345,10 @@ pub(crate) fn trace_resize_step(
     let (Some(start), Some(layout_done)) = (start, layout_done) else {
         return;
     };
-    let layout = layout_done.duration_since(start).as_micros().min(u64::MAX as u128) as u64;
+    let layout = layout_done
+        .duration_since(start)
+        .as_micros()
+        .min(u64::MAX as u128) as u64;
     let paint = micros_since(layout_done);
     let key = hwnd.0 as isize;
     RESIZE_STATS.with(|cell| {

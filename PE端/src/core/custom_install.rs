@@ -7,10 +7,10 @@
 use anyhow::{bail, Context, Result};
 
 use lr_core::custom_install::{
-    plan_full_disk_layout_for_disk, validate_existing_staging_extent, CustomInstallPlan, FullDiskRole,
-    PlannedPartition, PlannedPartitionRole, RepartitionAllDisksPlan, RequestedPartitionStyle,
-    BIOS_SYSTEM_FUNCTIONAL_MINIMUM_BYTES, ESP_4KN_MINIMUM_BYTES, ESP_512_MINIMUM_BYTES,
-    MIN_USEFUL_DATA_BYTES, MSR_WINDOWS_7_MINIMUM_BYTES,
+    plan_full_disk_layout_for_disk, validate_existing_staging_extent, CustomInstallPlan,
+    FullDiskRole, PlannedPartition, PlannedPartitionRole, RepartitionAllDisksPlan,
+    RequestedPartitionStyle, BIOS_SYSTEM_FUNCTIONAL_MINIMUM_BYTES, ESP_4KN_MINIMUM_BYTES,
+    ESP_512_MINIMUM_BYTES, MIN_USEFUL_DATA_BYTES, MSR_WINDOWS_7_MINIMUM_BYTES,
 };
 use lr_core::windows_storage::{
     CreatePartitionRequest, DiskStyle, FileSystem, FreeExtent, PartitionKind, VolumeIdentity,

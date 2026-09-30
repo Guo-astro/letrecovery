@@ -112,6 +112,13 @@ pub(crate) fn supports_scattered_staging(pe_path: &Path) -> bool {
         .is_ok_and(|bytes| capability_text_contains(&bytes, SCATTERED_STAGING_CAPABILITY))
 }
 
+/// Whether the PE helper inside this WIM declares that it can bring up wired and wireless
+/// networking from an authenticated payload ("接通 Wi-Fi PE").
+pub(crate) fn supports_pe_network_payload(pe_path: &Path) -> bool {
+    let capability = lr_core::pe_network::PE_NETWORK_CAPABILITY;
+    read_pe_capabilities(pe_path).is_ok_and(|bytes| capability_text_contains(&bytes, capability))
+}
+
 /// Root identity recorded in the LRPE4 journal. WinPE treats it as diagnostics only, so a
 /// filtered storage stack (hardware-ID spoofer) falls back to volume-level evidence instead of
 /// blocking the PE handoff.
@@ -132,9 +139,7 @@ fn persistent_pe_root_identity(
     match strict {
         Ok(identity) => Ok(identity),
         Err(error) => {
-            log::warn!(
-                "[PE] 系统盘分区表指纹不可用（{error:#}），PE 日志记录改用卷级诊断身份"
-            );
+            log::warn!("[PE] 系统盘分区表指纹不可用（{error:#}），PE 日志记录改用卷级诊断身份");
             let (style, gpt_partition_id) = match stable.partition {
                 lr_core::windows_storage::StablePartitionIdentity::Gpt { partition_id } => (
                     lr_core::install_handoff::CanonicalTargetStyle::Gpt,
@@ -646,9 +651,9 @@ fn secure_pe_directory() -> Result<SecurePeDirectory> {
         match verify_secure_directory_acl(&path) {
             Ok(()) => match repaired {
                 Ok(()) => log::info!("[PE] 持久 PE 目录权限已自动恢复"),
-                Err(error) => log::warn!(
-                    "[PE] 持久 PE 目录本身的权限已恢复，但部分子项未能同步: {error:#}"
-                ),
+                Err(error) => {
+                    log::warn!("[PE] 持久 PE 目录本身的权限已恢复，但部分子项未能同步: {error:#}")
+                }
             },
             Err(still_untrusted) => {
                 let empty = std::fs::read_dir(&path)
@@ -733,6 +738,7 @@ pub(crate) struct HandoffBootPayload {
     private_wifi_profile: Option<Vec<u8>>,
     administrator_secret: Option<zeroize::Zeroizing<Vec<u8>>>,
     bitlocker_secret: Option<zeroize::Zeroizing<Vec<u8>>>,
+    pe_network_payload: Option<super::pe_network::PeNetworkBootPayload>,
 }
 
 impl HandoffBootPayload {
@@ -774,6 +780,7 @@ impl HandoffBootPayload {
             private_wifi_profile,
             administrator_secret: None,
             bitlocker_secret: None,
+            pe_network_payload: None,
         })
     }
 
@@ -849,6 +856,31 @@ impl HandoffBootPayload {
             anyhow::bail!("protected BitLocker secret does not match its PE handoff manifest");
         }
         self.bitlocker_secret = Some(bytes);
+        Ok(self)
+    }
+
+    /// Attach the authenticated PE network payload, verifying it against the binding embedded in
+    /// the already authenticated config bytes, and the staged driver package against the
+    /// manifest inside that payload.
+    pub(crate) fn with_pe_network_payload(
+        mut self,
+        network: super::pe_network::PeNetworkBootPayload,
+    ) -> Result<Self> {
+        let config_text = std::str::from_utf8(&self.config_bytes)
+            .context("authenticated handoff config is not UTF-8")?;
+        match lr_core::pe_network::PeNetworkPayloadBinding::from_config_text(config_text)? {
+            Some(binding) => binding.verify(&network.bytes)?,
+            None => anyhow::bail!("PE network payload provided without an authenticated binding"),
+        }
+        let parsed = lr_core::pe_network::PeNetworkPayload::parse(&network.bytes)?;
+        let staged = match network.drivers.as_ref() {
+            Some(tree) => tree.files(),
+            None => &[],
+        };
+        if parsed.drivers.as_slice() != staged {
+            anyhow::bail!("PE network driver manifest and staged driver package disagree");
+        }
+        self.pe_network_payload = Some(network);
         Ok(self)
     }
 }
@@ -954,6 +986,22 @@ fn inject_authenticated_handoff(
             Ok::<_, anyhow::Error>((file, handle))
         })
         .transpose()?;
+    let pe_network_file = payload
+        .pe_network_payload
+        .as_ref()
+        .map(|network| {
+            let (file, mut handle) =
+                lr_core::scoped_temp_file::ScopedTempFile::create_system_administrators_writer_in(
+                    &directory.path,
+                    "handoff-pe-network",
+                    "ini",
+                )?;
+            handle.write_all(&network.bytes)?;
+            handle.sync_all()?;
+            lr_core::scoped_temp_file::verify_system_administrators_file_custody(&handle)?;
+            Ok::<_, anyhow::Error>((file, handle))
+        })
+        .transpose()?;
     let target_wim = target_wim
         .to_str()
         .context("private PE WIM path is not valid Unicode")?;
@@ -1040,6 +1088,39 @@ fn inject_authenticated_handoff(
             )
             .map_err(anyhow::Error::msg)?;
     }
+    if let Some((pe_network_file, _pe_network_handle)) = pe_network_file.as_ref() {
+        manager
+            .add_file_to_image(
+                target_wim,
+                boot_index as i32,
+                pe_network_file
+                    .path()
+                    .to_str()
+                    .context("protected PE network temporary path is not valid Unicode")?,
+                lr_core::pe_network::PAYLOAD_WIM_PATH,
+            )
+            .map_err(anyhow::Error::msg)?;
+    }
+    let pe_network_drivers = payload
+        .pe_network_payload
+        .as_ref()
+        .and_then(|network| network.drivers.as_ref());
+    if let Some(drivers) = pe_network_drivers {
+        // Re-check the staged package right before it enters the boot image.
+        lr_core::pe_network::verify_driver_tree(drivers.root(), drivers.files())
+            .context("staged PE network driver package changed before injection")?;
+        manager
+            .add_file_to_image(
+                target_wim,
+                boot_index as i32,
+                drivers
+                    .root()
+                    .to_str()
+                    .context("PE network driver staging path is not valid Unicode")?,
+                lr_core::pe_network::DRIVER_TREE_WIM_PATH,
+            )
+            .map_err(anyhow::Error::msg)?;
+    }
 
     let verification =
         lr_core::scoped_temp_file::ScopedTempDir::create_in(&directory.path, "handoff-readback")?;
@@ -1059,6 +1140,12 @@ fn inject_authenticated_handoff(
     }
     if bitlocker_file.is_some() {
         paths.push(HANDOFF_BITLOCKER_WIM_PATH);
+    }
+    if pe_network_file.is_some() {
+        paths.push(lr_core::pe_network::PAYLOAD_WIM_PATH);
+    }
+    if pe_network_drivers.is_some() {
+        paths.push(lr_core::pe_network::DRIVER_TREE_WIM_PATH);
     }
     manager
         .extract_paths(
@@ -1125,6 +1212,24 @@ fn inject_authenticated_handoff(
         if actual.as_slice() != expected.as_slice() {
             anyhow::bail!("protected BitLocker secret readback does not match injected bytes");
         }
+    }
+    if let Some(expected) = payload.pe_network_payload.as_ref() {
+        let actual = lr_core::scoped_temp_file::read_bounded_plain_file(
+            &verification
+                .path()
+                .join(lr_core::pe_network::PAYLOAD_FILE_NAME),
+            lr_core::pe_network::PAYLOAD_MAX_BYTES,
+        )?;
+        if actual.as_slice() != expected.bytes.as_slice() {
+            anyhow::bail!("protected PE network readback does not match injected bytes");
+        }
+    }
+    if let Some(drivers) = pe_network_drivers {
+        let readback = verification
+            .path()
+            .join(lr_core::pe_network::DRIVER_TREE_DIR_NAME);
+        lr_core::pe_network::verify_driver_tree(&readback, drivers.files())
+            .context("protected PE network driver readback does not match the staged package")?;
     }
     verifier
         .open_wim(target_wim)
@@ -2424,6 +2529,7 @@ fn validate_maintenance_language(language: &str) -> Result<&str> {
 fn build_maintenance_payload(
     language: &str,
     recovery_keys: &zeroize::Zeroizing<Vec<String>>,
+    network: super::pe_network::PeNetworkHandoff,
 ) -> Result<HandoffBootPayload> {
     use lr_core::handoff_manifest::{
         ArtifactLocation, ArtifactRecord, ArtifactRole, HandoffManifest, ManifestBinding,
@@ -2466,9 +2572,10 @@ fn build_maintenance_payload(
     let manifest_bytes = manifest.to_bytes()?;
     let binding = ManifestBinding::new(&manifest_bytes)?;
     let config_bytes = format!(
-        "[Maintenance]\r\nSessionId={}\r\nLanguage={}\r\n{}",
+        "[Maintenance]\r\nSessionId={}\r\nLanguage={}\r\n{}{}",
         session_id.as_str(),
         language,
+        network.config_lines(),
         binding.to_config_lines()
     )
     .into_bytes();
@@ -2481,6 +2588,10 @@ fn build_maintenance_payload(
         None,
         None,
     )?;
+    let payload = match network.into_boot_payload() {
+        Some(network) => payload.with_pe_network_payload(network)?,
+        None => payload,
+    };
     match secret {
         Some(secret) => payload.with_bitlocker_secret(secret),
         None => Ok(payload),
@@ -2533,7 +2644,11 @@ pub(crate) fn enter_pe_maintenance_with_progress(
     let keys = zeroize::Zeroizing::new(
         crate::core::bitlocker::BitLockerManager::new().collect_recovery_keys_best_effort(),
     );
-    let payload = build_maintenance_payload(language, &keys)?;
+    let payload = build_maintenance_payload(
+        language,
+        &keys,
+        super::pe_network::PeNetworkHandoff::prepare(&snapshot.path),
+    )?;
     progress(PeMaintenanceProgress::CreatingBootEntry);
     PeManager::new()
         .boot_to_pe_for_maintenance(&snapshot.path.to_string_lossy(), &pe.display_name, payload)?
@@ -2751,8 +2866,12 @@ mod cache_policy_tests {
     #[cfg(windows)]
     #[test]
     fn maintenance_payload_without_recovery_keys_has_no_secret_or_disk_identity() {
-        let payload =
-            build_maintenance_payload("zh-CN", &zeroize::Zeroizing::new(Vec::new())).unwrap();
+        let payload = build_maintenance_payload(
+            "zh-CN",
+            &zeroize::Zeroizing::new(Vec::new()),
+            crate::core::pe_network::PeNetworkHandoff::disabled(),
+        )
+        .unwrap();
         let manifest =
             lr_core::handoff_manifest::HandoffManifest::parse(&payload.manifest_bytes).unwrap();
 
@@ -2775,9 +2894,12 @@ mod cache_policy_tests {
         use lr_core::handoff_manifest::{ArtifactLocation, ArtifactRole};
 
         let key = "111111-222222-333333-444444-555555-666666-777777-888888".to_owned();
-        let payload =
-            build_maintenance_payload("en-US", &zeroize::Zeroizing::new(vec![key.clone()]))
-                .unwrap();
+        let payload = build_maintenance_payload(
+            "en-US",
+            &zeroize::Zeroizing::new(vec![key.clone()]),
+            crate::core::pe_network::PeNetworkHandoff::disabled(),
+        )
+        .unwrap();
         let manifest =
             lr_core::handoff_manifest::HandoffManifest::parse(&payload.manifest_bytes).unwrap();
         let artifact = manifest.artifacts.first().unwrap();

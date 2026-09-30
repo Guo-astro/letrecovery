@@ -30,8 +30,8 @@ use windows::Win32::Graphics::Gdi::{
     DrawTextW, EndPaint, FillRect, GdiFlush, GetDC, GetMonitorInfoW, GetTextMetricsW,
     MonitorFromWindow, Polygon, ReleaseDC, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HFONT, HGDIOBJ, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, TEXTMETRICW, TRANSPARENT,
+    DT_SINGLELINE, DT_VCENTER, HBITMAP, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    PAINTSTRUCT, TEXTMETRICW, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -39,9 +39,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetAncestor, GetDlgCtrlID, GetParent,
-    GetWindowRect, IsWindow, KillTimer, LoadCursorW, RegisterClassExW, SendMessageW,
-    ShowWindow, UpdateLayeredWindow, GA_ROOT, HMENU, IDC_ARROW, SW_SHOWNOACTIVATE, ULW_ALPHA,
-    WINDOW_EX_STYLE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetWindowRect, IsWindow, KillTimer, LoadCursorW, RegisterClassExW, SendMessageW, ShowWindow,
+    UpdateLayeredWindow, GA_ROOT, HMENU, IDC_ARROW, SW_SHOWNOACTIVATE, ULW_ALPHA, WINDOW_EX_STYLE,
+    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use windows::Win32::UI::Controls::{CloseThemeData, DrawThemeBackground, OpenThemeData, HTHEME};
@@ -136,7 +136,8 @@ impl Surface {
             ..Default::default()
         };
         let mut bits = std::ptr::null_mut::<c_void>();
-        let Ok(bitmap) = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0)
+        let Ok(bitmap) =
+            CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, HANDLE::default(), 0)
         else {
             let _ = DeleteDC(dc);
             return None;
@@ -254,7 +255,9 @@ unsafe fn notify(combo: HWND, code: u16) {
 }
 
 unsafe fn combo_strings(combo: HWND) -> Vec<Vec<u16>> {
-    let count = SendMessageW(combo, CB_GETCOUNT, WPARAM(0), LPARAM(0)).0.max(0) as usize;
+    let count = SendMessageW(combo, CB_GETCOUNT, WPARAM(0), LPARAM(0))
+        .0
+        .max(0) as usize;
     let mut items = Vec::with_capacity(count);
     for index in 0..count {
         let length = SendMessageW(combo, CB_GETLBTEXTLEN, WPARAM(index), LPARAM(0)).0;
@@ -346,9 +349,11 @@ fn rounded_distance(x: f32, y: f32, rect: RECT, radius: f32) -> f32 {
     outside + qx.max(qy).min(0.0) - radius
 }
 
+/// A cached outline mask, keyed by (width, height, radius, border).
+type MaskCacheEntry = ((i32, i32, i32, i32), std::rc::Rc<Vec<[u8; 2]>>);
+
 thread_local! {
-    static MASKS: RefCell<Vec<((i32, i32, i32, i32), std::rc::Rc<Vec<[u8; 2]>>)>> =
-        const { RefCell::new(Vec::new()) };
+    static MASKS: RefCell<Vec<MaskCacheEntry>> = const { RefCell::new(Vec::new()) };
     static ROW_HEIGHTS: RefCell<Vec<((isize, u32), i32)>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -388,7 +393,11 @@ pub(crate) unsafe fn list_row_height(parent: HWND, font: HFONT, dpi: u32) -> Opt
     const LVS_EX_DOUBLEBUFFER: isize = 0x0001_0000;
     let key = (font.0 as isize, dpi);
     if let Some(height) = ROW_HEIGHTS.with(|cache| {
-        cache.borrow().iter().find(|(entry, _)| *entry == key).map(|(_, height)| *height)
+        cache
+            .borrow()
+            .iter()
+            .find(|(entry, _)| *entry == key)
+            .map(|(_, height)| *height)
     }) {
         return Some(height);
     }
@@ -516,21 +525,23 @@ pub(crate) unsafe fn open(combo: HWND, palette: Palette) {
         notify(combo, CBN_CLOSEUP);
         return;
     }
-    let field_height = super::theme::combo_closed_height(
-        combo,
-        InnoMetrics::for_dpi(dpi).field_height,
-    )
-    .min((combo_rect.bottom - combo_rect.top).max(1));
+    let field_height =
+        super::theme::combo_closed_height(combo, InnoMetrics::for_dpi(dpi).field_height)
+            .min((combo_rect.bottom - combo_rect.top).max(1));
     let field_bottom = combo_rect.top + field_height;
     let work = work_area(combo);
-    let dropped_width = SendMessageW(combo, CB_GETDROPPEDWIDTH, WPARAM(0), LPARAM(0)).0.max(0) as i32;
+    let dropped_width = SendMessageW(combo, CB_GETDROPPEDWIDTH, WPARAM(0), LPARAM(0))
+        .0
+        .max(0) as i32;
     let width = (combo_rect.right - combo_rect.left)
         .max(dropped_width)
         .max(s(80))
         .min((work.right - work.left).max(s(80)));
     // The outline of every field: same radius and border width.
     let (radius, border) = rounded_control_frame_geometry(width, s(200), dpi)
-        .map_or((s(5), s(1).max(1)), |geometry| (geometry.radius, geometry.side_band.max(1)));
+        .map_or((s(5), s(1).max(1)), |geometry| {
+            (geometry.radius, geometry.side_band.max(1))
+        });
     // Rows start right at the outline: a highlighted row meets the border on both sides, and the
     // first row meets the top border (the rounded corners clip it like the lists' selection).
     let inset = border;
@@ -539,7 +550,9 @@ pub(crate) unsafe fn open(combo: HWND, palette: Palette) {
     let below = fit(work.bottom - field_bottom - gap);
     let above_space = fit(combo_rect.top - gap - work.top);
     let open_above = below < wanted && above_space > below;
-    let rows = wanted.min(if open_above { above_space } else { below }).max(1);
+    let rows = wanted
+        .min(if open_above { above_space } else { below })
+        .max(1);
     let height = rows as i32 * row_height + inset * 2;
     let x = combo_rect
         .left
@@ -609,7 +622,9 @@ pub(crate) unsafe fn open(combo: HWND, palette: Palette) {
         HTHEME::default()
     };
     let selection = SendMessageW(combo, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
-    let original = usize::try_from(selection).ok().filter(|index| *index < items.len());
+    let original = usize::try_from(selection)
+        .ok()
+        .filter(|index| *index < items.len());
     let slide = if open_above { s(8) } else { -s(8) };
     let mut popup = Popup {
         combo,
@@ -629,7 +644,10 @@ pub(crate) unsafe fn open(combo: HWND, palette: Palette) {
         rows_rect,
         scrollbar,
         theme,
-        background: super::theme::drop_down_field_color(combo, palette),
+        // The open list uses the page background. The closed field's colour at this moment is
+        // its pressed/hot state (light blue in the light theme), which made the whole menu
+        // look like one selected block.
+        background: palette.window,
         scroll_hot: ScrollPart::None,
         scroll_hover: false,
         origin,
@@ -731,7 +749,14 @@ unsafe fn finish(mut popup: Popup, accept: bool) {
     if let Some(index) = chosen.filter(|_| changed) {
         let _ = SendMessageW(combo, CB_SETCURSEL, WPARAM(index), LPARAM(0));
     }
-    notify(combo, if accept { CBN_SELENDOK } else { CBN_SELENDCANCEL });
+    notify(
+        combo,
+        if accept {
+            CBN_SELENDOK
+        } else {
+            CBN_SELENDCANCEL
+        },
+    );
     notify(combo, CBN_CLOSEUP);
     if changed {
         notify(combo, CBN_SELCHANGE);
@@ -760,7 +785,9 @@ fn scrollable(popup: &Popup) -> bool {
 /// Up arrow, track and down arrow of the scrollbar (arrows are square).
 fn scrollbar_parts(popup: &Popup) -> Option<(RECT, RECT, RECT)> {
     let bar = popup.scrollbar?;
-    let arrow = (bar.right - bar.left).min((bar.bottom - bar.top) / 3).max(1);
+    let arrow = (bar.right - bar.left)
+        .min((bar.bottom - bar.top) / 3)
+        .max(1);
     let up = RECT {
         bottom: bar.top + arrow,
         ..bar
@@ -930,7 +957,15 @@ unsafe fn render_scrollbar(popup: &Popup) {
     if popup.theme.is_invalid() {
         // Visual styles are off: a plain track, thumb and arrow marks in the list colours.
         let palette = popup.palette;
-        fill_rect(dc, RECT { top: up.top, bottom: down.bottom, ..track }, palette.button);
+        fill_rect(
+            dc,
+            RECT {
+                top: up.top,
+                bottom: down.bottom,
+                ..track
+            },
+            palette.button,
+        );
         let inset = scale(4, popup.dpi);
         fill_rect(
             dc,
@@ -947,15 +982,33 @@ unsafe fn render_scrollbar(popup: &Popup) {
             let half = scale(4, popup.dpi);
             let points = if pointing_up {
                 [
-                    POINT { x: cx - half, y: cy + half / 2 },
-                    POINT { x: cx + half, y: cy + half / 2 },
-                    POINT { x: cx, y: cy - half / 2 },
+                    POINT {
+                        x: cx - half,
+                        y: cy + half / 2,
+                    },
+                    POINT {
+                        x: cx + half,
+                        y: cy + half / 2,
+                    },
+                    POINT {
+                        x: cx,
+                        y: cy - half / 2,
+                    },
                 ]
             } else {
                 [
-                    POINT { x: cx - half, y: cy - half / 2 },
-                    POINT { x: cx + half, y: cy - half / 2 },
-                    POINT { x: cx, y: cy + half / 2 },
+                    POINT {
+                        x: cx - half,
+                        y: cy - half / 2,
+                    },
+                    POINT {
+                        x: cx + half,
+                        y: cy - half / 2,
+                    },
+                    POINT {
+                        x: cx,
+                        y: cy + half / 2,
+                    },
                 ]
             };
             let brush = CreateSolidBrush(palette.text_secondary);
@@ -1085,7 +1138,10 @@ unsafe fn move_hot(popup: &mut Popup, delta: isize) {
     if count == 0 {
         return;
     }
-    let current = popup.hot.or(popup.original).map_or(-1, |index| index as isize);
+    let current = popup
+        .hot
+        .or(popup.original)
+        .map_or(-1, |index| index as isize);
     let next = if current < 0 {
         if delta > 0 {
             0
@@ -1130,7 +1186,13 @@ unsafe fn drag_thumb(popup: &mut Popup, y: i32) {
     refresh(popup);
 }
 
-unsafe fn handle(popup: &mut Popup, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> Action {
+unsafe fn handle(
+    popup: &mut Popup,
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Action {
     match message {
         WM_TIMER_MESSAGE if wparam.0 == ANIMATION_TIMER_ID => {
             let progress =
@@ -1255,7 +1317,9 @@ unsafe extern "system" fn popup_proc(
                     return Action::None;
                 };
                 match slot.as_mut() {
-                    Some(popup) if popup.hwnd == hwnd => handle(popup, hwnd, message, wparam, lparam),
+                    Some(popup) if popup.hwnd == hwnd => {
+                        handle(popup, hwnd, message, wparam, lparam)
+                    }
                     _ => Action::None,
                 }
             });
@@ -1315,7 +1379,8 @@ pub(crate) unsafe fn handle_combo_input(
             true
         }
         WM_CHAR_MESSAGE if open_now => {
-            let typed = char::from_u32(wparam.0 as u32).map(|character| character.to_lowercase().next());
+            let typed =
+                char::from_u32(wparam.0 as u32).map(|character| character.to_lowercase().next());
             if let Some(Some(typed)) = typed {
                 if !typed.is_control() {
                     with_popup(combo, |popup| {

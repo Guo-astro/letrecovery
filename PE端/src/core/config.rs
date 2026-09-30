@@ -510,7 +510,10 @@ impl AuthenticatedInstallImageSet {
     fn verify_unchanged(&self) -> Result<()> {
         if self.scattered {
             if let Some(missing) = self.ordered_paths.iter().find(|path| !path.is_file()) {
-                bail!("authenticated scattered image part is missing: {}", missing.display());
+                bail!(
+                    "authenticated scattered image part is missing: {}",
+                    missing.display()
+                );
             }
             return Ok(());
         }
@@ -1813,12 +1816,15 @@ impl ConfigFileManager {
                 let software_prefix = "LetRecovery_Data\\preinstalled_software\\";
                 let mut actual_software = std::collections::BTreeSet::new();
                 for record in software_records {
-                    let filename = lr_core::data_staging::strip_scatter_prefix(&record.relative_path)
-                        .strip_prefix(software_prefix)
-                        .filter(|value| !value.is_empty() && !value.contains(['\\', '/']))
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("preinstalled-software artifact has an unexpected path")
-                        })?;
+                    let filename =
+                        lr_core::data_staging::strip_scatter_prefix(&record.relative_path)
+                            .strip_prefix(software_prefix)
+                            .filter(|value| !value.is_empty() && !value.contains(['\\', '/']))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "preinstalled-software artifact has an unexpected path"
+                                )
+                            })?;
                     if !actual_software.insert(filename.to_ascii_lowercase()) {
                         bail!("preinstalled-software manifest filename appears more than once");
                     }

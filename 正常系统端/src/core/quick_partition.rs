@@ -658,15 +658,15 @@ fn get_disk_info_from_path(
             Err(windows::core::Error::from(HRESULT::from_win32(1)))
         } else {
             DeviceIoControl(
-            handle,
-            IOCTL_DISK_GET_LENGTH_INFO,
-            None,
-            0,
-            Some(&mut length as *mut _ as *mut _),
-            std::mem::size_of::<DiskLengthInfo>() as u32,
-            Some(&mut bytes_returned),
-            None,
-        )
+                handle,
+                IOCTL_DISK_GET_LENGTH_INFO,
+                None,
+                0,
+                Some(&mut length as *mut _ as *mut _),
+                std::mem::size_of::<DiskLengthInfo>() as u32,
+                Some(&mut bytes_returned),
+                None,
+            )
         };
         let length_bytes = length_result.as_ref().ok().and_then(|_| {
             checked_disk_length(
@@ -691,15 +691,15 @@ fn get_disk_info_from_path(
                 Err(windows::core::Error::from(HRESULT::from_win32(1)))
             } else {
                 DeviceIoControl(
-                handle,
-                IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
-                None,
-                0,
-                Some(&mut geometry as *mut _ as *mut _),
-                std::mem::size_of::<DiskGeometryEx>() as u32,
-                Some(&mut bytes_returned),
-                None,
-            )
+                    handle,
+                    IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+                    None,
+                    0,
+                    Some(&mut geometry as *mut _ as *mut _),
+                    std::mem::size_of::<DiskGeometryEx>() as u32,
+                    Some(&mut bytes_returned),
+                    None,
+                )
             };
             geometry_bytes = geometry_result.as_ref().ok().and_then(|_| {
                 checked_disk_length(
@@ -785,19 +785,18 @@ fn get_disk_info_from_path(
             let header = std::ptr::read_unaligned(bytes.as_ptr().cast::<DriveLayoutInfoExHeader>());
             // DRIVE_LAYOUT_INFORMATION_GPT: DiskId(8..24), StartingUsableOffset(24..32),
             // UsableLength(32..40). Only used when every capacity query was rejected.
-            let gpt_usable_end = if header.partition_style == PARTITION_STYLE_GPT.0 as u32
-                && bytes.len() >= 40
-            {
-                let start = i64::from_le_bytes(bytes[24..32].try_into().unwrap_or([0; 8]));
-                let length = i64::from_le_bytes(bytes[32..40].try_into().unwrap_or([0; 8]));
-                u64::try_from(start)
-                    .ok()
-                    .zip(u64::try_from(length).ok())
-                    .and_then(|(start, length)| start.checked_add(length))
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+            let gpt_usable_end =
+                if header.partition_style == PARTITION_STYLE_GPT.0 as u32 && bytes.len() >= 40 {
+                    let start = i64::from_le_bytes(bytes[24..32].try_into().unwrap_or([0; 8]));
+                    let length = i64::from_le_bytes(bytes[32..40].try_into().unwrap_or([0; 8]));
+                    u64::try_from(start)
+                        .ok()
+                        .zip(u64::try_from(length).ok())
+                        .and_then(|(start, length)| start.checked_add(length))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
 
             let style = match header.partition_style {
                 x if x == PARTITION_STYLE_MBR.0 as u32 => PartitionStyle::MBR,
@@ -811,14 +810,22 @@ fn get_disk_info_from_path(
             // 解析分区信息
             let partitions = parse_partition_layout(bytes, &header, style, disk_number);
 
-            (style, is_init, partitions, header.partition_count, gpt_usable_end)
+            (
+                style,
+                is_init,
+                partitions,
+                header.partition_count,
+                gpt_usable_end,
+            )
         };
         let size_bytes = match capacity {
             Some((size_bytes, _)) => size_bytes,
             None => {
                 let partition_end = partitions
                     .iter()
-                    .filter_map(|partition| partition.offset_bytes.checked_add(partition.size_bytes))
+                    .filter_map(|partition| {
+                        partition.offset_bytes.checked_add(partition.size_bytes)
+                    })
                     .max()
                     .unwrap_or(0);
                 gpt_usable_end.max(partition_end)

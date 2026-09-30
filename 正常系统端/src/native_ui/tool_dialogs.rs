@@ -19,9 +19,8 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetDlgItem, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, MoveWindow,
-    SendMessageW, ShowWindow, BS_OWNERDRAW, BS_PUSHBUTTON, ES_AUTOHSCROLL,
-    ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, SW_HIDE, SW_SHOW, WM_SETFONT, WS_BORDER, WS_TABSTOP,
-    WS_VSCROLL,
+    SendMessageW, ShowWindow, BS_OWNERDRAW, BS_PUSHBUTTON, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
+    ES_MULTILINE, ES_READONLY, SW_HIDE, SW_SHOW, WM_SETFONT, WS_BORDER, WS_TABSTOP, WS_VSCROLL,
 };
 
 use super::controls::{child, wide};

@@ -10,8 +10,14 @@ const OFFLINE_HIVE_MAP: &[(&str, &str)] = &[
         "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet",
         "HKEY_LOCAL_MACHINE\\pc-sys\\ControlSet001",
     ),
-    ("HKLM\\SYSTEM\\CurrentControlSet", "HKEY_LOCAL_MACHINE\\pc-sys\\ControlSet001"),
-    ("HKEY_LOCAL_MACHINE\\SOFTWARE", "HKEY_LOCAL_MACHINE\\pc-soft"),
+    (
+        "HKLM\\SYSTEM\\CurrentControlSet",
+        "HKEY_LOCAL_MACHINE\\pc-sys\\ControlSet001",
+    ),
+    (
+        "HKEY_LOCAL_MACHINE\\SOFTWARE",
+        "HKEY_LOCAL_MACHINE\\pc-soft",
+    ),
     ("HKLM\\SOFTWARE", "HKEY_LOCAL_MACHINE\\pc-soft"),
     ("HKEY_LOCAL_MACHINE\\SYSTEM", "HKEY_LOCAL_MACHINE\\pc-sys"),
     ("HKLM\\SYSTEM", "HKEY_LOCAL_MACHINE\\pc-sys"),
@@ -44,7 +50,10 @@ fn convert_key_lines(content: &[u8]) -> Vec<u8> {
             let from = from.as_bytes();
             if body.len() >= from.len()
                 && body[..from.len()].eq_ignore_ascii_case(from)
-                && matches!(body.get(from.len()).copied(), None | Some(b'\\') | Some(b']'))
+                && matches!(
+                    body.get(from.len()).copied(),
+                    None | Some(b'\\') | Some(b']')
+                )
             {
                 output.extend_from_slice(&line[..indent + prefix]);
                 output.extend_from_slice(to.as_bytes());

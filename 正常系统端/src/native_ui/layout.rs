@@ -202,7 +202,9 @@ pub fn format_capacity_gb(value_gb: f64) -> String {
 
 /// The caption of a control and its font, measured: what a button, label or check box needs.
 pub unsafe fn control_text_width(control: HWND) -> i32 {
-    use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW, SendMessageW};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowTextLengthW, GetWindowTextW, SendMessageW,
+    };
     let length = GetWindowTextLengthW(control).max(0) as usize;
     if length == 0 {
         return 0;
@@ -210,13 +212,20 @@ pub unsafe fn control_text_width(control: HWND) -> i32 {
     let mut buffer = vec![0u16; length + 1];
     let copied = GetWindowTextW(control, &mut buffer).max(0) as usize;
     let text = String::from_utf16_lossy(&buffer[..copied]).replace('&', "");
-    let font = SendMessageW(control, 0x0031, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+    let font = SendMessageW(
+        control,
+        0x0031,
+        windows::Win32::Foundation::WPARAM(0),
+        windows::Win32::Foundation::LPARAM(0),
+    );
     measure_text(control, HFONT(font.0 as *mut _), &text, None).width
 }
 
 /// Height the caption of `control` needs when wrapped at `width`.
 pub unsafe fn control_wrapped_height(control: HWND, width: i32) -> i32 {
-    use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW, SendMessageW};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowTextLengthW, GetWindowTextW, SendMessageW,
+    };
     let length = GetWindowTextLengthW(control).max(0) as usize;
     if length == 0 || width <= 0 {
         return 0;
@@ -224,16 +233,23 @@ pub unsafe fn control_wrapped_height(control: HWND, width: i32) -> i32 {
     let mut buffer = vec![0u16; length + 1];
     let copied = GetWindowTextW(control, &mut buffer).max(0) as usize;
     let text = String::from_utf16_lossy(&buffer[..copied]);
-    let font = SendMessageW(control, 0x0031, windows::Win32::Foundation::WPARAM(0), windows::Win32::Foundation::LPARAM(0));
+    let font = SendMessageW(
+        control,
+        0x0031,
+        windows::Win32::Foundation::WPARAM(0),
+        windows::Win32::Foundation::LPARAM(0),
+    );
     measure_text(control, HFONT(font.0 as *mut _), &text, Some(width)).height
 }
 
 /// Width a closed drop-down needs for its longest item: the text, its margins and the chevron.
 pub unsafe fn combo_fitted_width(combo: HWND, dpi: u32, minimum: i32) -> i32 {
-    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
     use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
     let font = HFONT(SendMessageW(combo, 0x0031, WPARAM(0), LPARAM(0)).0 as *mut _);
-    let count = SendMessageW(combo, 0x0146, WPARAM(0), LPARAM(0)).0.clamp(0, 256) as usize;
+    let count = SendMessageW(combo, 0x0146, WPARAM(0), LPARAM(0))
+        .0
+        .clamp(0, 256) as usize;
     let mut widest = 0;
     for index in 0..count {
         let length = SendMessageW(combo, 0x0149, WPARAM(index), LPARAM(0)).0;
@@ -241,9 +257,14 @@ pub unsafe fn combo_fitted_width(combo: HWND, dpi: u32, minimum: i32) -> i32 {
             continue;
         }
         let mut buffer = vec![0u16; length as usize + 1];
-        let copied = SendMessageW(combo, 0x0148, WPARAM(index), LPARAM(buffer.as_mut_ptr() as isize))
-            .0
-            .clamp(0, length) as usize;
+        let copied = SendMessageW(
+            combo,
+            0x0148,
+            WPARAM(index),
+            LPARAM(buffer.as_mut_ptr() as isize),
+        )
+        .0
+        .clamp(0, length) as usize;
         let text = String::from_utf16_lossy(&buffer[..copied]);
         widest = widest.max(measure_text(combo, font, &text, None).width);
     }

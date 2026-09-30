@@ -56,6 +56,7 @@ pub fn is_orphaned_private_pe_file_name(name: &str) -> bool {
         ("handoff-manifest-", ".txt"),
         ("handoff-unattend-", ".xml"),
         ("handoff-wifi-", ".xml"),
+        ("handoff-pe-network-", ".ini"),
     ];
     TEMP_PATTERNS.iter().any(|(prefix, suffix)| {
         let Some(token) = lower

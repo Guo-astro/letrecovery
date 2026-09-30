@@ -472,7 +472,9 @@ fn spec_confirmed_disks_for_output(plan: &lr_core::custom_install::CustomInstall
 fn dual_boot_size_gib_for_output(plan: &lr_core::custom_install::CustomInstallPlan) -> Option<u64> {
     match plan {
         lr_core::custom_install::CustomInstallPlan::DualBoot(plan)
-            if plan.target_length_bytes % lr_core::custom_install::GIB == 0 =>
+            if plan
+                .target_length_bytes
+                .is_multiple_of(lr_core::custom_install::GIB) =>
         {
             Some(plan.target_length_bytes / lr_core::custom_install::GIB)
         }

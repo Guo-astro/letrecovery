@@ -14,9 +14,9 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
     CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
-    IntersectClipRect, InvalidateRect, RestoreDC, SaveDC, SelectClipRgn,
-    SelectObject, SetBkMode, SetTextColor, SetWindowRgn, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, HFONT, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    IntersectClipRect, InvalidateRect, RestoreDC, SaveDC, SelectClipRgn, SelectObject, SetBkMode,
+    SetTextColor, SetWindowRgn, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    HFONT, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Controls::{
@@ -33,12 +33,12 @@ use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindow
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, EnumThreadWindows, GetClassNameW, GetClientRect,
     GetParent, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, MoveWindow, PostMessageW,
-    SendMessageW, SetMenuInfo, ShowWindow, TrackPopupMenu, BM_SETCHECK,
-    BS_AUTORADIOBUTTON, BS_OWNERDRAW, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL,
-    CB_RESETCONTENT, CB_SETCURSEL, ES_AUTOHSCROLL, MENUINFO, MF_GRAYED, MF_OWNERDRAW, MF_POPUP,
-    MIM_BACKGROUND, SW_HIDE, SW_SHOW, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CAPTURECHANGED,
-    WM_COMMAND, WM_DRAWITEM, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM,
-    WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WS_BORDER, WS_TABSTOP,
+    SendMessageW, SetMenuInfo, ShowWindow, TrackPopupMenu, BM_SETCHECK, BS_AUTORADIOBUTTON,
+    BS_OWNERDRAW, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL,
+    ES_AUTOHSCROLL, MENUINFO, MF_GRAYED, MF_OWNERDRAW, MF_POPUP, MIM_BACKGROUND, SW_HIDE, SW_SHOW,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CAPTURECHANGED, WM_COMMAND, WM_DRAWITEM, WM_ERASEBKGND,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT,
+    WM_RBUTTONUP, WM_SETFONT, WS_BORDER, WS_TABSTOP,
 };
 
 use super::super::controls::fill_round_rect_antialiased;
@@ -1193,7 +1193,8 @@ impl NativeQuickPartitionDialog {
 
     unsafe fn layout_apply_button(&self, _dpi: u32) {
         // The dialog lays "Apply changes" out with its own command buttons.
-        self.shell.set_extra_command_buttons(&[self.controls.apply_pending]);
+        self.shell
+            .set_extra_command_buttons(&[self.controls.apply_pending]);
     }
 
     /// Every interaction re-renders the whole editor. Publish it as one frame: while the content
@@ -2626,12 +2627,19 @@ unsafe fn insert_columns(list: HWND) {
 /// redrew it in the system highlight colour.
 unsafe fn refill_disks(combo: HWND, disks: &[PhysicalDisk], selected: Option<u32>) {
     const CB_GETCURSEL_MESSAGE: u32 = 0x0147;
-    let items = disks.iter().map(|disk| disk.display_name()).collect::<Vec<_>>();
+    let items = disks
+        .iter()
+        .map(|disk| disk.display_name())
+        .collect::<Vec<_>>();
     let index = selected
         .and_then(|number| disks.iter().position(|disk| disk.disk_number == number))
         .map_or(NO_COMBO_SELECTION, |index| index);
     if combo_items_match(combo, &items) {
-        let expected = if index == NO_COMBO_SELECTION { -1 } else { index as isize };
+        let expected = if index == NO_COMBO_SELECTION {
+            -1
+        } else {
+            index as isize
+        };
         if SendMessageW(combo, CB_GETCURSEL_MESSAGE, WPARAM(0), LPARAM(0)).0 != expected {
             let _ = SendMessageW(combo, CB_SETCURSEL, WPARAM(index), LPARAM(0));
         }
@@ -2727,7 +2735,10 @@ unsafe fn refill_partitions(list: HWND, state: &QuickPartitionDialogState) {
     let desired = state.selected_row.map(|selected| match selected {
         EditorRow::Existing(index) => index,
         EditorRow::Planned(index) => {
-            state.selected_disk().map_or(0, |disk| disk.partitions.len()) + index
+            state
+                .selected_disk()
+                .map_or(0, |disk| disk.partitions.len())
+                + index
         }
     });
     if list_rows_match(list, &rows) {
@@ -2752,7 +2763,9 @@ unsafe fn refill_partitions(list: HWND, state: &QuickPartitionDialogState) {
             LPARAM((&mut clear as *mut LVITEMW) as isize),
         );
     } else {
-        let top = SendMessageW(list, LVM_GETTOPINDEX_MESSAGE, WPARAM(0), LPARAM(0)).0.max(0);
+        let top = SendMessageW(list, LVM_GETTOPINDEX_MESSAGE, WPARAM(0), LPARAM(0))
+            .0
+            .max(0);
         let _ = SendMessageW(
             list,
             windows::Win32::UI::WindowsAndMessaging::WM_SETREDRAW,
@@ -2765,7 +2778,12 @@ unsafe fn refill_partitions(list: HWND, state: &QuickPartitionDialogState) {
         }
         if top > 0 && row_count > 0 {
             // Scroll to the end, then back to the former first row, so it is on top again.
-            let _ = SendMessageW(list, LVM_ENSUREVISIBLE_MESSAGE, WPARAM(row_count - 1), LPARAM(0));
+            let _ = SendMessageW(
+                list,
+                LVM_ENSUREVISIBLE_MESSAGE,
+                WPARAM(row_count - 1),
+                LPARAM(0),
+            );
             let _ = SendMessageW(
                 list,
                 LVM_ENSUREVISIBLE_MESSAGE,

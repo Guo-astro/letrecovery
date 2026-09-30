@@ -9,9 +9,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateFontW, DeleteObject, HFONT};
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, MoveWindow, SendMessageW, ShowWindow, CBS_DROPDOWNLIST,
-    CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, SW_HIDE, SW_SHOW, WM_SETFONT,
-    WS_TABSTOP,
+    GetClientRect, MoveWindow, SendMessageW, ShowWindow, CBS_DROPDOWNLIST, CB_ADDSTRING,
+    CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL, SW_HIDE, SW_SHOW, WM_SETFONT, WS_TABSTOP,
 };
 
 use super::super::controls::{child, combo_inventory_index, wide, NO_COMBO_SELECTION};

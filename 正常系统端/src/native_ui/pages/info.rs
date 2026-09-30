@@ -1279,8 +1279,9 @@ impl AboutPage {
             width,
             dpi,
         );
-        let refresh_width = crate::native_ui::layout::fitted_button_width(self.refresh_languages, dpi, s(76))
-            .min(width / 3);
+        let refresh_width =
+            crate::native_ui::layout::fitted_button_width(self.refresh_languages, dpi, s(76))
+                .min(width / 3);
         // Keep the selector close to its actual longest item instead of stretching it
         // across the page. The remaining space is intentionally left after Refresh.
         let language_width = (width - label_width - refresh_width - gap)

@@ -5,7 +5,6 @@
 
 mod combo_popup;
 mod context_menu;
-mod syscolor_hook;
 mod controls;
 pub mod dialog;
 pub mod driver_transfer_dialog;
@@ -14,11 +13,12 @@ mod pages;
 pub mod preinstall_dialog;
 mod redraw;
 mod scrollbar_compositor;
+mod syscolor_hook;
 mod theme;
-pub(crate) mod ui_audit;
 pub mod tool_dialogs;
 pub mod tool_dialogs_mutating;
 pub mod tools;
+pub(crate) mod ui_audit;
 mod window;
 
 pub(crate) use lr_core::windows_compat::{

@@ -8,9 +8,9 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
 use lr_core::custom_install::{
-    plan_full_disk_layout_for_disk, validate_dual_boot_plan, validate_full_disk_plan, CustomInstallPlan,
-    DualBootPlan, FullDiskRole, FullDiskSelection, ImageSpaceRequirement, PlannedPartitionRole,
-    RepartitionAllDisksPlan, RequestedPartitionStyle, GIB,
+    plan_full_disk_layout_for_disk, validate_dual_boot_plan, validate_full_disk_plan,
+    CustomInstallPlan, DualBootPlan, FullDiskRole, FullDiskSelection, ImageSpaceRequirement,
+    PlannedPartitionRole, RepartitionAllDisksPlan, RequestedPartitionStyle, GIB,
 };
 use lr_core::data_staging::StorageAttachment;
 

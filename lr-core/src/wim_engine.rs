@@ -232,7 +232,10 @@ impl WimEngineManager {
         }
         // The default libwim engine failed. Windows' own WIM API reads every format Windows
         // Setup accepts; try it once before failing the installation.
-        log::warn!("libwim 应用镜像失败，尝试 Windows 自带的 wimgapi：{}", libwim_error);
+        log::warn!(
+            "libwim 应用镜像失败，尝试 Windows 自带的 wimgapi：{}",
+            libwim_error
+        );
         match WimgapiManager::new() {
             Ok(wimgapi) => {
                 match wimgapi.apply_image_cancellable(

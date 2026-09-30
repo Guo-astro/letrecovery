@@ -9,5 +9,6 @@ pub mod driver;
 pub mod expand_move;
 pub mod ghost;
 pub mod pca_preflight;
+pub mod pe_network;
 pub mod registry;
 pub mod system_utils;

@@ -20,8 +20,8 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, MoveWindow, SendMessageW, ShowWindow, BS_OWNERDRAW, SW_HIDE,
-    SW_SHOW, WM_SETFONT, WS_BORDER, WS_TABSTOP,
+    GetClientRect, MoveWindow, SendMessageW, ShowWindow, BS_OWNERDRAW, SW_HIDE, SW_SHOW,
+    WM_SETFONT, WS_BORDER, WS_TABSTOP,
 };
 
 use super::super::controls::{child, wide};

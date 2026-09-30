@@ -173,7 +173,7 @@ pub fn analyze_expand_partition(
             if donor.reach_mb > no_move_max_mb.saturating_add(1024)
                 && move_options
                     .last()
-                    .map_or(true, |nearer| donor.reach_mb > nearer.reach_mb)
+                    .is_none_or(|nearer| donor.reach_mb > nearer.reach_mb)
             {
                 move_options.push(donor);
             }
@@ -245,7 +245,9 @@ fn carry_along(
         partition_number: partition.partition_number,
         offset_bytes: partition.offset_bytes,
         size_bytes: partition.size_bytes,
-        drive_letter: partition.drive_letter.map(|letter| letter.to_ascii_uppercase()),
+        drive_letter: partition
+            .drive_letter
+            .map(|letter| letter.to_ascii_uppercase()),
         is_recovery: partition.is_recovery,
     })
 }
@@ -267,10 +269,8 @@ fn movable_data_letter(
     if !next.file_system.eq_ignore_ascii_case("NTFS") {
         return Err(crate::tr!("后方分区 {}: 不是 NTFS 分区，无法移动", letter));
     }
-    if matches!(
-        disk.partition_style,
-        crate::core::disk::PartitionStyle::MBR
-    ) && !next.partition_type.eq_ignore_ascii_case("0x07")
+    if matches!(disk.partition_style, crate::core::disk::PartitionStyle::MBR)
+        && !next.partition_type.eq_ignore_ascii_case("0x07")
     {
         return Err(crate::tr!(
             "后方分区 {}: 在扩展分区里或类型不受支持，无法移动",

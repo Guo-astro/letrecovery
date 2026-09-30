@@ -152,6 +152,24 @@ pub struct RemoteConfig {
     pub system_image_mode: SystemImageMode,
 }
 
+/// Whether a TLS failure was caused by the certificate validity window, i.e. by a wrong local
+/// clock: Schannel `CERT_E_EXPIRED` (0x800B0101, reported as os error -2146762495) or the rustls
+/// "not valid yet" / "expired" certificate errors.
+fn is_clock_related_tls_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "-2146762495",
+        "0x800b0101",
+        "certificate not valid yet",
+        "certificate expired",
+        "not valid before",
+        "not valid after",
+        "证书不在有效期内",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 impl RemoteConfig {
     /// 从服务器加载配置
     ///
@@ -161,7 +179,13 @@ impl RemoteConfig {
         let mut config = RemoteConfig::default();
 
         // 尝试加载配置
-        match Self::fetch_config() {
+        let fetched = match Self::fetch_config() {
+            Err(error) if is_clock_related_tls_error(&format!("{error:#}")) => {
+                Self::fetch_after_time_sync(error)
+            }
+            result => result,
+        };
+        match fetched {
             Ok((
                 pe_content,
                 dl_content,
@@ -257,6 +281,32 @@ impl RemoteConfig {
         );
         log::info!("远程资源目录已通过 v4 单请求加载");
         Ok(contents)
+    }
+
+    /// A certificate that is "not yet valid" or "expired" almost always means the local clock is
+    /// wrong (a VM resumed from an old snapshot, an empty CMOS battery). Synchronise the clock once
+    /// and fetch once more; when that is impossible, report exactly why instead of a bare TLS error.
+    fn fetch_after_time_sync(first: anyhow::Error) -> Result<RemoteConfigContents> {
+        log::warn!(
+            "远程配置的 HTTPS 证书有效期校验失败，系统时间可能不正确，正在同步时间后重试一次: {first:#}"
+        );
+        let sync = crate::core::tool_time_sync::sync_time_to_beijing();
+        if !sync.success {
+            anyhow::bail!(
+                "系统时间可能不正确（HTTPS 证书有效期校验失败），自动同步时间也失败：{}。请手动校准系统时间后重试。原始错误：{first:#}",
+                sync.message
+            );
+        }
+        log::info!(
+            "系统时间已同步（{} -> {}），重新获取远程配置",
+            sync.old_time.as_deref().unwrap_or("?"),
+            sync.new_time.as_deref().unwrap_or("?")
+        );
+        Self::fetch_config().map_err(|retry| {
+            anyhow::anyhow!(
+                "系统时间已同步，但重新获取远程配置仍失败：{retry:#}；同步前的错误：{first:#}"
+            )
+        })
     }
 
     fn fetch_v4_config(client: &reqwest::blocking::Client) -> Result<RemoteConfigContents> {
@@ -444,6 +494,22 @@ mod tests {
       }
     }
     "#;
+
+    #[test]
+    fn certificate_validity_failures_are_recognised_as_clock_problems() {
+        let schannel = "client error (Connect): (os error -2146762495)";
+        let schannel_zh = "要求的证书不在有效期内。";
+        let rustls_not_yet = "invalid peer certificate: certificate not valid yet";
+        let rustls_expired = "invalid peer certificate: certificate expired";
+        let dns = "dns error: No such host is known. (os error 11001)";
+        let issuer = "invalid peer certificate: UnknownIssuer";
+        for clock in [schannel, schannel_zh, rustls_not_yet, rustls_expired] {
+            assert!(is_clock_related_tls_error(clock), "{clock}");
+        }
+        for other in [dns, issuer] {
+            assert!(!is_clock_related_tls_error(other), "{other}");
+        }
+    }
 
     #[test]
     fn v4_catalogue_maps_categories_and_silent_install_metadata() {

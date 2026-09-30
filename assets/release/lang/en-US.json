@@ -2573,7 +2573,7 @@
         "写入自定义无人值守文件失败": "Failed to write the custom unattended file",
         "读取原备份标记文件失败": "Failed to read the original backup marker file",
         "正在启动镜像释放引擎...": "Starting the image apply engine...",
-        "未找到可用的 dism.exe。请确保系统已安装 DISM 或将 dism.exe 放置于程序目录的 bin\\Dism\\ 下\n已搜索路径:\n- {程序目录}\\bin\\Dism\\dism.exe\n- Windows API 返回的实际 System32\\Dism.exe\n- X:\\Windows\\System32\\dism.exe (常见 PE 环境)": "No usable dism.exe was found. Make sure DISM is installed on the system or place dism.exe under bin\\Dism\\ in the program directory\nSearched paths:\n- {program directory}\\bin\\Dism\\dism.exe\n- The actual System32\\Dism.exe returned by the Windows API\n- X:\\Windows\\System32\\dism.exe (common PE environment)",
+        "未找到可用的 dism.exe。请确保系统已安装 DISM 或将 dism.exe 放置于程序目录的 bin\\Dism\\ 下\n已搜索路径:\n- {程序目录}\\bin\\Dism\\dism.exe\n- Windows API 返回的实际 System32\\Dism.exe\n- X:\\Windows\\System32\\dism.exe (常见 PE 环境)": "No usable dism.exe was found. Make sure DISM is installed on the system or place dism.exe under bin\\Dism\\ in the program directory\nSearched paths:\n- <program directory>\\bin\\Dism\\dism.exe\n- The actual System32\\Dism.exe returned by the Windows API\n- X:\\Windows\\System32\\dism.exe (common PE environment)",
         "{}失败，退出代码: {}，详情: {}": "{} failed, exit code: {}, details: {}",
         "无法获取 DISM stdout": "Unable to get DISM stdout",
         "无法获取 DISM stderr": "Unable to get DISM stderr",

@@ -351,8 +351,11 @@ impl Dism {
         }
         match storage_requirements {
             Some(storage_requirements) => {
-                lr_core::driver::write_storage_driver_requirements(destination, storage_requirements)
-                    .context("驱动导出完成，但启动存储驱动清单生成或覆盖验证失败")?;
+                lr_core::driver::write_storage_driver_requirements(
+                    destination,
+                    storage_requirements,
+                )
+                .context("驱动导出完成，但启动存储驱动清单生成或覆盖验证失败")?;
             }
             None => log::warn!("[Dism] 本次导出不包含启动存储驱动清单"),
         }

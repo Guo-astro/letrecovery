@@ -270,7 +270,6 @@ pub fn read_offline_international_settings(
 
     let keyboard_key = default_hive.key(r"Keyboard Layout\Preload");
     let input_locale = match OfflineRegistry::query_string(&keyboard_key, "1")
-        .map_err(anyhow::Error::from)
         .and_then(|layout| input_locale_from_keyboard_layout(&layout))
     {
         Ok(value) => value,

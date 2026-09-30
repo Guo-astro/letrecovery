@@ -204,8 +204,7 @@ impl AdvancedOptions {
             .join("Windows")
             .join("System32")
             .join("ntdll.dll");
-        crate::core::system_utils::get_file_version(&ntdll)
-            .map(|(_, _, build, _)| u32::from(build))
+        crate::core::system_utils::get_file_version(&ntdll).map(|(_, _, build, _)| u32::from(build))
     }
 
     fn target_is_windows_11(target_partition: &str) -> bool {

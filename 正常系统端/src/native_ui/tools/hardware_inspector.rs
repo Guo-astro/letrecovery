@@ -12,8 +12,7 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, MoveWindow, SendMessageW, BS_OWNERDRAW, WM_GETFONT, WS_BORDER,
-    WS_TABSTOP,
+    GetClientRect, MoveWindow, SendMessageW, BS_OWNERDRAW, WM_GETFONT, WS_BORDER, WS_TABSTOP,
 };
 
 use crate::core::hardware_info::format_bytes;

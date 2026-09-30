@@ -1298,10 +1298,9 @@ fn expand_c_run(invocation: &ToolInvocation) -> Result<Value> {
     let target_size_mb = target_size_mb(invocation)?;
     let config = super::app_config::AppConfig::load_strict()?;
     let pe = select_cached_pe(false)?;
-    let move_option = analysis
-        .move_options
-        .iter()
-        .find(|option| target_size_mb > analysis.no_move_max_mb && option.reach_mb >= target_size_mb);
+    let move_option = analysis.move_options.iter().find(|option| {
+        target_size_mb > analysis.no_move_max_mb && option.reach_mb >= target_size_mb
+    });
     let receiver = super::native_expand_c_executor::start_expand_c_handoff(
         super::native_expand_c_executor::ExpandCHandoffRequest {
             target_partition: lr_core::windows_storage::current_windows_drive_letter()
@@ -1317,8 +1316,7 @@ fn expand_c_run(invocation: &ToolInvocation) -> Result<Value> {
             borrow_from_left: false,
             donor_target_size_mb: 0,
             requires_partition_move: target_size_mb > analysis.no_move_max_mb,
-            expected_donor_partition_number: move_option
-                .map_or(0, |donor| donor.partition_number),
+            expected_donor_partition_number: move_option.map_or(0, |donor| donor.partition_number),
             expected_donor_offset_bytes: move_option.map_or(0, |donor| donor.offset_bytes),
             expected_donor_size_bytes: move_option.map_or(0, |donor| donor.size_bytes),
             expected_moved_partitions: move_option

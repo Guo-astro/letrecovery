@@ -217,8 +217,9 @@ fn reconcile_dual_boot_size_gib(
     let required = whole_gib_for_capacity(required_bytes);
     // The automatic value is a practical system size, never the bare image minimum: the
     // image-derived "expanded size + 2 GB" leaves no room for drivers, updates or the first boot.
-    let automatic =
-        required.max(whole_gib_for_capacity(lr_core::custom_install::OPAQUE_IMAGE_FALLBACK_BYTES));
+    let automatic = required.max(whole_gib_for_capacity(
+        lr_core::custom_install::OPAQUE_IMAGE_FALLBACK_BYTES,
+    ));
     match current {
         Some(value) if value >= required && last_automatic != Some(value) => (value, None),
         _ => (automatic, Some(automatic)),
@@ -1183,7 +1184,9 @@ fn cached_disk_bus_type(
         Ok(bus) => Some(bus),
         Err(error) => {
             lr_core::windows_storage::warn_storage_once(&format!("bus:{disk_number}"), || {
-                format!("{context} cannot confirm bus type for physical disk {disk_number}: {error}")
+                format!(
+                    "{context} cannot confirm bus type for physical disk {disk_number}: {error}"
+                )
             });
             None
         }
@@ -4103,7 +4106,11 @@ impl NativeWindow {
             .map(|partition| BackupPartitionRow {
                 volume: partition.letter.clone(),
                 total_size: super::layout::format_capacity_mb(partition.total_size_mb),
-                used_size: super::layout::format_capacity_mb(partition.total_size_mb.saturating_sub(partition.free_size_mb)),
+                used_size: super::layout::format_capacity_mb(
+                    partition
+                        .total_size_mb
+                        .saturating_sub(partition.free_size_mb),
+                ),
                 label: partition.label.clone(),
                 bitlocker: localized_bitlocker_status(&partition.bitlocker_status),
                 status: if partition.has_windows {
@@ -4985,8 +4992,8 @@ impl NativeWindow {
                 inline_path_x
             };
             let path_width = (content_right - path_x).max(0);
-            let path_height = control_wrapped_height(h.unattend_path, path_width)
-                .max(self.scale(20));
+            let path_height =
+                control_wrapped_height(h.unattend_path, path_width).max(self.scale(20));
             let _ = MoveWindow(
                 h.unattend_path,
                 path_x,
@@ -5505,7 +5512,11 @@ impl NativeWindow {
                     .collect()
             })
             .unwrap_or_default();
-        let sizes = if sizes.is_empty() { vec![(0, 0)] } else { sizes };
+        let sizes = if sizes.is_empty() {
+            vec![(0, 0)]
+        } else {
+            sizes
+        };
         for (width, height) in sizes {
             if width > 0 && height > 0 {
                 let _ = SetWindowPos(
@@ -5515,7 +5526,9 @@ impl NativeWindow {
                     0,
                     width,
                     height,
-                    windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                        | SWP_NOZORDER
+                        | SWP_NOACTIVATE,
                 );
             }
             let mut window = RECT::default();
@@ -5588,7 +5601,10 @@ impl NativeWindow {
         let watcher_stop = stop.clone();
         let process = std::process::id();
         let watcher = std::thread::spawn(move || {
-            unsafe extern "system" fn close_message_box(window: HWND, lparam: LPARAM) -> windows::Win32::Foundation::BOOL {
+            unsafe extern "system" fn close_message_box(
+                window: HWND,
+                lparam: LPARAM,
+            ) -> windows::Win32::Foundation::BOOL {
                 let mut owner_process = 0u32;
                 let _ = GetWindowThreadProcessId(window, Some(&mut owner_process));
                 if owner_process == lparam.0 as u32 && IsWindowVisible(window).as_bool() {
@@ -5609,9 +5625,13 @@ impl NativeWindow {
             owner: HWND,
             windows: Vec<HWND>,
         }
-        unsafe extern "system" fn collect_owned(window: HWND, lparam: LPARAM) -> windows::Win32::Foundation::BOOL {
+        unsafe extern "system" fn collect_owned(
+            window: HWND,
+            lparam: LPARAM,
+        ) -> windows::Win32::Foundation::BOOL {
             let owned = &mut *(lparam.0 as *mut Owned);
-            if GetWindow(window, GW_OWNER).ok() == Some(owned.owner) && IsWindowVisible(window).as_bool()
+            if GetWindow(window, GW_OWNER).ok() == Some(owned.owner)
+                && IsWindowVisible(window).as_bool()
             {
                 owned.windows.push(window);
             }
@@ -5639,13 +5659,22 @@ impl NativeWindow {
             // Select some text in the tool's first multi-line field, so the screenshot shows the
             // selection colours.
             {
-                unsafe extern "system" fn find_report(window: HWND, lparam: LPARAM) -> windows::Win32::Foundation::BOOL {
+                unsafe extern "system" fn find_report(
+                    window: HWND,
+                    lparam: LPARAM,
+                ) -> windows::Win32::Foundation::BOOL {
                     let found = &mut *(lparam.0 as *mut HWND);
                     let mut class = [0u16; 16];
-                    let length = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(window, &mut class).max(0) as usize;
+                    let length =
+                        windows::Win32::UI::WindowsAndMessaging::GetClassNameW(window, &mut class)
+                            .max(0) as usize;
                     if found.is_invalid()
                         && String::from_utf16_lossy(&class[..length]).eq_ignore_ascii_case("Edit")
-                        && GetWindowLongPtrW(window, windows::Win32::UI::WindowsAndMessaging::GWL_STYLE) & 0x0004 != 0
+                        && GetWindowLongPtrW(
+                            window,
+                            windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+                        ) & 0x0004
+                            != 0
                         && IsWindowVisible(window).as_bool()
                     {
                         *found = window;
@@ -5787,7 +5816,9 @@ impl NativeWindow {
         // every ShowWindow call paint immediately exposes intermediate layouts as flashes. Suspend
         // the visible top level and every descendant; WM_SETREDRAW is per HWND and freezing only
         // the parent does not stop a child common control from publishing its own intermediate DC.
-        let redraw = manage_redraw.then(|| redraw::begin_page_transition(hwnd, "切换页面")).flatten();
+        let redraw = manage_redraw
+            .then(|| redraw::begin_page_transition(hwnd, "切换页面"))
+            .flatten();
         if self.advanced_visible {
             if let Some(advanced) = &self.advanced_page {
                 advanced.show(false);
@@ -6124,13 +6155,16 @@ impl NativeWindow {
             self.select_page(hwnd, Page::Install);
             return;
         }
+        // Re-detect on every opening unless a profile is already captured: a Wi-Fi connection
+        // made after the first opening must not stay hidden for the rest of the session.
         if !self.advanced_visible
             && self
                 .app_config
                 .install_prefs
                 .advanced_options
-                .wifi_detected
-                .is_none()
+                .wifi_profile_xml
+                .trim()
+                .is_empty()
         {
             let available = crate::core::native_wifi::connected_wifi_available().unwrap_or(false);
             self.app_config.install_prefs.advanced_options.wifi_detected = Some(available);
@@ -6519,6 +6553,36 @@ impl NativeWindow {
                 .unwrap_or_default();
             extension.eq_ignore_ascii_case("gho") || extension.eq_ignore_ascii_case("ghs")
         });
+        // Mirror the install-time gate in `NativeInstallState::start_intent`: keeping personal
+        // files needs full Windows (never PE), "reinstall the selected partition" mode, a target
+        // that already contains Windows and a Windows 7+ WIM/ESD/SWM source. Offering it anywhere
+        // else only produced "安装未开始" after the user pressed Install.
+        let custom_mode_index = SendMessageW(handles.custom_mode, 0x0147, WPARAM(0), LPARAM(0)).0;
+        let image_major = selected.and_then(|image| image.major_version);
+        let target_has_windows = self
+            .selected_install_target()
+            .is_some_and(|target| target.has_windows);
+        let personal_files_available = !self.is_pe_environment
+            && custom_mode_index <= 0
+            && self.xp_i386_source.is_none()
+            && !source_is_gho
+            && image_major.is_none_or(|major| major >= 6)
+            && target_has_windows;
+        if !personal_files_available {
+            // The page is not always visible when the context changes, so clear the captured
+            // session value as well; otherwise a hidden, previously checked option still blocks.
+            let options = &mut self.app_config.install_prefs.advanced_options;
+            options.preserve_personal_files = false;
+        }
+        // LetRecovery imports a migrated Wi-Fi profile only through its own first-logon
+        // finalizer, which exists only with the built-in answer file.
+        let builtin_unattend = unattended_enabled && self.custom_unattend_path.trim().is_empty();
+        let wifi_detected = self
+            .app_config
+            .install_prefs
+            .advanced_options
+            .wifi_detected
+            .unwrap_or(false);
         if let Some(page) = &mut self.advanced_page {
             let preinstall_catalogue_available = !self
                 .download_controller
@@ -6532,15 +6596,11 @@ impl NativeWindow {
                     && self.custom_unattend_path.trim().is_empty()
                     && !capabilities.xp
                     && !source_is_gho,
-                wifi_available: self
-                    .app_config
-                    .install_prefs
-                    .advanced_options
-                    .wifi_detected
-                    .unwrap_or(false),
+                wifi_available: builtin_unattend && wifi_detected,
                 preinstall_catalogue_available,
                 vmware_tools_available,
                 target_capabilities: capabilities,
+                personal_files_available,
             });
         }
     }
@@ -6622,9 +6682,8 @@ impl NativeWindow {
         let target_disk_number = self
             .selected_install_target()
             .and_then(|target| target.disk_number);
-        let target_bus = target_disk_number.and_then(|disk_number| {
-            cached_disk_bus_type(disk_number, "[WIN7 DRIVERS]")
-        });
+        let target_bus = target_disk_number
+            .and_then(|disk_number| cached_disk_bus_type(disk_number, "[WIN7 DRIVERS]"));
         let target = selected.map(|image| {
             format!(
                 "{}::{}::{}::disk={:?}::bus={:?}",
@@ -7179,7 +7238,11 @@ impl NativeWindow {
             .map(|partition| BackupPartitionRow {
                 volume: partition.letter.clone(),
                 total_size: super::layout::format_capacity_mb(partition.total_size_mb),
-                used_size: super::layout::format_capacity_mb(partition.total_size_mb.saturating_sub(partition.free_size_mb)),
+                used_size: super::layout::format_capacity_mb(
+                    partition
+                        .total_size_mb
+                        .saturating_sub(partition.free_size_mb),
+                ),
                 label: partition.label.clone(),
                 bitlocker: localized_bitlocker_status(&partition.bitlocker_status),
                 status: if partition.has_windows {
@@ -11243,7 +11306,11 @@ impl NativeWindow {
                         moving
                     ),
                     width: 640,
-                    height: if request.requires_partition_move { 380 } else { 320 },
+                    height: if request.requires_partition_move {
+                        380
+                    } else {
+                        320
+                    },
                     buttons: DialogButtons {
                         primary: crate::tr!("确认扩容"),
                         secondary: None,
@@ -11329,9 +11396,9 @@ impl NativeWindow {
         let handles = self.handles.as_ref()?;
         let selected = SendMessageW(handles.partitions, 0x100C, WPARAM(usize::MAX), LPARAM(2)).0;
         let partition = self.partitions.get(usize::try_from(selected).ok()?)?;
-        let disk_bus_type = partition.disk_number.and_then(|disk_number| {
-            cached_disk_bus_type(disk_number, "[INSTALL TARGET]")
-        });
+        let disk_bus_type = partition
+            .disk_number
+            .and_then(|disk_number| cached_disk_bus_type(disk_number, "[INSTALL TARGET]"));
         Some(InstallTarget {
             partition: partition.letter.clone(),
             disk_number: partition.disk_number,
@@ -12746,7 +12813,11 @@ impl NativeWindow {
             state.cancellable = false;
             terminal = true;
         }
-        let composed = if terminal { redraw::begin_page_transition(hwnd, "下载状态切换") } else { None };
+        let composed = if terminal {
+            redraw::begin_page_transition(hwnd, "下载状态切换")
+        } else {
+            None
+        };
         let terminal_redraw_suspended = composed.is_some();
         if terminal_redraw_suspended {
             // WM_SETREDRAW is never sent to the top-level window: it clears WS_VISIBLE, which lets clicks
@@ -15361,6 +15432,9 @@ unsafe extern "system" fn window_proc(
                     ID_CUSTOM_INSTALL_MODE if notification == CBN_SELCHANGE as u16 => {
                         state.sync_install_preferences_from_controls();
                         state.sync_dual_boot_size_with_selected_image();
+                        // Full-disk and dual-boot modes cannot keep personal files; refresh the
+                        // advanced page so that option disappears (and is cleared) immediately.
+                        state.update_advanced_install_context();
                         state.layout(hwnd);
                         state.update_install_primary_state();
                         redraw::invalidate_client_tree(hwnd);

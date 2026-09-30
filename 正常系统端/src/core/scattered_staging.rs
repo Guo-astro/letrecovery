@@ -329,7 +329,11 @@ impl ScatterStaging {
                 .context("生成分散目录定位标记内容")?;
             write_synced_file(&marker, &bytes)
                 .with_context(|| format!("写入分散目录定位标记 {}", marker.display()))?;
-            log::info!("[SCATTER] 已在 {}: 创建分散目录 {}", volume.letter, root.display());
+            log::info!(
+                "[SCATTER] 已在 {}: 创建分散目录 {}",
+                volume.letter,
+                root.display()
+            );
         }
         let root = volume
             .root
@@ -368,7 +372,9 @@ impl ScatterStaging {
         match platform::free_bytes(&format!("{}:\\", volume.letter)) {
             Ok(value) => value,
             Err(error) => {
-                let estimated = volume.planned_free_bytes.saturating_sub(volume.placed_bytes);
+                let estimated = volume
+                    .planned_free_bytes
+                    .saturating_sub(volume.placed_bytes);
                 log::warn!(
                     "[SCATTER] 重新读取 {}: 空闲空间失败，改用估算值 {estimated}: {error}",
                     volume.letter
@@ -426,9 +432,12 @@ impl ScatterStaging {
     /// 哪里都放不下时退回剩余最多的分区并记 warn，由实际写入结果决定成败。
     pub(crate) fn choose_for_unit(&self, unit_bytes: u64, largest_file_bytes: u64) -> char {
         let candidates = self.candidates(true);
-        if let Some(letter) =
-            choose_volume_for_unit(&candidates, unit_bytes, largest_file_bytes, Some(self.primary))
-        {
+        if let Some(letter) = choose_volume_for_unit(
+            &candidates,
+            unit_bytes,
+            largest_file_bytes,
+            Some(self.primary),
+        ) {
             return letter;
         }
         let fallback = candidates
@@ -587,7 +596,10 @@ pub(crate) fn copy_entry(source: &Path, destination: &Path) -> std::io::Result<(
         ));
     }
     std::fs::create_dir_all(destination)?;
-    for entry in walkdir::WalkDir::new(source).follow_links(false).min_depth(1) {
+    for entry in walkdir::WalkDir::new(source)
+        .follow_links(false)
+        .min_depth(1)
+    {
         let entry = entry.map_err(std::io::Error::other)?;
         let relative = entry
             .path()
