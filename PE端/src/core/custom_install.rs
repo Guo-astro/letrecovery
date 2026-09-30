@@ -1014,9 +1014,11 @@ fn delete_old_partitions_except_staging(
         .partitions
         .iter()
         .filter(|partition| {
-            !(partition.offset_bytes == staging_offset && partition.size_bytes == staging_length)
-                && !(is_mbr_container(partition)
-                    && partition_contains_range(partition, staging_offset, staging_end))
+            let is_staging =
+                partition.offset_bytes == staging_offset && partition.size_bytes == staging_length;
+            let holds_staging = is_mbr_container(partition)
+                && partition_contains_range(partition, staging_offset, staging_end);
+            !(is_staging || holds_staging)
         })
         .map(|partition| partition.offset_bytes)
         .collect::<Vec<_>>();
