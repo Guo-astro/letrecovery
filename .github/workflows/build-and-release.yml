@@ -30,9 +30,9 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PAT || github.token }}
 
-      - name: Pin reproducible build timestamp
+      - name: Pin build timestamp
         shell: bash
-        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+        run: echo "SOURCE_DATE_EPOCH=$(date -u +%s)" >> "$GITHUB_ENV"
 
       - name: Setup Rust 1.88
         uses: dtolnay/rust-toolchain@stable
