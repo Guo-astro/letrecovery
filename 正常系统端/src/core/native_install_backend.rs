@@ -2401,7 +2401,14 @@ impl ProductionInstallBackend {
         };
         let result = super::pe::PeManager::new()
             .boot_to_pe_for_install(&path.to_string_lossy(), display_name, payload)
-            .map_err(|error| Self::error("install_pe_boot_entry", error));
+            .map_err(|error| {
+                let code = if super::pe::boot_change_was_blocked(&error) {
+                    super::native_install_executor::PE_BOOT_CHANGE_BLOCKED
+                } else {
+                    "install_pe_boot_entry"
+                };
+                Self::error(code, error)
+            });
         match result {
             Ok(transaction) => {
                 self.pe_boot_transaction = Some(transaction);

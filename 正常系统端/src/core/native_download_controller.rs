@@ -310,7 +310,8 @@ impl NativeDownloadController {
                 .systems
                 .iter()
                 .map(|system| ResourceRow {
-                    name: system.display_name.clone(),
+                    // Server catalogue text is Simplified Chinese; translate the visible row only.
+                    name: crate::tr!(system.display_name.as_str()),
                     resource_type: if system.is_win11 { "Win11" } else { "Win10" }.into(),
                     size: String::new(),
                 })
@@ -319,7 +320,7 @@ impl NativeDownloadController {
                 .active_software()
                 .iter()
                 .map(|software| ResourceRow {
-                    name: software.name.clone(),
+                    name: crate::tr!(software.name.as_str()),
                     resource_type: software.version.clone().unwrap_or_default(),
                     size: String::new(),
                 })

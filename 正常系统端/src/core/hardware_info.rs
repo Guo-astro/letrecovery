@@ -2613,3 +2613,81 @@ mod diagnostic_tests {
         assert!(parsed.serial_number.is_empty());
     }
 }
+
+/// Display names of antivirus products registered with Windows Security Center
+/// (`ROOT\\SecurityCenter2`, Vista and later client editions). Used only to name the product in
+/// guidance text: Server editions and WinPE have no Security Center, and every failure returns
+/// an empty list without affecting any operation.
+pub fn registered_antivirus_names() -> Vec<String> {
+    let _com = ComInitGuard::new();
+    let Some(wmi) = WmiConnection::connect("ROOT\\SecurityCenter2") else {
+        return Vec::new();
+    };
+    let Some(results) = wmi.query("SELECT displayName, productState FROM AntiVirusProduct") else {
+        return Vec::new();
+    };
+    order_antivirus_names(
+        results
+            .filter_map(|object| {
+                let name = object.get_string("displayName")?.trim().to_string();
+                let state = object
+                    .get_string("productState")
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                (!name.is_empty()).then_some((name, state))
+            })
+            .collect(),
+    )
+}
+
+/// Security Center keeps listing Microsoft Defender after a third-party product takes over, so
+/// third-party products come first and Defender is named only when nothing else is registered.
+/// `productState` bit 0x1000 is the widely used "real-time protection on" flag. It is not
+/// documented by Microsoft, which is acceptable here because it only orders a hint.
+fn order_antivirus_names(products: Vec<(String, Option<u32>)>) -> Vec<String> {
+    let mut ranked: Vec<(u8, String)> = Vec::new();
+    for (name, state) in products {
+        if ranked
+            .iter()
+            .any(|(_, existing)| existing.eq_ignore_ascii_case(&name))
+        {
+            continue;
+        }
+        let enabled = state.is_some_and(|state| state & 0x1000 != 0);
+        let defender = name.to_ascii_lowercase().contains("defender");
+        let rank = match (defender, enabled) {
+            (false, true) => 0,
+            (false, false) => 1,
+            (true, true) => 2,
+            (true, false) => 3,
+        };
+        ranked.push((rank, name));
+    }
+    let third_party = ranked.iter().any(|(rank, _)| *rank < 2);
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked
+        .into_iter()
+        .filter(|(rank, _)| !third_party || *rank < 2)
+        .map(|(_, name)| name)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn antivirus_hint_prefers_third_party_products_over_defender() {
+        let names = order_antivirus_names(vec![
+            ("Windows Defender".to_string(), Some(0x060100)),
+            ("360安全卫士".to_string(), Some(0x060000)),
+            ("火绒安全软件".to_string(), Some(0x061000)),
+            ("火绒安全软件".to_string(), Some(0x061000)),
+        ]);
+        assert_eq!(names, vec!["火绒安全软件", "360安全卫士"]);
+        assert_eq!(
+            order_antivirus_names(vec![("Windows Defender".to_string(), Some(0x061100))]),
+            vec!["Windows Defender"]
+        );
+        assert!(order_antivirus_names(Vec::new()).is_empty());
+    }
+}

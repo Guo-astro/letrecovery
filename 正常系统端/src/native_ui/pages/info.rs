@@ -1199,59 +1199,7 @@ impl AboutPage {
         let gap = s(8);
         let metrics = LayoutMetrics::for_dpi(dpi);
         let field_height = metrics.field_height;
-        let row_height = s(30);
-        let widest_button = self
-            .link_buttons
-            .iter()
-            .chain(self.action_buttons.iter())
-            .map(|button| crate::native_ui::layout::control_text_width(*button))
-            .max()
-            .unwrap_or(0);
-        let button_layout = about_button_layout(width, dpi, widest_button);
-
-        let _ = MoveWindow(
-            self.product_name,
-            rect.x,
-            rect.y,
-            width,
-            s(28).min(rect.height.max(0)),
-            false,
-        );
-        let version_y = rect.y + s(36);
-        let version_label_width = s(72).min(width / 3);
-        let _ = MoveWindow(
-            self.version_label,
-            rect.x,
-            version_y + s(4),
-            version_label_width,
-            s(22),
-            false,
-        );
-        let _ = MoveWindow(
-            self.version,
-            rect.x + version_label_width,
-            version_y,
-            (width - version_label_width).max(0),
-            s(28),
-            false,
-        );
-
-        let description_y = version_y + s(38);
-        // The description is a single short sentence. Giving it all spare vertical space
-        // pushes every setting and the credits into the status bar on ordinary window sizes.
-        // Keep the page as a compact top-down flow; the remaining controls still wrap by width.
-        let description_height = s(28);
-        let _ = MoveWindow(
-            self.description,
-            rect.x,
-            description_y,
-            width,
-            description_height,
-            false,
-        );
-
         let settings_x = rect.x;
-        let language_y = description_y + description_height + gap;
         let label_width = settings_label_width(
             &[
                 measure_text(
@@ -1289,6 +1237,94 @@ impl AboutPage {
             .max(0);
         let language_closed_height = combo_closed_height(self.language, field_height);
         let language_row_height = language_closed_height.max(field_height);
+        let half = (width - gap) / 2;
+        // Two check boxes per row when every caption fits half the width; otherwise one per row.
+        let check_boxes = [
+            self.easy_mode,
+            self.logging,
+            self.automation_export,
+            self.automatic_feedback,
+        ];
+        let widest = check_boxes
+            .iter()
+            .map(|check| crate::native_ui::layout::control_text_width(*check) + s(24))
+            .max()
+            .unwrap_or(0);
+        let per_row = if widest <= half { 2 } else { 1 };
+        let check_width = if per_row == 2 { half } else { width };
+        let check_rows = (check_boxes.len() as i32 + per_row - 1) / per_row;
+        let engine_width = (width - label_width).min(s(280)).max(0);
+        let engine_closed_height = combo_closed_height(self.wim_engine, field_height);
+        let engine_row_height = engine_closed_height.max(field_height);
+        let download_threads_width = s(88).min((width - label_width).max(0));
+        let threads_closed_height = combo_closed_height(self.download_threads, field_height);
+        let threads_row_height = threads_closed_height.max(field_height);
+        let buttons: Vec<HWND> = self
+            .link_buttons
+            .iter()
+            .chain(self.action_buttons.iter())
+            .copied()
+            .collect();
+        let caption_widths: Vec<i32> = buttons
+            .iter()
+            .map(|button| crate::native_ui::layout::control_text_width(*button))
+            .collect();
+        let flow = about_flow_layout(&AboutFlowInput {
+            available_height: rect.height.max(0),
+            width,
+            dpi,
+            language_row_height,
+            check_rows,
+            engine_row_height,
+            threads_row_height,
+            help_text_height: crate::native_ui::layout::control_wrapped_height(
+                self.settings_help,
+                width,
+            ),
+            credits_text_height: crate::native_ui::layout::control_wrapped_height(
+                self.credits,
+                width,
+            ),
+            button_caption_widths: &caption_widths,
+        });
+
+        let _ = MoveWindow(
+            self.product_name,
+            rect.x,
+            rect.y,
+            width,
+            s(28).min(rect.height.max(0)),
+            false,
+        );
+        let version_y = rect.y + flow.version_y;
+        let version_label_width = s(72).min(width / 3);
+        let _ = MoveWindow(
+            self.version_label,
+            rect.x,
+            version_y + s(4),
+            version_label_width,
+            s(22),
+            false,
+        );
+        let _ = MoveWindow(
+            self.version,
+            rect.x + version_label_width,
+            version_y,
+            (width - version_label_width).max(0),
+            s(28),
+            false,
+        );
+        // The description is a single short sentence; only the last compaction step hides it.
+        let _ = MoveWindow(
+            self.description,
+            rect.x,
+            rect.y + flow.description_y,
+            width,
+            flow.description_height,
+            false,
+        );
+
+        let language_y = rect.y + flow.language_y;
         let _ = MoveWindow(
             self.language_label,
             settings_x,
@@ -1313,39 +1349,19 @@ impl AboutPage {
             language_closed_height,
             false,
         );
-        let easy_y = language_y + language_row_height + gap;
-        let half = (width - gap) / 2;
-        // Two check boxes per row when every caption fits half the width; otherwise one per row.
-        let check_boxes = [
-            self.easy_mode,
-            self.logging,
-            self.automation_export,
-            self.automatic_feedback,
-        ];
-        let widest = check_boxes
-            .iter()
-            .map(|check| crate::native_ui::layout::control_text_width(*check) + s(24))
-            .max()
-            .unwrap_or(0);
-        let per_row = if widest <= half { 2 } else { 1 };
-        let check_width = if per_row == 2 { half } else { width };
         for (index, check) in check_boxes.into_iter().enumerate() {
             let column = index as i32 % per_row;
             let row = index as i32 / per_row;
             let _ = MoveWindow(
                 check,
                 settings_x + column * (half + gap),
-                easy_y + row * (s(26) + gap),
+                rect.y + flow.check_y + row * flow.check_step,
                 check_width,
                 s(26),
                 false,
             );
         }
-        let rows = (check_boxes.len() as i32 + per_row - 1) / per_row;
-        let engine_y = easy_y + rows * (s(26) + gap);
-        let engine_width = (width - label_width).min(s(280)).max(0);
-        let engine_closed_height = combo_closed_height(self.wim_engine, field_height);
-        let engine_row_height = engine_closed_height.max(field_height);
+        let engine_y = rect.y + flow.engine_y;
         let _ = MoveWindow(
             self.wim_engine_label,
             settings_x,
@@ -1362,10 +1378,7 @@ impl AboutPage {
             s(220),
             false,
         );
-        let download_threads_y = engine_y + engine_row_height + gap;
-        let download_threads_width = s(88).min((width - label_width).max(0));
-        let threads_closed_height = combo_closed_height(self.download_threads, field_height);
-        let threads_row_height = threads_closed_height.max(field_height);
+        let download_threads_y = rect.y + flow.threads_y;
         let _ = MoveWindow(
             self.download_threads_label,
             settings_x,
@@ -1386,52 +1399,29 @@ impl AboutPage {
             s(300),
             false,
         );
-        let help_y = download_threads_y + threads_row_height + gap;
-        let help_height =
-            crate::native_ui::layout::control_wrapped_height(self.settings_help, width).max(s(48));
         let _ = MoveWindow(
             self.settings_help,
             settings_x,
-            help_y,
+            rect.y + flow.help_y,
             width,
-            help_height,
+            flow.help_height,
             false,
         );
-        let credits_y = help_y + help_height + gap;
-        let credits_height =
-            crate::native_ui::layout::control_wrapped_height(self.credits, width).max(s(44));
         let _ = MoveWindow(
             self.credits,
             settings_x,
-            credits_y,
+            rect.y + flow.credits_y,
             width,
-            credits_height,
+            flow.credits_height,
             false,
         );
-        let buttons_y = credits_y + credits_height + gap;
-        for index in 0..3 {
-            let column = index as i32 % button_layout.columns;
-            let row = index as i32 / button_layout.columns;
+        for (button, placement) in buttons.iter().zip(&flow.buttons) {
             let _ = MoveWindow(
-                self.link_buttons[index],
-                rect.x + column * (button_layout.button_width + gap),
-                buttons_y + row * (row_height + gap),
-                button_layout.button_width,
-                row_height,
-                false,
-            );
-        }
-
-        for (index, button) in self.action_buttons.iter().copied().enumerate() {
-            let unified_index = 3 + index as i32;
-            let column = unified_index % button_layout.columns;
-            let row = unified_index / button_layout.columns;
-            let _ = MoveWindow(
-                button,
-                rect.x + column * (button_layout.button_width + gap),
-                buttons_y + row * (row_height + gap),
-                button_layout.button_width,
-                row_height,
+                *button,
+                rect.x + placement.x,
+                rect.y + placement.y,
+                placement.width,
+                flow.button_height,
                 false,
             );
         }
@@ -1540,6 +1530,249 @@ fn about_button_layout(width: i32, dpi: u32, widest_caption: i32) -> AboutButton
     }
 }
 
+/// Measured inputs of the About page's vertical flow, in physical pixels.
+#[derive(Clone, Copy, Debug)]
+struct AboutFlowInput<'a> {
+    available_height: i32,
+    width: i32,
+    dpi: u32,
+    language_row_height: i32,
+    check_rows: i32,
+    engine_row_height: i32,
+    threads_row_height: i32,
+    help_text_height: i32,
+    credits_text_height: i32,
+    button_caption_widths: &'a [i32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AboutButtonPlacement {
+    x: i32,
+    y: i32,
+    width: i32,
+}
+
+/// Vertical positions relative to the page rectangle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AboutFlowLayout {
+    version_y: i32,
+    description_y: i32,
+    description_height: i32,
+    language_y: i32,
+    check_y: i32,
+    check_step: i32,
+    engine_y: i32,
+    threads_y: i32,
+    help_y: i32,
+    help_height: i32,
+    credits_y: i32,
+    credits_height: i32,
+    buttons: Vec<AboutButtonPlacement>,
+    button_height: i32,
+    bottom: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AboutCompaction {
+    tight_spacing: bool,
+    single_button_row: bool,
+    show_help: bool,
+    show_description: bool,
+}
+
+/// The About page sits above the command bar whose left side shows the boot mode, TPM and
+/// Secure Boot status. Longer German and French captions wrapped the fourth button into a
+/// second row that covered that status. The original flow is kept whenever it fits; otherwise
+/// the least visible compaction that fits is used: one caption-sized button row, then tighter
+/// vertical spacing, and only as a last resort the optional settings hint and the one-line
+/// description are hidden.
+fn about_flow_layout(input: &AboutFlowInput<'_>) -> AboutFlowLayout {
+    const STEPS: [AboutCompaction; 6] = [
+        AboutCompaction {
+            tight_spacing: false,
+            single_button_row: false,
+            show_help: true,
+            show_description: true,
+        },
+        AboutCompaction {
+            tight_spacing: false,
+            single_button_row: true,
+            show_help: true,
+            show_description: true,
+        },
+        AboutCompaction {
+            tight_spacing: true,
+            single_button_row: false,
+            show_help: true,
+            show_description: true,
+        },
+        AboutCompaction {
+            tight_spacing: true,
+            single_button_row: true,
+            show_help: true,
+            show_description: true,
+        },
+        AboutCompaction {
+            tight_spacing: true,
+            single_button_row: true,
+            show_help: false,
+            show_description: true,
+        },
+        AboutCompaction {
+            tight_spacing: true,
+            single_button_row: true,
+            show_help: false,
+            show_description: false,
+        },
+    ];
+    let mut layout = about_flow_layout_with(input, STEPS[0]);
+    for step in &STEPS[1..] {
+        if layout.bottom <= input.available_height {
+            break;
+        }
+        layout = about_flow_layout_with(input, *step);
+    }
+    layout
+}
+
+fn about_flow_layout_with(
+    input: &AboutFlowInput<'_>,
+    compaction: AboutCompaction,
+) -> AboutFlowLayout {
+    // Same truncating scale as the page layout, so the uncompacted flow is unchanged.
+    let s = |value: i32| value * input.dpi as i32 / 96;
+    let width = input.width.max(0);
+    let tight = compaction.tight_spacing;
+    let gap = if tight { s(4) } else { s(8) };
+    let version_y = if tight { s(32) } else { s(36) };
+    let description_y = version_y + if tight { s(32) } else { s(38) };
+    let description_height = match (compaction.show_description, tight) {
+        (false, _) => 0,
+        (true, true) => s(24),
+        (true, false) => s(28),
+    };
+    let language_y = if compaction.show_description {
+        description_y + description_height + gap
+    } else {
+        description_y
+    };
+    let check_y = language_y + input.language_row_height + gap;
+    let check_step = s(26) + gap;
+    let engine_y = check_y + input.check_rows.max(0) * check_step;
+    let threads_y = engine_y + input.engine_row_height + gap;
+    let help_y = threads_y + input.threads_row_height + gap;
+    let help_height = match (compaction.show_help, tight) {
+        (false, _) => 0,
+        (true, true) => input.help_text_height.max(0),
+        (true, false) => input.help_text_height.max(s(48)),
+    };
+    let credits_y = if compaction.show_help {
+        help_y + help_height + gap
+    } else {
+        help_y
+    };
+    let credits_height = if tight {
+        input.credits_text_height.max(0)
+    } else {
+        input.credits_text_height.max(s(44))
+    };
+    let buttons_y = credits_y + credits_height + gap;
+    let button_height = s(30);
+    let column_gap = s(8);
+    let single_row = if compaction.single_button_row {
+        about_single_button_row(width, column_gap, input.button_caption_widths, input.dpi)
+    } else {
+        None
+    };
+    let buttons: Vec<AboutButtonPlacement> = match single_row {
+        Some(row) => row
+            .into_iter()
+            .map(|(x, width)| AboutButtonPlacement {
+                x,
+                y: buttons_y,
+                width,
+            })
+            .collect(),
+        None => {
+            let widest = input
+                .button_caption_widths
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0);
+            let grid = about_button_layout(width, input.dpi, widest);
+            (0..input.button_caption_widths.len() as i32)
+                .map(|index| AboutButtonPlacement {
+                    x: (index % grid.columns) * (grid.button_width + column_gap),
+                    y: buttons_y + (index / grid.columns) * (button_height + gap),
+                    width: grid.button_width,
+                })
+                .collect()
+        }
+    };
+    let bottom = buttons
+        .iter()
+        .map(|button| button.y + button_height)
+        .max()
+        .unwrap_or(credits_y + credits_height);
+    AboutFlowLayout {
+        version_y,
+        description_y,
+        description_height,
+        language_y,
+        check_y,
+        check_step,
+        engine_y,
+        threads_y,
+        help_y,
+        help_height,
+        credits_y,
+        credits_height,
+        buttons,
+        button_height,
+        bottom,
+    }
+}
+
+/// Places every About button on one row when each keeps its caption plus a compact inner
+/// padding. Spare width is shared evenly so the row still spans the page.
+fn about_single_button_row(
+    width: i32,
+    gap: i32,
+    captions: &[i32],
+    dpi: u32,
+) -> Option<Vec<(i32, i32)>> {
+    let count = i32::try_from(captions.len()).ok()?;
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let padding = ((16_i64 * i64::from(dpi.max(1)) + 48) / 96) as i32;
+    let minimum = captions
+        .iter()
+        .map(|caption| (*caption).max(0) + padding)
+        .sum::<i32>()
+        + gap * (count - 1);
+    if minimum > width {
+        return None;
+    }
+    let spare = width - minimum;
+    let mut x = 0;
+    Some(
+        captions
+            .iter()
+            .enumerate()
+            .map(|(index, caption)| {
+                let index = index as i32;
+                let share = spare / count + i32::from(index < spare % count);
+                let button_width = (*caption).max(0) + padding + share;
+                let placement = (x, button_width);
+                x += button_width + gap;
+                placement
+            })
+            .collect(),
+    )
+}
+
 unsafe fn set_text(hwnd: HWND, value: &str) {
     let value = wide(value);
     let _ = SetWindowTextW(hwnd, PCWSTR(value.as_ptr()));
@@ -1604,6 +1837,99 @@ mod tests {
         let narrow = about_button_layout(180, 192, 0);
         assert_eq!(narrow.columns, 1);
         assert_eq!(narrow.button_width, 180);
+    }
+
+    fn about_flow_fixture(available_height: i32, captions: &[i32]) -> AboutFlowInput<'_> {
+        // Geometry measured from the 150 % German report: 940 px content width and 634 px
+        // between the page header and the command bar.
+        AboutFlowInput {
+            available_height,
+            width: 940,
+            dpi: 144,
+            language_row_height: 35,
+            check_rows: 2,
+            engine_row_height: 35,
+            threads_row_height: 35,
+            help_text_height: 74,
+            credits_text_height: 74,
+            button_caption_widths: captions,
+        }
+    }
+
+    #[test]
+    fn about_flow_keeps_the_original_geometry_whenever_it_fits() {
+        let captions = [120, 110, 130, 140];
+        let layout = about_flow_layout(&about_flow_fixture(2_000, &captions));
+        let s = |value: i32| value * 144 / 96;
+        assert_eq!(layout.version_y, s(36));
+        assert_eq!(layout.description_y, s(36) + s(38));
+        assert_eq!(layout.description_height, s(28));
+        assert_eq!(layout.language_y, layout.description_y + s(28) + s(8));
+        assert_eq!(layout.check_step, s(26) + s(8));
+        assert_eq!(layout.help_height, 74);
+        let grid = about_button_layout(940, 144, 140);
+        assert!(layout
+            .buttons
+            .iter()
+            .all(|button| button.width == grid.button_width));
+        assert_eq!(
+            layout.buttons[0].y,
+            layout.credits_y + layout.credits_height + s(8)
+        );
+    }
+
+    #[test]
+    fn german_about_buttons_move_into_one_row_instead_of_the_status_bar() {
+        let captions = [153, 203, 194, 230];
+        let input = about_flow_fixture(634, &captions);
+        let original = about_flow_layout_with(
+            &input,
+            AboutCompaction {
+                tight_spacing: false,
+                single_button_row: false,
+                show_help: true,
+                show_description: true,
+            },
+        );
+        assert!(original.bottom > 634, "fixture must reproduce the overlap");
+
+        let layout = about_flow_layout(&input);
+        assert!(
+            layout.bottom <= 634,
+            "bottom {} overlaps the command bar",
+            layout.bottom
+        );
+        assert!(layout
+            .buttons
+            .iter()
+            .all(|button| button.y == layout.buttons[0].y));
+        assert_eq!(layout.help_height, 74);
+        let last = layout.buttons.last().expect("four About buttons");
+        assert_eq!(last.x + last.width, 940);
+        for (button, caption) in layout.buttons.iter().zip(captions) {
+            assert!(button.width >= caption + 24);
+        }
+        for pair in layout.buttons.windows(2) {
+            assert!(pair[0].x + pair[0].width < pair[1].x);
+        }
+    }
+
+    #[test]
+    fn long_french_captions_tighten_spacing_before_hiding_anything() {
+        let captions = [211, 176, 176, 284];
+        let layout = about_flow_layout(&about_flow_fixture(634, &captions));
+        assert!(layout.bottom <= 634, "bottom {}", layout.bottom);
+        assert!(layout.help_height > 0);
+        assert!(layout.description_height > 0);
+    }
+
+    #[test]
+    fn only_a_very_short_page_hides_the_optional_settings_hint() {
+        let captions = [211, 176, 176, 284];
+        let layout = about_flow_layout(&about_flow_fixture(540, &captions));
+        assert_eq!(layout.help_height, 0);
+        assert!(layout.description_height > 0);
+        assert!(layout.bottom <= 540, "bottom {}", layout.bottom);
     }
 
     #[test]

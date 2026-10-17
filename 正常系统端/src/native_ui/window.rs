@@ -409,7 +409,12 @@ impl HardwareCopyFeedback {
 enum InstallWorkerMessage {
     Event(InstallExecutionEvent),
     Cancelled,
-    Failed(String),
+    Failed {
+        message: String,
+        /// `Some` when security software most likely blocked the PE boot entry; holds the
+        /// antivirus names reported by Windows Security Center, best match first.
+        security_block: Option<Vec<String>>,
+    },
 }
 
 struct ImageInfoMessage {
@@ -12123,7 +12128,15 @@ impl NativeWindow {
                     InstallWorkerMessage::Cancelled
                 } else {
                     log::error!("原生安装执行失败: {error}");
-                    InstallWorkerMessage::Failed(error.user_message())
+                    // The Security Center lookup stays on this worker thread; the dialog only uses
+                    // the product names to give concrete instructions.
+                    let security_block = error
+                        .boot_change_blocked()
+                        .then(crate::core::hardware_info::registered_antivirus_names);
+                    InstallWorkerMessage::Failed {
+                        message: error.user_message(),
+                        security_block,
+                    }
                 };
                 let _ = sender.send(message);
             }
@@ -12241,6 +12254,7 @@ impl NativeWindow {
         }
         let mut reboot_after_completion = false;
         let mut show_failure_log_prompt = false;
+        let mut security_block_prompt: Option<Vec<String>> = None;
         for message in messages {
             let mut terminal = false;
             if let Some(page) = &mut self.progress_page {
@@ -12338,12 +12352,18 @@ impl NativeWindow {
                             self.install_auto_reboot && !self.install_requires_secure_boot_disable;
                         terminal = true;
                     }
-                    InstallWorkerMessage::Failed(error) => {
+                    InstallWorkerMessage::Failed {
+                        message,
+                        security_block,
+                    } => {
                         state.status = ProgressStatus::Failed;
                         state.current_step = crate::tr!("安装失败");
-                        state.detail = error;
+                        state.detail = message;
                         state.status_text = crate::tr!("安装已安全停止，请检查错误信息。");
-                        show_failure_log_prompt = true;
+                        // A security-software block has its own explanation; the generic log
+                        // prompt would only add a second popup for an already known cause.
+                        show_failure_log_prompt = security_block.is_none();
+                        security_block_prompt = security_block;
                         terminal = true;
                     }
                     InstallWorkerMessage::Cancelled => {
@@ -12381,6 +12401,9 @@ impl NativeWindow {
         }
         if show_failure_log_prompt {
             self.show_terminal_error_log_prompt(hwnd);
+        }
+        if let Some(products) = security_block_prompt {
+            self.show_security_block_prompt(hwnd, &products);
         }
         if reboot_after_completion {
             log::info!("安装完成，用户已选择立即重启");
@@ -13725,6 +13748,41 @@ impl NativeWindow {
         if let Ok(mut dialog) = DialogShell::create(hwnd, spec) {
             dialog.fit_content_height(0);
             let _ = dialog.show_modal();
+        }
+    }
+
+    /// Explains a PE boot entry that security software most likely blocked. The install stopped in
+    /// its reversible phase and the PE boot transaction was rolled back, so the dialog can say
+    /// that nothing changed. "Back to retry" only leaves the progress page: the user starts the
+    /// install again from the normal page, so every selection check and the usual confirmation
+    /// run again instead of being bypassed.
+    unsafe fn show_security_block_prompt(&mut self, hwnd: HWND, products: &[String]) {
+        let product = products
+            .first()
+            .map(|name| crate::tr!("「{}」", name))
+            .unwrap_or_else(|| crate::tr!("你的安全软件"));
+        let spec = DialogSpec {
+            window_title: crate::tr!("安装已安全停止"),
+            title: crate::tr!("安全软件拦截了启动项修改"),
+            description: crate::tr!(
+                "LetRecovery 需要添加一个临时启动项才能重启进入安装环境，这一步被安全软件拦截了。安装已安全停止，电脑没有任何改动。\r\n\r\n1. 如果安全软件弹出了提示，请选择「允许」或「信任」。\r\n2. 如果没有弹窗，请在{}中把 LetRecovery 加入信任区（白名单）。\r\n3. 仍然不行的话，可以暂时关闭防护。重启进入安装环境后就不再需要它；如果没有继续安装，请记得重新打开。\r\n\r\n处理好后点击「返回重试」，然后重新开始安装。",
+                product
+            ),
+            width: 620,
+            height: 420,
+            buttons: DialogButtons {
+                primary: crate::tr!("返回重试"),
+                secondary: None,
+                cancel: Some(crate::tr!("关闭")),
+            },
+        };
+        match DialogShell::create(hwnd, spec) {
+            Ok(mut dialog) => {
+                if dialog.show_modal() == DialogResult::Primary {
+                    self.leave_progress(hwnd);
+                }
+            }
+            Err(error) => log::warn!("[SECURITY BLOCK] 无法显示安全软件拦截提示: {error}"),
         }
     }
 

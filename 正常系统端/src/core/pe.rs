@@ -1734,6 +1734,197 @@ pub(super) fn ci_force_auto_staging_requested() -> bool {
 /// WinPE 启动管理器
 trait BcdRunner {
     fn run(&self, arguments: &[&str]) -> Result<String>;
+
+    /// Waits before repeating a bcdedit run that ended without any report. Mock runners
+    /// override this so tests stay instantaneous.
+    fn pause_before_retry(&self, attempt: usize) {
+        std::thread::sleep(std::time::Duration::from_millis(
+            250 * u64::try_from(attempt).unwrap_or(1),
+        ));
+    }
+}
+
+/// Total bcdedit runs allowed for one write whose earlier runs ended without any report.
+const BCDEDIT_UNREPORTED_TERMINATION_ATTEMPTS: usize = 3;
+
+/// A bcdedit run that ended with an exit code other than bcdedit's own success and failure
+/// codes (0 and 1) and wrote nothing to stdout or stderr.
+///
+/// bcdedit prints a localized message for every error it handles itself. A silent run with any
+/// other exit code was ended from outside (for example by security software that guards boot
+/// configuration changes) or crashed before reporting, so whether its write landed is unknown
+/// until the store is read back. A field log showed exactly this for `/set <loader> osdevice
+/// ramdisk=...`: exit code -1 and no output within a few milliseconds, right after bcdedit had
+/// accepted the identical `device` value.
+#[derive(Debug)]
+struct BcdeditTerminatedWithoutReport {
+    arguments: String,
+    exit_code: Option<i32>,
+}
+
+impl std::fmt::Display for BcdeditTerminatedWithoutReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let exit_code = self
+            .exit_code
+            .map(|code| format!("{code} (0x{:08X})", code as u32))
+            .unwrap_or_else(|| tr!("未知"));
+        formatter.write_str(&tr!(
+            "bcdedit 未输出任何信息就被结束（参数：{}，退出码：{}）。启动配置修改可能被安全软件或系统防护拦截，请在安全软件中允许 LetRecovery 修改系统引导后重试。",
+            self.arguments,
+            exit_code
+        ))
+    }
+}
+
+impl std::error::Error for BcdeditTerminatedWithoutReport {}
+
+fn bcdedit_terminated_without_report(
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> bool {
+    !success && exit_code != Some(1) && stdout.trim().is_empty() && stderr.trim().is_empty()
+}
+
+fn bcdedit_run_was_terminated(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<BcdeditTerminatedWithoutReport>()
+        .is_some()
+}
+
+/// Whether PE boot preparation failed because bcdedit ended without reporting anything, which
+/// the UI explains as likely security-software interference. Every context layer is checked.
+pub(crate) fn boot_change_was_blocked(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<BcdeditTerminatedWithoutReport>()
+            .is_some()
+    })
+}
+
+/// Runs a bcdedit command whose effect is idempotent for an object owned by this transaction.
+/// Only an unreported termination is repeated; an error that bcdedit reported itself is
+/// returned unchanged on its first occurrence.
+fn run_idempotent_bcdedit<R: BcdRunner>(runner: &R, arguments: &[&str]) -> Result<String> {
+    let mut attempt = 1;
+    loop {
+        match runner.run(arguments) {
+            Err(error)
+                if bcdedit_run_was_terminated(&error)
+                    && attempt < BCDEDIT_UNREPORTED_TERMINATION_ATTEMPTS =>
+            {
+                log::warn!(
+                    "[PE] bcdedit {:?} 未输出任何信息即结束（第 {} 次），稍后重试: {}",
+                    arguments,
+                    attempt,
+                    error
+                );
+                runner.pause_before_retry(attempt);
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Value of one element in `bcdedit /enum <id> /v` output. Element names are not localized,
+/// only headings are, so the first whitespace-separated token identifies the element.
+fn bcd_enum_element_value<'a>(output: &'a str, element: &str) -> Option<&'a str> {
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        let name = line.split_whitespace().next()?;
+        name.eq_ignore_ascii_case(element)
+            .then(|| line[name.len()..].trim())
+    })
+}
+
+/// bcdedit echoes values with its own casing (`Yes`, lower-case GUIDs). A device element may
+/// also be shown with the NT device path instead of the supplied drive letter; the file path
+/// and the random ramdisk-options GUID after the bracket still identify this exact value.
+fn bcd_element_value_matches(expected: &str, displayed: &str) -> bool {
+    let expected = expected.trim().to_lowercase();
+    let displayed = displayed.trim().to_lowercase();
+    if expected == displayed {
+        return true;
+    }
+    let ramdisk_target = |value: &str| -> Option<String> {
+        let rest = value.strip_prefix("ramdisk=[")?;
+        let close = rest.find(']')?;
+        Some(rest[close + 1..].to_string())
+    };
+    matches!(
+        (ramdisk_target(&expected), ramdisk_target(&displayed)),
+        (Some(expected), Some(displayed)) if !expected.is_empty() && expected == displayed
+    )
+}
+
+fn bcd_element_has_value<R: BcdRunner>(
+    runner: &R,
+    guid: &str,
+    element: &str,
+    expected: &str,
+) -> Result<bool> {
+    let output = runner.run(&["/enum", guid, "/v"])?;
+    Ok(output_contains_guid(&output, guid)
+        && bcd_enum_element_value(&output, element)
+            .is_some_and(|displayed| bcd_element_value_matches(expected, displayed)))
+}
+
+/// Sets one element on an object created by this PE boot transaction.
+fn set_bcd_element<R: BcdRunner>(runner: &R, guid: &str, element: &str, value: &str) -> Result<()> {
+    let error = match run_idempotent_bcdedit(runner, &["/set", guid, element, value]) {
+        Ok(_) => return Ok(()),
+        Err(error) if bcdedit_run_was_terminated(&error) => error,
+        Err(error) => return Err(error),
+    };
+    // The last silent run may still have committed the value before it ended. The store
+    // read-back is authoritative; without the exact value the write stays failed.
+    match bcd_element_has_value(runner, guid, element, value) {
+        Ok(true) => {
+            log::warn!("[PE] bcdedit 未报告结果，但回读确认 {guid} 的 {element} 已是目标值，继续");
+            Ok(())
+        }
+        Ok(false) => Err(error),
+        Err(readback) => Err(anyhow::anyhow!(
+            "{error}; read-back of {element} on {guid} also failed: {readback:#}"
+        )),
+    }
+}
+
+/// Creates one object under this transaction's fresh identifier. `/create` is not idempotent,
+/// so after a silent termination the exact identifier decides whether the object already exists
+/// before the command may run again.
+fn create_bcd_object<R: BcdRunner>(runner: &R, arguments: &[&str], guid: &str) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        let error = match runner.run(arguments) {
+            Ok(_) => return Ok(()),
+            Err(error) if bcdedit_run_was_terminated(&error) => error,
+            Err(error) => return Err(error),
+        };
+        match bcd_object_is_present(runner, guid) {
+            Ok(true) => {
+                log::warn!("[PE] bcdedit 未报告结果，但回读确认对象 {guid} 已创建，继续");
+                return Ok(());
+            }
+            Ok(false) if attempt < BCDEDIT_UNREPORTED_TERMINATION_ATTEMPTS => {
+                log::warn!(
+                    "[PE] bcdedit {:?} 未输出任何信息即结束且对象不存在（第 {} 次），稍后重试",
+                    arguments,
+                    attempt
+                );
+                runner.pause_before_retry(attempt);
+                attempt += 1;
+            }
+            Ok(false) => return Err(error),
+            Err(readback) => {
+                return Err(anyhow::anyhow!(
+                    "{error}; read-back of {guid} also failed: {readback:#}"
+                ))
+            }
+        }
+    }
 }
 
 fn output_contains_guid(output: &str, guid: &str) -> bool {
@@ -1797,10 +1988,33 @@ fn add_one_shot_boot<R: BcdRunner>(runner: &R, loader_guid: &str) -> Result<()> 
     if !valid_bcd_guid(loader_guid) {
         anyhow::bail!("invalid PE loader GUID before setting one-shot boot sequence");
     }
-    runner.run(&["/bootsequence", loader_guid, "/addfirst"])?;
-    let bootmgr = runner.run(&["/enum", "{bootmgr}"])?;
+    // Adding the same identifier first again is idempotent. A silent termination is decided by
+    // the Boot Manager read-back below, which is required for every outcome anyway.
+    let terminated =
+        match run_idempotent_bcdedit(runner, &["/bootsequence", loader_guid, "/addfirst"]) {
+            Ok(_) => None,
+            Err(error) if bcdedit_run_was_terminated(&error) => Some(error),
+            Err(error) => return Err(error),
+        };
+    let bootmgr = match runner.run(&["/enum", "{bootmgr}"]) {
+        Ok(output) => output,
+        Err(readback) => {
+            return Err(match terminated {
+                Some(error) => {
+                    anyhow::anyhow!("{error}; BootSequence read-back also failed: {readback:#}")
+                }
+                None => readback,
+            })
+        }
+    };
     if !output_contains_guid(&bootmgr, loader_guid) {
+        if let Some(error) = terminated {
+            return Err(error);
+        }
         anyhow::bail!("PE loader is absent from BootSequence after bcdedit reported success");
+    }
+    if terminated.is_some() {
+        log::warn!("[PE] bcdedit 未报告结果，但回读确认 BootSequence 已包含 {loader_guid}，继续");
     }
     Ok(())
 }
@@ -1878,6 +2092,69 @@ impl Drop for PeBootTransaction {
             self.active = false;
         }
     }
+}
+
+/// Every value of one PE ramdisk boot entry, built before any store write so the exact bcdedit
+/// sequence can be exercised with a mock runner.
+struct PeBootEntryPlan<'a> {
+    ramdisk_guid: &'a str,
+    loader_guid: &'a str,
+    ram_description: String,
+    display_name: &'a str,
+    system_partition: String,
+    sdi_bcd_path: String,
+    device: String,
+    winload: &'static str,
+}
+
+fn write_pe_boot_entry<R: BcdRunner>(runner: &R, plan: &PeBootEntryPlan<'_>) -> Result<()> {
+    log::info!("[PE] 创建 ramdisk 设备");
+    create_bcd_object(
+        runner,
+        &[
+            "/create",
+            plan.ramdisk_guid,
+            "/d",
+            &plan.ram_description,
+            "/device",
+        ],
+        plan.ramdisk_guid,
+    )?;
+    log::info!("[PE] Ramdisk GUID: {}", plan.ramdisk_guid);
+    for (element, value) in [
+        ("ramdisksdidevice", plan.system_partition.as_str()),
+        ("ramdisksdipath", plan.sdi_bcd_path.as_str()),
+    ] {
+        set_bcd_element(runner, plan.ramdisk_guid, element, value)?;
+    }
+
+    log::info!("[PE] 创建 osloader");
+    create_bcd_object(
+        runner,
+        &[
+            "/create",
+            plan.loader_guid,
+            "/d",
+            plan.display_name,
+            "/application",
+            "osloader",
+        ],
+        plan.loader_guid,
+    )?;
+    log::info!("[PE] Loader GUID: {}", plan.loader_guid);
+    // `osdevice` repeats the `device` value; winload needs both for a ramdisk WinPE.
+    for (element, value) in [
+        ("device", plan.device.as_str()),
+        ("path", plan.winload),
+        ("osdevice", plan.device.as_str()),
+        ("systemroot", "\\windows"),
+        ("detecthal", "yes"),
+        ("winpe", "yes"),
+        ("ems", "no"),
+    ] {
+        set_bcd_element(runner, plan.loader_guid, element, value)?;
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -2241,6 +2518,7 @@ impl PeManager {
     }
 
     fn run_bcdedit(&self, arguments: &[&str]) -> Result<String> {
+        let started = std::time::Instant::now();
         let output = create_command(&self.bcdedit_path)
             .args(arguments)
             .output()
@@ -2254,8 +2532,26 @@ impl PeManager {
                     )
                 )
             })?;
+        let elapsed_ms = started.elapsed().as_millis();
         let stdout = gbk_to_utf8(&output.stdout);
         let stderr = gbk_to_utf8(&output.stderr);
+        if bcdedit_terminated_without_report(
+            output.status.success(),
+            output.status.code(),
+            &stdout,
+            &stderr,
+        ) {
+            log::warn!(
+                "[PE] bcdedit {:?} 未输出任何信息即结束: exit_code={:?} elapsed_ms={}",
+                arguments,
+                output.status.code(),
+                elapsed_ms
+            );
+            return Err(anyhow::Error::new(BcdeditTerminatedWithoutReport {
+                arguments: arguments.join(" "),
+                exit_code: output.status.code(),
+            }));
+        }
         ensure_bcdedit_success(
             arguments,
             output.status.success(),
@@ -2284,61 +2580,24 @@ impl PeManager {
             .context("resolve running Windows volume for PE BCD entry")?;
         let wim_bcd_path = bcd_path_on_volume(&record.wim_path, system_drive)?;
         let sdi_bcd_path = bcd_path_on_volume(&record.sdi_path, system_drive)?;
-        let system_partition = format!("partition={system_drive}:");
-
-        let create_result = (|| -> Result<()> {
-            log::info!("[PE] 创建 ramdisk 设备");
-            let ram_description = format!("{} RAM", display_name);
-            let ramdisk_guid = record.ramdisk_guid.as_str();
-            self.run_bcdedit(&["/create", ramdisk_guid, "/d", &ram_description, "/device"])?;
-            log::info!("[PE] Ramdisk GUID: {}", ramdisk_guid);
-
-            for cmd in [
-                vec![
-                    "/set",
-                    ramdisk_guid,
-                    "ramdisksdidevice",
-                    system_partition.as_str(),
-                ],
-                vec!["/set", ramdisk_guid, "ramdisksdipath", &sdi_bcd_path],
-            ] {
-                self.run_bcdedit(&cmd)?;
-            }
-
-            log::info!("[PE] 创建 osloader");
-            let loader_guid = record.loader_guid.as_str();
-            self.run_bcdedit(&[
-                "/create",
-                loader_guid,
-                "/d",
-                display_name,
-                "/application",
-                "osloader",
-            ])?;
-            log::info!("[PE] Loader GUID: {}", loader_guid);
-
-            let winload = if is_uefi {
+        let plan = PeBootEntryPlan {
+            ramdisk_guid: record.ramdisk_guid.as_str(),
+            loader_guid: record.loader_guid.as_str(),
+            ram_description: format!("{} RAM", display_name),
+            display_name,
+            system_partition: format!("partition={system_drive}:"),
+            sdi_bcd_path,
+            device: format!(
+                "ramdisk=[{system_drive}:]{},{}",
+                wim_bcd_path, record.ramdisk_guid
+            ),
+            winload: if is_uefi {
                 "\\windows\\system32\\boot\\winload.efi"
             } else {
                 "\\windows\\system32\\boot\\winload.exe"
-            };
-            let device_str = format!("ramdisk=[{system_drive}:]{},{}", wim_bcd_path, ramdisk_guid);
-            for cmd in [
-                vec!["/set", loader_guid, "device", &device_str],
-                vec!["/set", loader_guid, "path", winload],
-                vec!["/set", loader_guid, "osdevice", &device_str],
-                vec!["/set", loader_guid, "systemroot", "\\windows"],
-                vec!["/set", loader_guid, "detecthal", "yes"],
-                vec!["/set", loader_guid, "winpe", "yes"],
-                vec!["/set", loader_guid, "ems", "no"],
-            ] {
-                self.run_bcdedit(&cmd)?;
-            }
-            Ok(())
-        })();
-
-        create_result?;
-        Ok(())
+            },
+        };
+        write_pe_boot_entry(self, &plan)
     }
 
     /// 设置下次启动为PE
@@ -3008,6 +3267,7 @@ mod cache_policy_tests {
     enum MockReply {
         Ok(String),
         Err(&'static str),
+        Terminated,
     }
 
     struct MockBcdRunner {
@@ -3039,8 +3299,14 @@ mod cache_policy_tests {
             {
                 MockReply::Ok(output) => Ok(output),
                 MockReply::Err(message) => anyhow::bail!(message),
+                MockReply::Terminated => Err(anyhow::Error::new(BcdeditTerminatedWithoutReport {
+                    arguments: arguments.join(" "),
+                    exit_code: Some(-1),
+                })),
             }
         }
+
+        fn pause_before_retry(&self, _attempt: usize) {}
     }
 
     #[test]
@@ -3209,6 +3475,251 @@ mod cache_policy_tests {
             .expect_err("a GUID still present after delete must fail")
             .to_string();
         assert!(error.contains("remains"));
+    }
+
+    fn bcd_mock_calls(runner: &MockBcdRunner) -> Vec<Vec<String>> {
+        runner.calls.lock().expect("lock mock BCD calls").clone()
+    }
+
+    fn bcd_args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn bcd_ok() -> MockReply {
+        MockReply::Ok("操作成功完成。".to_string())
+    }
+
+    const BCD_DEVICE_FIXTURE: &str =
+        "ramdisk=[C:]\\LetRecovery_PE\\boot-fixture.wim,{11111111-1111-1111-1111-111111111111}";
+
+    fn bcd_entry_plan_fixture() -> PeBootEntryPlan<'static> {
+        PeBootEntryPlan {
+            ramdisk_guid: RAMDISK_GUID,
+            loader_guid: LOADER_GUID,
+            ram_description: "LetRecovery PE RAM".to_string(),
+            display_name: "LetRecovery PE",
+            system_partition: "partition=C:".to_string(),
+            sdi_bcd_path: "\\LetRecovery_PE\\boot-fixture.sdi".to_string(),
+            device: BCD_DEVICE_FIXTURE.to_string(),
+            winload: "\\windows\\system32\\boot\\winload.efi",
+        }
+    }
+
+    #[test]
+    fn boot_change_block_is_recognized_through_context_layers_only() {
+        let blocked = anyhow::Error::new(BcdeditTerminatedWithoutReport {
+            arguments: "/set {fixture} osdevice ramdisk=[C:]\\boot.wim,{fixture}".to_string(),
+            exit_code: Some(-1),
+        })
+        .context("create PE boot entry");
+        assert!(boot_change_was_blocked(&blocked));
+        assert!(!boot_change_was_blocked(&anyhow::anyhow!(
+            "bcdedit 执行失败（参数：/set，退出码：1）：拒绝访问。"
+        )));
+    }
+
+    #[test]
+    fn bcdedit_silent_abnormal_exit_is_the_only_unreported_termination() {
+        assert!(bcdedit_terminated_without_report(false, Some(-1), "", ""));
+        assert!(bcdedit_terminated_without_report(false, None, " ", "\r\n"));
+        assert!(bcdedit_terminated_without_report(
+            false,
+            Some(-1_073_741_819),
+            "",
+            ""
+        ));
+        // bcdedit's own failure code and every written diagnostic stay ordinary failures.
+        assert!(!bcdedit_terminated_without_report(false, Some(1), "", ""));
+        assert!(!bcdedit_terminated_without_report(
+            false,
+            Some(-1),
+            "拒绝访问。",
+            ""
+        ));
+        assert!(!bcdedit_terminated_without_report(
+            false,
+            Some(-1),
+            "",
+            "access denied"
+        ));
+        assert!(!bcdedit_terminated_without_report(true, Some(0), "", ""));
+    }
+
+    #[test]
+    fn pe_boot_entry_writes_osdevice_after_device_and_path() {
+        let runner = MockBcdRunner::new((0..11).map(|_| bcd_ok()));
+        write_pe_boot_entry(&runner, &bcd_entry_plan_fixture()).unwrap();
+        let calls = bcd_mock_calls(&runner);
+        assert_eq!(calls.len(), 11);
+        assert_eq!(
+            calls[0],
+            bcd_args(&[
+                "/create",
+                RAMDISK_GUID,
+                "/d",
+                "LetRecovery PE RAM",
+                "/device"
+            ])
+        );
+        assert_eq!(
+            calls[4],
+            bcd_args(&["/set", LOADER_GUID, "device", BCD_DEVICE_FIXTURE])
+        );
+        assert_eq!(
+            calls[5],
+            bcd_args(&[
+                "/set",
+                LOADER_GUID,
+                "path",
+                "\\windows\\system32\\boot\\winload.efi"
+            ])
+        );
+        assert_eq!(
+            calls[6],
+            bcd_args(&["/set", LOADER_GUID, "osdevice", BCD_DEVICE_FIXTURE])
+        );
+        assert_eq!(calls[10], bcd_args(&["/set", LOADER_GUID, "ems", "no"]));
+    }
+
+    #[test]
+    fn unreported_osdevice_termination_is_retried_before_failing() {
+        let mut replies: Vec<MockReply> = (0..6).map(|_| bcd_ok()).collect();
+        replies.push(MockReply::Terminated);
+        replies.extend((0..5).map(|_| bcd_ok()));
+        let runner = MockBcdRunner::new(replies);
+
+        write_pe_boot_entry(&runner, &bcd_entry_plan_fixture()).unwrap();
+
+        let calls = bcd_mock_calls(&runner);
+        assert_eq!(calls.len(), 12);
+        assert_eq!(calls[6], calls[7]);
+        assert_eq!(
+            calls[7],
+            bcd_args(&["/set", LOADER_GUID, "osdevice", BCD_DEVICE_FIXTURE])
+        );
+    }
+
+    #[test]
+    fn persistent_unreported_termination_fails_closed_without_the_value() {
+        let mut replies: Vec<MockReply> = (0..6).map(|_| bcd_ok()).collect();
+        replies.extend((0..BCDEDIT_UNREPORTED_TERMINATION_ATTEMPTS).map(|_| MockReply::Terminated));
+        replies.push(MockReply::Ok(format!(
+            "标识符                  {}\ndevice                  {}\npath                    \\windows\\system32\\boot\\winload.efi",
+            LOADER_GUID.to_ascii_lowercase(),
+            BCD_DEVICE_FIXTURE
+        )));
+        let runner = MockBcdRunner::new(replies);
+
+        let error = write_pe_boot_entry(&runner, &bcd_entry_plan_fixture())
+            .expect_err("a missing osdevice must stop the PE boot entry")
+            .to_string();
+
+        assert!(error.contains("osdevice"));
+        assert!(error.contains("0xFFFFFFFF"));
+        let calls = bcd_mock_calls(&runner);
+        assert_eq!(calls.len(), 6 + BCDEDIT_UNREPORTED_TERMINATION_ATTEMPTS + 1);
+        assert_eq!(
+            calls.last().expect("read-back call"),
+            &bcd_args(&["/enum", LOADER_GUID, "/v"])
+        );
+    }
+
+    #[test]
+    fn unreported_termination_is_accepted_only_when_readback_shows_the_value() {
+        let runner = MockBcdRunner::new(
+            (0..BCDEDIT_UNREPORTED_TERMINATION_ATTEMPTS)
+                .map(|_| MockReply::Terminated)
+                .chain([MockReply::Ok(format!(
+                    "Windows Boot Loader\nidentifier              {}\nosdevice                ramdisk=[\\Device\\HarddiskVolume3]\\LetRecovery_PE\\boot-fixture.wim,{}",
+                    LOADER_GUID.to_ascii_lowercase(),
+                    RAMDISK_GUID.to_ascii_lowercase()
+                ))]),
+        );
+        set_bcd_element(&runner, LOADER_GUID, "osdevice", BCD_DEVICE_FIXTURE).unwrap();
+    }
+
+    #[test]
+    fn bcdedit_reported_error_is_never_retried() {
+        let runner = MockBcdRunner::new([MockReply::Err("设置元素数据时出错。拒绝访问。")]);
+        let error = set_bcd_element(&runner, LOADER_GUID, "osdevice", BCD_DEVICE_FIXTURE)
+            .expect_err("a reported bcdedit error must fail closed")
+            .to_string();
+        assert!(error.contains("拒绝访问"));
+        assert_eq!(bcd_mock_calls(&runner).len(), 1);
+    }
+
+    #[test]
+    fn unreported_create_termination_is_resolved_by_object_readback() {
+        let runner = MockBcdRunner::new([
+            MockReply::Terminated,
+            MockReply::Ok(format!("identifier              {LOADER_GUID}")),
+        ]);
+        create_bcd_object(
+            &runner,
+            &[
+                "/create",
+                LOADER_GUID,
+                "/d",
+                "LetRecovery PE",
+                "/application",
+                "osloader",
+            ],
+            LOADER_GUID,
+        )
+        .unwrap();
+        assert_eq!(bcd_mock_calls(&runner).len(), 2);
+    }
+
+    #[test]
+    fn bcd_value_comparison_is_exact_apart_from_bcdedit_display_forms() {
+        assert!(bcd_element_value_matches("yes", "Yes"));
+        assert!(bcd_element_value_matches(
+            BCD_DEVICE_FIXTURE,
+            &BCD_DEVICE_FIXTURE.to_ascii_lowercase()
+        ));
+        assert!(bcd_element_value_matches(
+            BCD_DEVICE_FIXTURE,
+            "ramdisk=[\\Device\\HarddiskVolume3]\\LetRecovery_PE\\boot-fixture.wim,{11111111-1111-1111-1111-111111111111}"
+        ));
+        assert!(!bcd_element_value_matches(
+            BCD_DEVICE_FIXTURE,
+            "ramdisk=[C:]\\LetRecovery_PE\\boot-other.wim,{11111111-1111-1111-1111-111111111111}"
+        ));
+        assert!(!bcd_element_value_matches(
+            BCD_DEVICE_FIXTURE,
+            "partition=C:"
+        ));
+        assert_eq!(
+            bcd_enum_element_value(
+                "device                  partition=C:\nosdevice                partition=D:",
+                "osdevice"
+            ),
+            Some("partition=D:")
+        );
+    }
+
+    #[test]
+    fn terminated_one_shot_boot_needs_the_boot_manager_readback() {
+        let accepted = MockBcdRunner::new(
+            (0..BCDEDIT_UNREPORTED_TERMINATION_ATTEMPTS)
+                .map(|_| MockReply::Terminated)
+                .chain([MockReply::Ok(format!(
+                    "bootsequence            {LOADER_GUID}"
+                ))]),
+        );
+        add_one_shot_boot(&accepted, LOADER_GUID).unwrap();
+
+        let rejected = MockBcdRunner::new(
+            (0..BCDEDIT_UNREPORTED_TERMINATION_ATTEMPTS)
+                .map(|_| MockReply::Terminated)
+                .chain([MockReply::Ok(
+                    "bootsequence            {33333333-3333-3333-3333-333333333333}".to_string(),
+                )]),
+        );
+        let error = add_one_shot_boot(&rejected, LOADER_GUID)
+            .expect_err("a missing BootSequence entry must fail")
+            .to_string();
+        assert!(error.contains("/bootsequence"));
     }
 
     #[test]

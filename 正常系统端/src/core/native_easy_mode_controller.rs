@@ -293,7 +293,8 @@ impl NativeEasyModeController {
                     system
                         .volumes
                         .iter()
-                        .map(|volume| volume.name.clone())
+                        // Edition names are server catalogue text; selection stays index based.
+                        .map(|volume| crate::tr!(volume.name.as_str()))
                         .collect()
                 })
                 .unwrap_or_default(),

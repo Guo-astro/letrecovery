@@ -34,7 +34,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor, GetCaretPos,
     GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW, LoadCursorW,
-    PostQuitMessage, RegisterClassExW, SendMessageW, ShowWindow, TranslateMessage,
+    PostQuitMessage, RegisterClassExW, SendMessageW, SetCursor, ShowWindow, TranslateMessage,
     UpdateLayeredWindow, GA_ROOT, GWL_STYLE, HMENU, IDC_ARROW, MSG, NONCLIENTMETRICSW,
     SW_SHOWNOACTIVATE, ULW_ALPHA, WINDOW_EX_STYLE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -465,6 +465,7 @@ unsafe fn track(
     present(&menu);
     MENU.with(|cell| *cell.borrow_mut() = Some(menu));
     let _ = SetCapture(hwnd);
+    show_menu_arrow_cursor();
     // Modal loop, like TrackPopupMenu: keys are handled here, the mouse by the menu window.
     let mut message = MSG::default();
     loop {
@@ -618,6 +619,15 @@ fn item_at(menu: &Menu, x: i32, y: i32) -> Option<usize> {
     (0..menu.items.len()).find(|index| y >= menu.tops[*index] && y < menu.tops[index + 1])
 }
 
+/// Shows the arrow while the menu is open, like `TrackPopupMenu`. The menu holds mouse capture
+/// and Windows sends no `WM_SETCURSOR` to a capturing window, so the class cursor never applies
+/// and the I-beam the Edit control set last would otherwise stay on screen over the menu.
+unsafe fn show_menu_arrow_cursor() {
+    if let Ok(arrow) = LoadCursorW(None, IDC_ARROW) {
+        let _ = SetCursor(arrow);
+    }
+}
+
 unsafe extern "system" fn menu_proc(
     hwnd: HWND,
     message: u32,
@@ -640,6 +650,9 @@ unsafe extern "system" fn menu_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP => {
+            if message == WM_MOUSEMOVE {
+                show_menu_arrow_cursor();
+            }
             let x = (lparam.0 & 0xffff) as u16 as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
             let mut result: Option<Option<usize>> = None;

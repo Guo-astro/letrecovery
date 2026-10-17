@@ -254,6 +254,11 @@ pub enum InstallExecutionOutcome {
     ReadyToRebootIntoPe,
 }
 
+/// Stable backend code for a PE boot entry that bcdedit could not write because the process was
+/// ended without reporting anything (most likely security software). The UI keys its dedicated
+/// guidance on this code instead of on localized text.
+pub const PE_BOOT_CHANGE_BLOCKED: &str = "pe_boot_change_blocked";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallBackendError {
     pub code: &'static str,
@@ -283,12 +288,20 @@ pub enum InstallExecutionError {
 }
 
 impl InstallExecutionError {
+    /// Whether the PE boot entry was most likely blocked by security software.
+    pub fn boot_change_blocked(&self) -> bool {
+        matches!(self, Self::Backend { source, .. } if source.code == PE_BOOT_CHANGE_BLOCKED)
+    }
+
     /// Returns a concise localized message suitable for the progress page.
     ///
     /// Backend `detail` is intentionally excluded here: it remains available through
     /// [`std::fmt::Display`] for logs and support diagnostics. Source-image verification uses a
     /// fixed, non-sensitive support code plus common causes so a screenshot remains actionable.
     pub fn user_message(&self) -> String {
+        if self.boot_change_blocked() {
+            return crate::tr!("安全软件拦截了启动项修改。安装已安全停止，电脑没有任何改动。");
+        }
         match self {
             Self::DevelopmentBuildDenied => {
                 crate::tr!("开发测试构建禁止执行真实系统安装。")
@@ -743,6 +756,21 @@ impl NativeInstallExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_block_is_identified_by_its_stable_backend_code_only() {
+        let blocked = InstallExecutionError::Backend {
+            phase: InstallExecutionPhase::InstallPeBootEntry,
+            source: InstallBackendError::new(PE_BOOT_CHANGE_BLOCKED, "bcdedit ended silently"),
+        };
+        assert!(blocked.boot_change_blocked());
+        assert!(blocked.user_message().contains("安全软件"));
+        let ordinary = InstallExecutionError::Backend {
+            phase: InstallExecutionPhase::InstallPeBootEntry,
+            source: InstallBackendError::new("install_pe_boot_entry", "拒绝访问"),
+        };
+        assert!(!ordinary.boot_change_blocked());
+    }
     #[cfg(not(feature = "non-elevated-tests"))]
     use std::cell::Cell;
     #[cfg(not(feature = "non-elevated-tests"))]

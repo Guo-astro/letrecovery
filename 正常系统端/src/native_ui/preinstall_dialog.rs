@@ -242,7 +242,11 @@ impl NativePreinstallDialog {
 
     unsafe fn populate_categories(&mut self) {
         for (row, category) in self.categories.iter().enumerate() {
-            insert_text_item(self.category_list, row as i32, &category.name);
+            insert_text_item(
+                self.category_list,
+                row as i32,
+                &crate::tr!(category.name.as_str()),
+            );
         }
         if !self.categories.is_empty() {
             set_selected_item(self.category_list, 0);
@@ -255,10 +259,13 @@ impl NativePreinstallDialog {
         let _ = SendMessageW(self.package_list, LVM_DELETEALLITEMS, WPARAM(0), LPARAM(0));
         if let Some(category) = self.categories.get(self.active_category) {
             for (row, software) in category.items.iter().enumerate() {
+                // Catalogue text is server data in Simplified Chinese. Translate it only for display;
+                // selection and installation keep using the original catalogue fields.
+                let name = crate::tr!(software.name.as_str());
                 let label = if software.description.trim().is_empty() {
-                    software.name.clone()
+                    name
                 } else {
-                    format!("{}  —  {}", software.name, software.description)
+                    format!("{}  —  {}", name, crate::tr!(software.description.as_str()))
                 };
                 insert_list_item(self.package_list, row as i32);
                 set_list_subitem(self.package_list, row as i32, 1, &label);
