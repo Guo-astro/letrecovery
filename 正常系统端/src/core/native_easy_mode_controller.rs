@@ -272,8 +272,16 @@ impl NativeEasyModeController {
             None
         };
         let description = match (selected, selected_volume) {
-            (Some(system), Some(volume)) => format!("{} - {}", system.name, volume.name),
-            (Some(system), None) => format!("{} - {}", system.name, crate::tr!("请先选择版本")),
+            (Some(system), Some(volume)) => format!(
+                "{} - {}",
+                crate::utils::i18n::translate_catalogue(&system.name),
+                crate::utils::i18n::translate_catalogue(&volume.name)
+            ),
+            (Some(system), None) => format!(
+                "{} - {}",
+                crate::utils::i18n::translate_catalogue(&system.name),
+                crate::tr!("请先选择版本")
+            ),
             _ if self.loading => crate::tr!("正在加载系统列表..."),
             _ => crate::tr!("请选择要安装的系统："),
         };
@@ -285,7 +293,7 @@ impl NativeEasyModeController {
             systems: self
                 .systems
                 .iter()
-                .map(|system| system.name.clone())
+                .map(|system| crate::utils::i18n::translate_catalogue(&system.name))
                 .collect(),
             selected_system: self.selected_system,
             volumes: selected

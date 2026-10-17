@@ -289,7 +289,7 @@ impl NativeDownloadController {
     pub fn software_category_names(&self) -> Vec<String> {
         self.software_categories
             .iter()
-            .map(|category| category.name.clone())
+            .map(|category| crate::utils::i18n::translate_catalogue(&category.name))
             .collect()
     }
 
@@ -311,7 +311,7 @@ impl NativeDownloadController {
                 .iter()
                 .map(|system| ResourceRow {
                     // Server catalogue text is Simplified Chinese; translate the visible row only.
-                    name: crate::tr!(system.display_name.as_str()),
+                    name: crate::utils::i18n::translate_catalogue(&system.display_name),
                     resource_type: if system.is_win11 { "Win11" } else { "Win10" }.into(),
                     size: String::new(),
                 })
@@ -320,7 +320,7 @@ impl NativeDownloadController {
                 .active_software()
                 .iter()
                 .map(|software| ResourceRow {
-                    name: crate::tr!(software.name.as_str()),
+                    name: crate::utils::i18n::translate_catalogue(&software.name),
                     resource_type: software.version.clone().unwrap_or_default(),
                     size: String::new(),
                 })

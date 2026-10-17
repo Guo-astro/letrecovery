@@ -68,6 +68,8 @@ struct I18nManager {
     current_language: String,
     /// 当前翻译表
     translations: HashMap<String, String>,
+    /// Translations for text owned by the live v4 catalogue, replaced on each successful refresh.
+    catalogue_translations: HashMap<String, HashMap<String, String>>,
     /// 可用语言列表缓存
     available_languages: Vec<LanguageInfo>,
 }
@@ -77,6 +79,7 @@ impl I18nManager {
         Self {
             current_language: String::from("zh-CN"),
             translations: HashMap::new(),
+            catalogue_translations: HashMap::new(),
             available_languages: Vec::new(),
         }
     }
@@ -300,6 +303,46 @@ pub fn translate(text: &str) -> String {
     let guard = manager.read();
 
     translate_internal(&guard, text)
+}
+
+/// Replace the optional server-provided translations for strings from the v4 catalogue.
+///
+/// This table is deliberately separate from application translations: it only participates in
+/// `translate_catalogue`, so the server cannot override unrelated UI messages.
+pub fn set_catalogue_translations(translations: HashMap<String, HashMap<String, String>>) {
+    let manager = I18N_MANAGER.get_or_init(|| RwLock::new(I18nManager::new()));
+    manager.write().catalogue_translations = translations;
+}
+
+/// Translate a display string supplied by the live v4 catalogue. Server values take precedence
+/// for this catalogue-only surface, with the bundled language file remaining a compatibility
+/// fallback for older servers and incomplete translation tables.
+pub fn translate_catalogue(text: &str) -> String {
+    let manager = I18N_MANAGER.get_or_init(|| RwLock::new(I18nManager::new()));
+    let guard = manager.read();
+    translate_catalogue_internal(&guard, text)
+}
+
+fn translate_catalogue_internal(manager: &I18nManager, text: &str) -> String {
+    if is_dprk_easter_egg_language(&manager.current_language) {
+        return DPRK_EASTER_EGG_SLOGAN.to_string();
+    }
+    if manager.current_language == "zh-CN" {
+        return text.to_string();
+    }
+    if let Some(translated) = manager
+        .catalogue_translations
+        .get(text)
+        .and_then(|locales| {
+            locales
+                .iter()
+                .find(|(locale, _)| locale.eq_ignore_ascii_case(&manager.current_language))
+                .map(|(_, value)| value)
+        })
+    {
+        return translated.clone();
+    }
+    translate_internal(manager, text)
 }
 
 fn translate_internal(manager: &I18nManager, text: &str) -> String {
@@ -551,6 +594,42 @@ mod tests {
         assert!(scan_available_languages()
             .iter()
             .any(|language| language.code == DPRK_EASTER_EGG_LANGUAGE));
+    }
+
+    #[test]
+    fn server_catalogue_translation_overrides_bundle_and_falls_back_when_missing() {
+        let mut manager = I18nManager::new();
+        load_language_internal(&mut manager, "en-US");
+        manager.catalogue_translations.insert(
+            "安全防护".to_string(),
+            HashMap::from([("en-US".to_string(), "Server security".to_string())]),
+        );
+        assert_eq!(
+            translate_catalogue_internal(&manager, "安全防护"),
+            "Server security"
+        );
+        assert_eq!(
+            translate_catalogue_internal(&manager, "常用工具"),
+            "Common Tools"
+        );
+        assert_eq!(translate_catalogue_internal(&manager, "unknown"), "unknown");
+
+        manager.current_language = "zh-CN".to_string();
+        assert_eq!(
+            translate_catalogue_internal(&manager, "安全防护"),
+            "安全防护"
+        );
+    }
+
+    #[test]
+    fn catalogue_category_uses_embedded_japanese_translation_without_server_entry() {
+        let mut manager = I18nManager::new();
+        load_language_internal(&mut manager, "ja-JP");
+
+        assert_eq!(
+            translate_catalogue_internal(&manager, "安全防护"),
+            "セキュリティ"
+        );
     }
 
     #[test]

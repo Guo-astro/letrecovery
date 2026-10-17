@@ -245,7 +245,7 @@ impl NativePreinstallDialog {
             insert_text_item(
                 self.category_list,
                 row as i32,
-                &crate::tr!(category.name.as_str()),
+                &crate::utils::i18n::translate_catalogue(&category.name),
             );
         }
         if !self.categories.is_empty() {
@@ -261,11 +261,15 @@ impl NativePreinstallDialog {
             for (row, software) in category.items.iter().enumerate() {
                 // Catalogue text is server data in Simplified Chinese. Translate it only for display;
                 // selection and installation keep using the original catalogue fields.
-                let name = crate::tr!(software.name.as_str());
+                let name = crate::utils::i18n::translate_catalogue(&software.name);
                 let label = if software.description.trim().is_empty() {
                     name
                 } else {
-                    format!("{}  —  {}", name, crate::tr!(software.description.as_str()))
+                    format!(
+                        "{}  —  {}",
+                        name,
+                        crate::utils::i18n::translate_catalogue(&software.description)
+                    )
                 };
                 insert_list_item(self.package_list, row as i32);
                 set_list_subitem(self.package_list, row as i32, 1, &label);

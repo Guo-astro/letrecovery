@@ -10,6 +10,8 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
+use std::collections::HashMap;
 
 /// v4 单文件资源目录。正常情况下只需要一次 HTTP 请求。
 pub const SERVER_V4_URL: &str = "https://letrecovery.cloud-pe.cn/v4/";
@@ -21,6 +23,7 @@ type RemoteConfigContents = (
     Option<String>,
     Option<String>,
     SystemImageMode,
+    HashMap<String, HashMap<String, String>>,
 );
 
 /// 服务端控制系统镜像目录来源的模式。
@@ -55,6 +58,9 @@ fn enabled_by_default() -> bool {
 #[derive(Debug, Deserialize)]
 struct V4CatalogResponse {
     data: V4CatalogData,
+    /// Also accept a sibling field for API deployments that merge the map at response level.
+    #[serde(default)]
+    i18n: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +70,9 @@ struct V4CatalogData {
     system_images: Vec<V4SystemEntry>,
     easy_mode: EasyModeConfig,
     software: Vec<V4SoftwareCategory>,
+    /// Optional source-text -> locale -> translation table returned alongside the v4 catalogue.
+    #[serde(default)]
+    i18n: Option<Value>,
     /// 1=微软官方，2=API，3=微软官方+API；缺失时必须保持模式1。
     #[serde(
         default,
@@ -150,6 +159,8 @@ pub struct RemoteConfig {
     pub error: Option<String>,
     /// 本次目录实际采用的系统镜像来源模式。
     pub system_image_mode: SystemImageMode,
+    /// Server-maintained translations for display strings supplied by the v4 catalogue.
+    pub catalogue_translations: HashMap<String, HashMap<String, String>>,
 }
 
 /// Whether a TLS failure was caused by the certificate validity window, i.e. by a wrong local
@@ -193,6 +204,7 @@ impl RemoteConfig {
                 easy_content,
                 gpu_content,
                 system_image_mode,
+                catalogue_translations,
             )) => {
                 config.pe_content = pe_content;
                 config.dl_content = dl_content;
@@ -200,6 +212,7 @@ impl RemoteConfig {
                 config.easy_content = easy_content;
                 config.gpu_content = gpu_content;
                 config.system_image_mode = system_image_mode;
+                config.catalogue_translations = catalogue_translations;
                 config.loaded = true;
                 log::info!("远程配置加载成功");
             }
@@ -325,6 +338,8 @@ impl RemoteConfig {
     }
 
     fn v4_catalog_to_contents(catalog: V4CatalogResponse) -> Result<RemoteConfigContents> {
+        let catalogue_translations =
+            parse_catalogue_translations(catalog.data.i18n.as_ref().or(catalog.i18n.as_ref()));
         let mode = SystemImageMode::try_from(
             catalog
                 .data
@@ -391,8 +406,56 @@ impl RemoteConfig {
             Some(easy_content),
             None,
             mode,
+            catalogue_translations,
         ))
     }
+}
+
+const CATALOGUE_I18N_MAX_ENTRIES: usize = 4096;
+const CATALOGUE_I18N_MAX_TEXT_BYTES: usize = 4096;
+const CATALOGUE_I18N_LOCALES: [&str; 5] = ["en-US", "de-DE", "fr-FR", "ja-JP", "ko-KR"];
+
+/// Invalid optional translation rows are ignored so a bad i18n field cannot make the core v4
+/// resource catalogue unavailable.
+fn parse_catalogue_translations(value: Option<&Value>) -> HashMap<String, HashMap<String, String>> {
+    let Some(entries) = value.and_then(Value::as_object) else {
+        if value.is_some() {
+            log::warn!("v4 catalogue i18n field is not an object; translations ignored");
+        }
+        return HashMap::new();
+    };
+    let mut translations = HashMap::new();
+    for (source, locale_values) in entries.iter().take(CATALOGUE_I18N_MAX_ENTRIES) {
+        if source.trim().is_empty() || source.len() > CATALOGUE_I18N_MAX_TEXT_BYTES {
+            continue;
+        }
+        let Some(locale_values) = locale_values.as_object() else {
+            continue;
+        };
+        let mut locales = HashMap::new();
+        for (locale, translated) in locale_values {
+            if !CATALOGUE_I18N_LOCALES
+                .iter()
+                .any(|supported| supported.eq_ignore_ascii_case(locale))
+            {
+                continue;
+            }
+            let Some(translated) = translated.as_str() else {
+                continue;
+            };
+            if translated.trim().is_empty() || translated.len() > CATALOGUE_I18N_MAX_TEXT_BYTES {
+                continue;
+            }
+            locales.insert(locale.clone(), translated.to_owned());
+        }
+        if !locales.is_empty() {
+            translations.insert(source.clone(), locales);
+        }
+    }
+    if entries.len() > CATALOGUE_I18N_MAX_ENTRIES {
+        log::warn!("v4 catalogue i18n has too many entries; excess rows ignored");
+    }
+    translations
 }
 
 fn merge_system_images(official: Vec<OnlineSystem>, api: Vec<OnlineSystem>) -> Vec<OnlineSystem> {
@@ -474,13 +537,13 @@ mod tests {
         "software": [
           {
             "id": "utility",
-            "name": "常用工具",
-            "description": "Utilities",
+            "name": "常用软件",
+            "description": "常用工具集合",
             "count": 1,
             "items": [{
               "id": "tool",
-              "name": "Tool",
-              "description": "Description",
+              "name": "工具",
+              "description": "工具描述",
               "download_url": "https://example.com/tool.exe",
               "filename": "tool.exe",
               "version": "1.0",
@@ -490,7 +553,12 @@ mod tests {
             }]
           }
         ],
-        "system_image_mode": 2
+        "system_image_mode": 2,
+        "i18n": {
+          "常用软件": {"en-US": "Common software"},
+          "工具": {"en-US": "Utility"},
+          "工具描述": {"en-US": "A utility application"}
+        }
       }
     }
     "#;
@@ -514,9 +582,14 @@ mod tests {
     #[test]
     fn v4_catalogue_maps_categories_and_silent_install_metadata() {
         let catalog: V4CatalogResponse = serde_json::from_str(V4_FIXTURE).unwrap();
-        let (pe, systems, software, easy, gpu, mode) =
+        let (pe, systems, software, easy, gpu, mode, i18n) =
             RemoteConfig::v4_catalog_to_contents(catalog).unwrap();
         assert_eq!(mode, SystemImageMode::Api);
+        assert_eq!(
+            i18n.get("常用软件")
+                .and_then(|locales| locales.get("en-US")),
+            Some(&"Common software".to_owned())
+        );
 
         let pe_content = pe.unwrap();
         let systems_content = systems.unwrap();
@@ -540,7 +613,8 @@ mod tests {
         );
         assert_eq!(manager.software_list.len(), 1);
         assert_eq!(manager.software_categories.len(), 1);
-        assert_eq!(manager.software_categories[0].name, "常用工具");
+        assert_eq!(manager.software_categories[0].name, "常用软件");
+        assert_eq!(manager.software_list[0].name, "工具");
         assert_eq!(
             manager.software_list[0].silent_command.as_deref(),
             Some("\"{installer}\" /S")
@@ -590,6 +664,22 @@ mod tests {
         value["data"]["system_image_mode"] = serde_json::json!(9);
         let catalog: V4CatalogResponse = serde_json::from_value(value).unwrap();
         assert!(RemoteConfig::v4_catalog_to_contents(catalog).is_err());
+    }
+
+    #[test]
+    fn invalid_optional_i18n_rows_are_ignored_without_rejecting_the_catalogue() {
+        let mut value: serde_json::Value = serde_json::from_str(V4_FIXTURE).unwrap();
+        value["data"]["i18n"] = serde_json::json!({
+            "valid": {"en-US": "Valid"},
+            "empty": {"en-US": " "},
+            "unsupported": {"zh-CN": "不应出现"},
+            "wrong-type": {"en-US": 42},
+            "bad-row": "not a locale map"
+        });
+        let catalog: V4CatalogResponse = serde_json::from_value(value).unwrap();
+        let translations = RemoteConfig::v4_catalog_to_contents(catalog).unwrap().6;
+        assert_eq!(translations.len(), 1);
+        assert_eq!(translations["valid"]["en-US"], "Valid");
     }
 
     #[test]

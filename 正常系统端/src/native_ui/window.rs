@@ -3091,6 +3091,7 @@ impl NativeWindow {
         );
         let mut pending_easy_catalogue = None;
         if let Some(remote) = &config.remote_config {
+            crate::utils::i18n::set_catalogue_translations(remote.catalogue_translations.clone());
             let catalogue = ConfigManager {
                 systems: remote
                     .dl_content
@@ -12443,6 +12444,8 @@ impl NativeWindow {
             }
             return;
         }
+
+        crate::utils::i18n::set_catalogue_translations(remote.catalogue_translations.clone());
 
         let catalogue = ConfigManager {
             systems: remote
