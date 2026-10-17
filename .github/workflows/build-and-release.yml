@@ -596,117 +596,25 @@ jobs:
           echo "--- updated config.json ---"
           cat pkg/config.json
 
-      - name: Upload PE WIM to 21Vianet OneDrive with rclone
+      - name: Upload PE WIM to Cloudflare R2
         # Production releases always publish the new PE image. Test branches below
         # are prereleases and must never replace the public PE image or metadata.
+        # upload-to-r2.ps1 stages the file under a temporary name and only then swaps
+        # LetRecovery/LetRecovery_PE.wim server-side: downloads get the previous image
+        # until the new one is complete, and the previous image is deleted afterwards.
         if: ${{ (inputs.branch || github.ref_name) == 'main' }}
         shell: pwsh
         env:
-          ONEDRIVE_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
-          ONEDRIVE_CLIENT_SECRET: ${{ secrets.ONEDRIVE_CLIENT_SECRET }}
-          ONEDRIVE_TENANT_ID: ${{ secrets.ONEDRIVE_TENANT_ID }}
-          ONEDRIVE_USER_EMAIL: ${{ secrets.ONEDRIVE_USER_EMAIL }}
-          ONEDRIVE_REMOTE_ROOT: ${{ secrets.ONEDRIVE_REMOTE_ROOT }}
-          ONEDRIVE_REMOTE_PATH: ${{ secrets.ONEDRIVE_REMOTE_PATH }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           $ErrorActionPreference = "Stop"
-
-          foreach ($name in @("ONEDRIVE_CLIENT_ID", "ONEDRIVE_CLIENT_SECRET", "ONEDRIVE_TENANT_ID", "ONEDRIVE_USER_EMAIL")) {
-            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
-              throw "Missing repository secret: $name"
-            }
-          }
-          if ([string]::IsNullOrWhiteSpace($env:ONEDRIVE_REMOTE_PATH)) {
-            throw "OneDrive remote path is empty"
-          }
-          if (-not $env:ONEDRIVE_REMOTE_PATH.StartsWith("/")) {
-            throw "OneDrive remote path must start with '/': $env:ONEDRIVE_REMOTE_PATH"
-          }
-
-          $wimPath = "pkg\bin\pe\LetRecovery_PE.wim"
-          if (-not (Test-Path -LiteralPath $wimPath)) {
-            throw "WIM not found: $wimPath"
-          }
-
-          $wim = Get-Item -LiteralPath $wimPath
-          $md5 = (Get-FileHash -LiteralPath $wim.FullName -Algorithm MD5).Hash.ToUpperInvariant()
-          $root = $env:ONEDRIVE_REMOTE_ROOT.Trim([char]'/')
-          $leaf = $env:ONEDRIVE_REMOTE_PATH.TrimStart([char]'/')
-          $targetPath = if ([string]::IsNullOrWhiteSpace($root)) { $leaf } else { "$root/$leaf" }
-
-          Write-Host "Uploading PE WIM to 21Vianet OneDrive: /$targetPath"
-          Write-Host "Local WIM: $($wim.FullName)"
-          Write-Host "Size: $($wim.Length) bytes"
-          Write-Host "MD5: $md5"
-
-          if (-not (Get-Command rclone -ErrorAction SilentlyContinue)) {
-            choco install rclone -y --no-progress
-            if ($LASTEXITCODE -ne 0) { throw "Failed to install rclone" }
-          }
-          rclone version
-          if ($LASTEXITCODE -ne 0) { throw "rclone is not available" }
-
-          $tokenBody = @{
-            client_id = $env:ONEDRIVE_CLIENT_ID
-            client_secret = $env:ONEDRIVE_CLIENT_SECRET
-            scope = "https://microsoftgraph.chinacloudapi.cn/.default"
-            grant_type = "client_credentials"
-          }
-          $tokenResponse = Invoke-RestMethod `
-            -Method Post `
-            -Uri "https://login.chinacloudapi.cn/$($env:ONEDRIVE_TENANT_ID)/oauth2/v2.0/token" `
-            -ContentType "application/x-www-form-urlencoded" `
-            -Body $tokenBody `
-            -TimeoutSec 60
-
-          if ([string]::IsNullOrWhiteSpace($tokenResponse.access_token)) {
-            throw "Failed to obtain Microsoft Graph access token"
-          }
-
-          $graphHeaders = @{
-            Authorization = "Bearer $($tokenResponse.access_token)"
-          }
-          $encodedUser = [System.Uri]::EscapeDataString($env:ONEDRIVE_USER_EMAIL)
-          $drive = Invoke-RestMethod `
-            -Method Get `
-            -Uri "https://microsoftgraph.chinacloudapi.cn/v1.0/users/$encodedUser/drive" `
-            -Headers $graphHeaders `
-            -TimeoutSec 60
-
-          if ([string]::IsNullOrWhiteSpace($drive.id)) {
-            throw "Failed to resolve OneDrive drive id for $($env:ONEDRIVE_USER_EMAIL)"
-          }
-          Write-Host "Resolved OneDrive drive id for $($env:ONEDRIVE_USER_EMAIL)"
-
-          $env:RCLONE_CONFIG_LR_ONEDRIVE_TYPE = "onedrive"
-          $env:RCLONE_CONFIG_LR_ONEDRIVE_REGION = "cn"
-          $env:RCLONE_CONFIG_LR_ONEDRIVE_CLIENT_ID = $env:ONEDRIVE_CLIENT_ID
-          $env:RCLONE_CONFIG_LR_ONEDRIVE_CLIENT_SECRET = $env:ONEDRIVE_CLIENT_SECRET
-          $env:RCLONE_CONFIG_LR_ONEDRIVE_TENANT = $env:ONEDRIVE_TENANT_ID
-          $env:RCLONE_CONFIG_LR_ONEDRIVE_CLIENT_CREDENTIALS = "true"
-          $env:RCLONE_CONFIG_LR_ONEDRIVE_DRIVE_ID = $drive.id
-          $env:RCLONE_CONFIG_LR_ONEDRIVE_DRIVE_TYPE = "business"
-
-          rclone copyto `
-            $wim.FullName `
-            "lr_onedrive:$targetPath" `
-            --onedrive-chunk-size 80Mi `
-            --onedrive-upload-cutoff 4Mi `
-            --onedrive-no-versions `
-            --transfers 1 `
-            --checkers 4 `
-            --retries 5 `
-            --low-level-retries 20 `
-            --stats 10s `
-            --progress
-          if ($LASTEXITCODE -ne 0) {
-            throw "rclone upload failed for /$targetPath"
-          }
-
-          rclone lsl "lr_onedrive:$targetPath"
-          if ($LASTEXITCODE -ne 0) {
-            throw "rclone upload verification failed for /$targetPath"
-          }
+          & .\.github\scripts\upload-to-r2.ps1 `
+            -Prefix "LetRecovery" `
+            -Path ".\pkg\bin\pe\LetRecovery_PE.wim" `
+            -PublicBaseUrl "https://r2.cloud-pe.cn"
 
       - name: Update LetRecovery server PE config
         if: ${{ (inputs.branch || github.ref_name) == 'main' }}
@@ -715,7 +623,8 @@ jobs:
           UPDATE_API_SECRET: ${{ secrets.UPDATE_API_SECRET }}
           DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
           LETRECOVERY_UPDATE_API: ${{ secrets.LETRECOVERY_UPDATE_API }}
-          LETRECOVERY_PE_URL: ${{ secrets.LETRECOVERY_PE_URL }}
+          # Public R2 URL of the image published by the previous step.
+          LETRECOVERY_PE_URL: https://r2.cloud-pe.cn/LetRecovery/LetRecovery_PE.wim
           LETRECOVERY_PE_NAME: LetRecovery PE
           LETRECOVERY_PE_FILENAME: LetRecovery_PE.wim
         run: |
@@ -962,6 +871,25 @@ jobs:
             "- ``$($asset.Name)`` — $($asset.Length) bytes — SHA-256 ``$hash``" |
               Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           }
+
+      - name: Upload LetRecovery.7z and installer to Cloudflare R2
+        # Same rule as the PE image: only main replaces the public downloads that the
+        # website links to. Both files are fully uploaded and verified before either
+        # public object is swapped, so downloads keep getting the previous release
+        # until the new files are complete; the previous files are deleted afterwards.
+        if: ${{ (inputs.branch || github.ref_name) == 'main' }}
+        shell: pwsh
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\.github\scripts\upload-to-r2.ps1 `
+            -Prefix "LetRecovery" `
+            -Path ".\LetRecovery.7z", ".\installer\output\LetRecovery-Setup-x64.exe" `
+            -PublicBaseUrl "https://r2.cloud-pe.cn"
 
       - name: Determine tag
         id: tag
